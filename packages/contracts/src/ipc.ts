@@ -27,6 +27,7 @@ import type {
   ProjectWriteFileResult,
 } from "./project.ts";
 import type { ProviderInstanceId } from "./providerInstance.ts";
+import type { CodexUsageSnapshot } from "./providerRuntime.ts";
 import type {
   ServerConfig,
   ServerProcessDiagnosticsResult,
@@ -464,6 +465,9 @@ export interface LocalApi {
   };
   server: {
     getConfig: () => Promise<ServerConfig>;
+    getCodexUsage: (input: {
+      readonly instanceId: ProviderInstanceId;
+    }) => Promise<CodexUsageSnapshot | null>;
     /**
      * Refresh provider snapshots. When `input.instanceId` is supplied only that
      * configured instance is probed; otherwise every configured instance is

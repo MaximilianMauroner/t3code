@@ -1224,6 +1224,54 @@ describe("deriveWorkLogEntries", () => {
     expect(entries.map((entry) => entry.id)).toEqual(["tool-1-complete", "tool-2-complete"]);
   });
 
+  it("collapses adjacent repeated file-change rows for the same file", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "file-change-1",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        turnId: "turn-1",
+        kind: "tool.completed",
+        summary: "File change",
+        payload: {
+          itemType: "file_change",
+          title: "File change",
+          requestKind: "file-change",
+          data: {
+            item: {
+              changes: [{ path: "apps/web/convex/calendar.ts" }],
+            },
+          },
+        },
+      }),
+      makeActivity({
+        id: "file-change-2",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        turnId: "turn-1",
+        kind: "tool.completed",
+        summary: "File change",
+        payload: {
+          itemType: "file_change",
+          title: "File change",
+          requestKind: "file-change",
+          data: {
+            item: {
+              changes: [{ path: "apps/web/convex/calendar.ts" }],
+            },
+          },
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities, TurnId.make("turn-1"));
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      id: "file-change-2",
+      changedFiles: ["apps/web/convex/calendar.ts"],
+      requestKind: "file-change",
+    });
+  });
+
   it("collapses same-timestamp lifecycle rows even when completed sorts before updated by id", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({

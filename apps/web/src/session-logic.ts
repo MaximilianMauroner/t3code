@@ -481,10 +481,12 @@ export function deriveWorkLogEntries(
   activities: ReadonlyArray<OrchestrationThreadActivity>,
   latestTurnId: TurnId | undefined,
 ): WorkLogEntry[] {
-  const ordered = [...activities].toSorted(compareActivitiesByOrder);
+  const relevantActivities = latestTurnId
+    ? activities.filter((activity) => activity.turnId === latestTurnId)
+    : activities;
+  const ordered = [...relevantActivities].toSorted(compareActivitiesByOrder);
   const entries: DerivedWorkLogEntry[] = [];
   for (const activity of ordered) {
-    if (latestTurnId && activity.turnId !== latestTurnId) continue;
     if (activity.kind === "tool.started") continue;
     if (activity.kind === "task.started") continue;
     if (activity.kind === "context-window.updated") continue;
@@ -609,6 +611,9 @@ function shouldCollapseToolLifecycleEntries(
   if (next.activityKind !== "tool.updated" && next.activityKind !== "tool.completed") {
     return false;
   }
+  if (shouldCollapseRepeatedFileChangeEntries(previous, next)) {
+    return true;
+  }
   if (previous.activityKind === "tool.completed") {
     return false;
   }
@@ -667,6 +672,10 @@ function deriveToolLifecycleCollapseKey(entry: DerivedWorkLogEntry): string | un
   if (entry.activityKind !== "tool.updated" && entry.activityKind !== "tool.completed") {
     return undefined;
   }
+  const fileChangeKey = deriveFileChangeCollapseKey(entry);
+  if (fileChangeKey) {
+    return fileChangeKey;
+  }
   if (entry.toolCallId) {
     return `tool:${entry.toolCallId}`;
   }
@@ -677,6 +686,50 @@ function deriveToolLifecycleCollapseKey(entry: DerivedWorkLogEntry): string | un
     return undefined;
   }
   return [itemType, normalizedLabel, detail].join("\u001f");
+}
+
+function shouldCollapseRepeatedFileChangeEntries(
+  previous: DerivedWorkLogEntry,
+  next: DerivedWorkLogEntry,
+): boolean {
+  const previousKey = deriveFileChangeCollapseKey(previous);
+  const nextKey = deriveFileChangeCollapseKey(next);
+  return previousKey !== undefined && previousKey === nextKey;
+}
+
+function deriveFileChangeCollapseKey(entry: DerivedWorkLogEntry): string | undefined {
+  if (!isFileChangeWorkLogEntry(entry)) {
+    return undefined;
+  }
+  const changedFiles = normalizeChangedFilesForCollapse(entry.changedFiles);
+  if (changedFiles.length === 0) {
+    return undefined;
+  }
+  const normalizedLabel = normalizeCompactToolLabel(entry.toolTitle ?? entry.label);
+  return ["file-change", normalizedLabel, changedFiles.join("\u001e")].join("\u001f");
+}
+
+function isFileChangeWorkLogEntry(entry: DerivedWorkLogEntry): boolean {
+  return entry.requestKind === "file-change" || entry.itemType === "file_change";
+}
+
+function normalizeChangedFilesForCollapse(
+  changedFiles: ReadonlyArray<string> | undefined,
+): string[] {
+  if (!changedFiles) {
+    return [];
+  }
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const filePath of changedFiles) {
+    const trimmed = filePath.trim();
+    if (!trimmed || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    normalized.push(trimmed);
+  }
+  return normalized.toSorted();
 }
 
 function normalizeCompactToolLabel(value: string): string {

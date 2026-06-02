@@ -133,6 +133,7 @@ vi.mock("@t3tools/client-runtime", async (importOriginal) => {
     },
     server: {
       getConfig: vi.fn(),
+      getCodexUsage: vi.fn(),
       refreshProviders: vi.fn(),
       discoverSourceControl: vi.fn(),
       updateProvider: vi.fn(),

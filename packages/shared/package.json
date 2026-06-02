@@ -99,6 +99,10 @@
       "types": "./src/keybindings.ts",
       "import": "./src/keybindings.ts"
     },
+    "./codexUsage": {
+      "types": "./src/codexUsage.ts",
+      "import": "./src/codexUsage.ts"
+    },
     "./composerTrigger": {
       "types": "./src/composerTrigger.ts",
       "import": "./src/composerTrigger.ts"

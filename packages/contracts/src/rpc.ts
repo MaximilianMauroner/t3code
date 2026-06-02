@@ -54,6 +54,7 @@ import {
   OrchestrationRpcSchemas,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { CodexUsageSnapshot } from "./providerRuntime.ts";
 import {
   ProjectSearchEntriesError,
   ProjectSearchEntriesInput,
@@ -150,6 +151,7 @@ export const WS_METHODS = {
 
   // Server meta
   serverGetConfig: "server.getConfig",
+  serverGetCodexUsage: "server.getCodexUsage",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
   serverUpsertKeybinding: "server.upsertKeybinding",
@@ -192,6 +194,13 @@ export const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
   payload: Schema.Struct({}),
   success: ServerConfig,
   error: Schema.Union([KeybindingsConfigError, ServerSettingsError]),
+});
+
+export const WsServerGetCodexUsageRpc = Rpc.make(WS_METHODS.serverGetCodexUsage, {
+  payload: Schema.Struct({
+    instanceId: ProviderInstanceId,
+  }),
+  success: Schema.NullOr(CodexUsageSnapshot),
 });
 
 export const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
@@ -511,6 +520,7 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
 
 export const WsRpcGroup = RpcGroup.make(
   WsServerGetConfigRpc,
+  WsServerGetCodexUsageRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsServerUpsertKeybindingRpc,
