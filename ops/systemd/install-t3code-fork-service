@@ -21,6 +21,13 @@ health_script="/usr/local/sbin/t3code-fork-healthcheck"
 health_lock_helper="/usr/local/sbin/t3code-fork-lock"
 health_service="/etc/systemd/system/t3code-fork-healthcheck.service"
 health_timer="/etc/systemd/system/t3code-fork-healthcheck.timer"
+nightly_unit_dir="/etc/systemd/system"
+nightly_timer_unit="t3code-nightly-update.timer"
+nightly_service_unit="t3code-nightly-update.service"
+nightly_timer_path="${nightly_unit_dir}/${nightly_timer_unit}"
+nightly_service_path="${nightly_unit_dir}/${nightly_service_unit}"
+nightly_wants_dir="${nightly_unit_dir}/timers.target.wants"
+nightly_wants_link="${nightly_wants_dir}/${nightly_timer_unit}"
 health_url="${T3CODE_HEALTH_URL:-http://127.0.0.1:41731/.well-known/t3/environment}"
 
 [ -x "$node_path" ] || { printf '%s\n' "Configured Node executable is unavailable." >&2; exit 1; }
@@ -143,6 +150,48 @@ if [ ! -f "$sentinel" ] || [ "$(cat "$sentinel")" != "$commit" ] || [ ! -f "$ent
 fi
 "$node_path" "$entry" --version >/dev/null
 
+read_unit_state() {
+  operation="$1"; unit="$2"
+  if unit_state="$(systemctl "$operation" "$unit" 2>/dev/null)"; then :; else :; fi
+  [ -n "$unit_state" ] || return 1
+  printf '%s\n' "$unit_state"
+}
+validate_nightly_source_path() {
+  source="$1"
+  if [ -L "$source" ]; then
+    [ "$(/usr/bin/readlink "$source")" = /dev/null ] || return 1
+  else
+    [ -f "$source" ] || return 1
+    [ "$(/usr/bin/stat -c '%u' "$source")" -eq 0 ] || return 1
+    [ "$(/usr/bin/stat -c '%a' "$source")" = 644 ] || return 1
+  fi
+}
+validate_nightly_wants_link() {
+  if [ "$nightly_timer_enabled" = enabled ]; then
+    [ -L "$nightly_wants_link" ] || return 1
+    [ "$(/usr/bin/readlink "$nightly_wants_link")" = "$nightly_timer_path" ] || return 1
+  else
+    [ ! -e "$nightly_wants_link" ] && [ ! -L "$nightly_wants_link" ] || return 1
+  fi
+}
+validate_nightly_preflight() {
+  [ -d "$nightly_unit_dir" ] && [ ! -L "$nightly_unit_dir" ] || return 1
+  [ -d "$nightly_wants_dir" ] && [ ! -L "$nightly_wants_dir" ] || return 1
+  validate_nightly_source_path "$nightly_timer_path" || return 1
+  validate_nightly_source_path "$nightly_service_path" || return 1
+  nightly_timer_enabled="$(read_unit_state is-enabled "$nightly_timer_unit")" || return 1
+  nightly_service_enabled="$(read_unit_state is-enabled "$nightly_service_unit")" || return 1
+  nightly_timer_active="$(read_unit_state is-active "$nightly_timer_unit")" || return 1
+  nightly_service_active="$(read_unit_state is-active "$nightly_service_unit")" || return 1
+  case "$nightly_timer_enabled" in enabled|disabled|masked) ;; *) return 1 ;; esac
+  case "$nightly_service_enabled" in static|masked) ;; *) return 1 ;; esac
+  case "$nightly_timer_active" in active|inactive) ;; *) return 1 ;; esac
+  case "$nightly_service_active" in active|inactive) ;; *) return 1 ;; esac
+  validate_nightly_wants_link
+}
+validate_nightly_preflight ||
+  { printf '%s\n' "Nightly updater unit preflight failed." >&2; exit 1; }
+
 # Everything below is one reversible activation transaction.
 backup_dir="$(mktemp -d)"
 backup_file() {
@@ -154,6 +203,21 @@ restore_file() {
   rm -rf "$target"
   [ -f "$backup_dir/$label.absent" ] || cp -a "$backup_dir/$label" "$target"
 }
+backup_nightly_path() {
+  label="$1"; source="$2"
+  if [ -e "$source" ] || [ -L "$source" ]; then
+    [ ! -d "$source" ] || [ -L "$source" ] || return 1
+    cp -a "$source" "$backup_dir/$label"
+  else
+    : >"$backup_dir/$label.absent"
+  fi
+}
+restore_nightly_path() {
+  label="$1"; target="$2"
+  [ ! -d "$target" ] || [ -L "$target" ] || return 1
+  rm -f "$target"
+  [ -f "$backup_dir/$label.absent" ] || cp -a "$backup_dir/$label" "$target"
+}
 backup_file current "$current_link"
 backup_file old_dropin "$old_dropin_path"
 backup_file dropin "$dropin_path"
@@ -161,13 +225,50 @@ backup_file health_script "$health_script"
 backup_file health_lock_helper "$health_lock_helper"
 backup_file health_service "$health_service"
 backup_file health_timer "$health_timer"
-nightly_enabled="$(systemctl is-enabled t3code-nightly-update.timer 2>/dev/null || true)"
-nightly_active="$(systemctl is-active t3code-nightly-update.timer 2>/dev/null || true)"
+validate_nightly_source_path "$nightly_timer_path"
+validate_nightly_source_path "$nightly_service_path"
+validate_nightly_wants_link
+backup_nightly_path nightly_timer "$nightly_timer_path"
+backup_nightly_path nightly_service "$nightly_service_path"
+backup_nightly_path nightly_wants "$nightly_wants_link"
 health_enabled="$(systemctl is-enabled t3code-fork-healthcheck.timer 2>/dev/null || true)"
 health_active="$(systemctl is-active t3code-fork-healthcheck.timer 2>/dev/null || true)"
 service_active="$(systemctl is-active t3code.service 2>/dev/null || true)"
 install_complete=false
 rollback_complete=false
+verify_nightly_original_state() {
+  validate_nightly_source_path "$nightly_timer_path" || return 1
+  validate_nightly_source_path "$nightly_service_path" || return 1
+  [ "$(read_unit_state is-enabled "$nightly_timer_unit")" = "$nightly_timer_enabled" ] || return 1
+  [ "$(read_unit_state is-enabled "$nightly_service_unit")" = "$nightly_service_enabled" ] || return 1
+  [ "$(read_unit_state is-active "$nightly_timer_unit")" = "$nightly_timer_active" ] || return 1
+  [ "$(read_unit_state is-active "$nightly_service_unit")" = "$nightly_service_active" ] || return 1
+  validate_nightly_wants_link
+}
+restore_nightly_units() {
+  systemctl stop "$nightly_timer_unit" || return 1
+  systemctl stop "$nightly_service_unit" || return 1
+  systemctl unmask "$nightly_timer_unit" || return 1
+  systemctl unmask "$nightly_service_unit" || return 1
+  restore_nightly_path nightly_timer "$nightly_timer_path" || return 1
+  restore_nightly_path nightly_service "$nightly_service_path" || return 1
+  restore_nightly_path nightly_wants "$nightly_wants_link" || return 1
+  systemctl daemon-reload || return 1
+  case "$nightly_timer_enabled" in
+    enabled) systemctl enable "$nightly_timer_unit" || return 1 ;;
+    disabled) systemctl disable "$nightly_timer_unit" || return 1 ;;
+    masked) : ;;
+  esac
+  case "$nightly_timer_active" in
+    active) systemctl start "$nightly_timer_unit" || return 1 ;;
+    inactive) systemctl stop "$nightly_timer_unit" || return 1 ;;
+  esac
+  case "$nightly_service_active" in
+    active) systemctl start "$nightly_service_unit" || return 1 ;;
+    inactive) systemctl stop "$nightly_service_unit" || return 1 ;;
+  esac
+  verify_nightly_original_state
+}
 rollback() {
   [ "$rollback_complete" = true ] && return
   rollback_complete=true
@@ -176,6 +277,8 @@ rollback() {
     release_update_lock || true
     return
   fi
+  nightly_restore_failed=false
+  if ! restore_nightly_units; then nightly_restore_failed=true; fi
   restore_file current "$current_link"
   restore_file old_dropin "$old_dropin_path"
   restore_file dropin "$dropin_path"
@@ -184,15 +287,14 @@ rollback() {
   restore_file health_service "$health_service"
   restore_file health_timer "$health_timer"
   systemctl daemon-reload || true
-  systemctl unmask t3code-nightly-update.timer >/dev/null 2>&1 || true
-  case "$nightly_enabled" in enabled) systemctl enable t3code-nightly-update.timer || true ;; masked) systemctl mask t3code-nightly-update.timer || true ;; *) systemctl disable t3code-nightly-update.timer || true ;; esac
-  [ "$nightly_active" = active ] && systemctl start t3code-nightly-update.timer || systemctl stop t3code-nightly-update.timer || true
   systemctl unmask t3code-fork-healthcheck.timer >/dev/null 2>&1 || true
   case "$health_enabled" in enabled) systemctl enable t3code-fork-healthcheck.timer || true ;; masked) systemctl mask t3code-fork-healthcheck.timer || true ;; *) systemctl disable t3code-fork-healthcheck.timer || true ;; esac
   [ "$health_active" = active ] && systemctl start t3code-fork-healthcheck.timer || systemctl stop t3code-fork-healthcheck.timer || true
   [ "$service_active" = active ] && systemctl restart t3code.service || systemctl stop t3code.service || true
   rm -rf "$backup_dir"
   release_update_lock || true
+  [ "$nightly_restore_failed" = false ] ||
+    { printf '%s\n' "Could not restore nightly updater units exactly." >&2; return 1; }
 }
 exit_handler() {
   status=$?
@@ -220,8 +322,28 @@ install -m 0644 "$script_dir/t3code-fork-healthcheck.service" "$health_service"
 install -m 0644 "$script_dir/t3code-fork-healthcheck.timer" "$health_timer"
 systemctl daemon-reload
 systemctl show t3code.service -p ExecStart --value | grep -F "fork-current/node_modules/t3/dist/bin.mjs" >/dev/null
-systemctl disable --now t3code-nightly-update.timer || true
-systemctl mask t3code-nightly-update.timer
+systemctl stop "$nightly_timer_unit"
+systemctl stop "$nightly_service_unit"
+case "$nightly_timer_enabled" in
+  enabled|disabled) systemctl disable "$nightly_timer_unit" ;;
+  masked) : ;;
+esac
+[ ! -e "$nightly_wants_link" ] && [ ! -L "$nightly_wants_link" ]
+validate_nightly_source_path "$nightly_timer_path"
+validate_nightly_source_path "$nightly_service_path"
+[ ! -d "$nightly_timer_path" ] || [ -L "$nightly_timer_path" ]
+[ ! -d "$nightly_service_path" ] || [ -L "$nightly_service_path" ]
+rm -f "$nightly_timer_path"
+rm -f "$nightly_service_path"
+systemctl daemon-reload
+systemctl mask "$nightly_timer_unit"
+systemctl mask "$nightly_service_unit"
+[ "$(/usr/bin/readlink "$nightly_timer_path")" = /dev/null ]
+[ "$(/usr/bin/readlink "$nightly_service_path")" = /dev/null ]
+[ "$(read_unit_state is-enabled "$nightly_timer_unit")" = masked ]
+[ "$(read_unit_state is-enabled "$nightly_service_unit")" = masked ]
+[ "$(read_unit_state is-active "$nightly_timer_unit")" = inactive ]
+[ "$(read_unit_state is-active "$nightly_service_unit")" = inactive ]
 systemctl enable --now t3code-fork-healthcheck.timer
 systemctl restart t3code.service
 

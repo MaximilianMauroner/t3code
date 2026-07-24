@@ -61,8 +61,9 @@ describe("fork service bootstrap installer", () => {
       false,
     );
     expect(installer.indexOf('rm -f "$old_dropin_path"')).toBeGreaterThan(-1);
-    expect(installer.indexOf("systemctl show t3code.service -p ExecStart")).toBeLessThan(
-      installer.indexOf("systemctl disable --now t3code-nightly-update.timer"),
+    const execStartIndex = installer.indexOf("systemctl show t3code.service -p ExecStart");
+    expect(execStartIndex).toBeLessThan(
+      installer.indexOf('systemctl stop "$nightly_timer_unit"', execStartIndex),
     );
   });
 
@@ -74,7 +75,8 @@ describe("fork service bootstrap installer", () => {
       installer.indexOf('install -m 0644 "$script_dir/t3code.service'),
     );
     expect(installer).toContain("backup_file current");
-    expect(installer).toContain("nightly_enabled=");
+    expect(installer).toContain('nightly_timer_enabled="$(read_unit_state is-enabled');
+    expect(installer).toContain('nightly_service_enabled="$(read_unit_state is-enabled');
     expect(installer).toContain("health_enabled=");
     expect(installer).toContain("restore_file dropin");
     expect(installer).toContain("trap signal_handler HUP INT TERM");
@@ -191,6 +193,98 @@ describe("fork service bootstrap installer", () => {
     expect(installer).not.toContain(" add --prod ");
     expect(installer).not.toContain("tarball=");
     expect(installer).not.toContain("package.json");
+  });
+
+  it("strictly preflights the fixed nightly units and exact wants link read-only", () => {
+    const preflightIndex = installer.indexOf("validate_nightly_preflight ||");
+    const transactionIndex = installer.indexOf(
+      "# Everything below is one reversible activation transaction.",
+    );
+    expect(installer).toContain('nightly_unit_dir="/etc/systemd/system"');
+    expect(installer).toContain('nightly_timer_unit="t3code-nightly-update.timer"');
+    expect(installer).toContain('nightly_service_unit="t3code-nightly-update.service"');
+    expect(installer).toContain('nightly_wants_dir="${nightly_unit_dir}/timers.target.wants"');
+    expect(installer).toContain('nightly_wants_link="${nightly_wants_dir}/${nightly_timer_unit}"');
+    expect(installer).toContain('[ -d "$nightly_unit_dir" ] && [ ! -L "$nightly_unit_dir" ]');
+    expect(installer).toContain('[ -d "$nightly_wants_dir" ] && [ ! -L "$nightly_wants_dir" ]');
+    expect(installer).toContain('[ "$(/usr/bin/readlink "$source")" = /dev/null ]');
+    expect(installer).toContain('[ "$(/usr/bin/stat -c \'%u\' "$source")" -eq 0 ]');
+    expect(installer).toContain('[ "$(/usr/bin/stat -c \'%a\' "$source")" = 644 ]');
+    expect(installer).toContain('case "$nightly_timer_enabled" in enabled|disabled|masked)');
+    expect(installer).toContain('case "$nightly_service_enabled" in static|masked)');
+    expect(installer).toContain('case "$nightly_timer_active" in active|inactive)');
+    expect(installer).toContain('case "$nightly_service_active" in active|inactive)');
+    expect(installer).toContain(
+      '[ "$(/usr/bin/readlink "$nightly_wants_link")" = "$nightly_timer_path" ]',
+    );
+    expect(preflightIndex).toBeGreaterThan(installer.indexOf('"$node_path" "$entry" --version'));
+    expect(preflightIndex).toBeLessThan(transactionIndex);
+  });
+
+  it("retires both nightly units inside the existing reversible transaction", () => {
+    const timerBackupIndex = installer.indexOf(
+      'backup_nightly_path nightly_timer "$nightly_timer_path"',
+    );
+    const serviceBackupIndex = installer.indexOf(
+      'backup_nightly_path nightly_service "$nightly_service_path"',
+    );
+    const wantsBackupIndex = installer.indexOf(
+      'backup_nightly_path nightly_wants "$nightly_wants_link"',
+    );
+    const trapIndex = installer.indexOf("trap exit_handler EXIT");
+    const forwardIndex = installer.indexOf('systemctl stop "$nightly_timer_unit"', trapIndex);
+    const forward = installer.slice(forwardIndex);
+    expect(timerBackupIndex).toBeGreaterThan(-1);
+    expect(serviceBackupIndex).toBeGreaterThan(timerBackupIndex);
+    expect(wantsBackupIndex).toBeGreaterThan(serviceBackupIndex);
+    expect(trapIndex).toBeGreaterThan(wantsBackupIndex);
+    expect(forwardIndex).toBeGreaterThan(trapIndex);
+    expect(forward).toContain('systemctl stop "$nightly_service_unit"');
+    expect(forward).toContain('systemctl disable "$nightly_timer_unit"');
+    expect(forward).toContain('[ ! -e "$nightly_wants_link" ] && [ ! -L "$nightly_wants_link" ]');
+    expect(forward).toContain('rm -f "$nightly_timer_path"');
+    expect(forward).toContain('rm -f "$nightly_service_path"');
+    expect(forward).toContain('systemctl mask "$nightly_timer_unit"');
+    expect(forward).toContain('systemctl mask "$nightly_service_unit"');
+    expect(forward).toContain('[ "$(/usr/bin/readlink "$nightly_timer_path")" = /dev/null ]');
+    expect(forward).toContain('[ "$(/usr/bin/readlink "$nightly_service_path")" = /dev/null ]');
+    expect(forward).toContain('[ "$(read_unit_state is-enabled "$nightly_timer_unit")" = masked ]');
+    expect(forward).toContain(
+      '[ "$(read_unit_state is-enabled "$nightly_service_unit")" = masked ]',
+    );
+    expect(forward).toContain(
+      '[ "$(read_unit_state is-active "$nightly_timer_unit")" = inactive ]',
+    );
+    expect(forward).toContain(
+      '[ "$(read_unit_state is-active "$nightly_service_unit")" = inactive ]',
+    );
+    expect(forward).not.toMatch(/nightly_[^\n]*\|\| true/);
+  });
+
+  it("restores exact nightly artifacts and states without recursive deletion", () => {
+    const restoreStart = installer.indexOf("restore_nightly_units() {");
+    const restoreEnd = installer.indexOf("\n}\nrollback() {", restoreStart);
+    const restore = installer.slice(restoreStart, restoreEnd);
+    expect(restore).toContain('systemctl stop "$nightly_timer_unit"');
+    expect(restore).toContain('systemctl stop "$nightly_service_unit"');
+    expect(restore).toContain('systemctl unmask "$nightly_timer_unit"');
+    expect(restore).toContain('systemctl unmask "$nightly_service_unit"');
+    expect(restore).toContain('restore_nightly_path nightly_timer "$nightly_timer_path"');
+    expect(restore).toContain('restore_nightly_path nightly_service "$nightly_service_path"');
+    expect(restore).toContain('restore_nightly_path nightly_wants "$nightly_wants_link"');
+    expect(restore.indexOf("systemctl daemon-reload")).toBeGreaterThan(
+      restore.indexOf('restore_nightly_path nightly_wants "$nightly_wants_link"'),
+    );
+    expect(restore).toContain('enabled) systemctl enable "$nightly_timer_unit"');
+    expect(restore).toContain('disabled) systemctl disable "$nightly_timer_unit"');
+    expect(restore).toContain('active) systemctl start "$nightly_timer_unit"');
+    expect(restore).toContain('active) systemctl start "$nightly_service_unit"');
+    expect(restore).toContain("verify_nightly_original_state");
+    expect(installer).toContain('rm -f "$target"');
+    expect(installer).not.toMatch(/rm -rf ["']?\$nightly_/);
+    expect(installer).not.toMatch(/rm -rf [^\n]*(?:nightly-update|timers\\.target\\.wants)/);
+    expect(installer).toContain('case "$nightly_timer_enabled" in\n  enabled|disabled)');
+    expect(installer).toContain("masked) : ;;");
   });
 
   it("commits and disables signal rollback before releasing the verified activation", () => {
