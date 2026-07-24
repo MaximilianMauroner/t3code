@@ -201,6 +201,15 @@ while [ "$verified_seconds" -lt 120 ]; do
 done
 body="$(curl --fail --silent --show-error --max-time 10 "$health_url")"
 printf '%s' "$body" | grep -Eq "\"currentCommit\"[[:space:]]*:[[:space:]]*\"${commit}\""
-release_update_lock
+
+# Commit activation before releasing ownership. From here on, failures leave
+# the verified deployment in place and never run rollback.
+trap - EXIT HUP INT TERM
 install_complete=true
+rollback_complete=true
+rm -rf "$backup_dir"
+if ! release_update_lock; then
+  printf '%s\n' "Verified activation is committed, but update lock ownership changed; refusing rollback." >&2
+  exit 1
+fi
 printf '%s\n' "Installed and verified immutable T3 Code fork release ${commit}."

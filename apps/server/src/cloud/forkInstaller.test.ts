@@ -26,8 +26,17 @@ function lockCommand(
   pid: number,
   token: string,
 ) {
+  const guardParent = NodePath.join(stateDir, "test-guard-root");
+  if (!NodeFS.existsSync(guardParent)) {
+    NodeFS.mkdirSync(guardParent, { mode: 0o700 });
+  }
   return NodeChildProcess.spawnSync(lockHelper, [operation, stateDir, String(pid), token], {
     encoding: "utf8",
+    env: {
+      ...process.env,
+      T3CODE_ALLOW_TEST_LOCK_GUARD: "1",
+      T3CODE_TEST_LOCK_GUARD_PATH: NodePath.join(guardParent, "guard"),
+    },
   });
 }
 
@@ -96,17 +105,37 @@ describe("fork service bootstrap installer", () => {
     expect(installer.indexOf("trap early_exit_handler EXIT")).toBeLessThan(acquireIndex);
     expect(acquireIndex).toBeLessThan(installer.indexOf('pnpm_version="$(run_as_user'));
     expect(acquireIndex).toBeLessThan(installer.indexOf("run_as_user git"));
-    expect(installer.indexOf("release_update_lock\ninstall_complete=true")).toBeGreaterThan(
-      installer.indexOf('while [ "$verified_seconds" -lt 120 ]'),
-    );
     expect(installer).not.toContain("backup_file update_lock");
     expect(installer).not.toContain("restore_file update_lock");
     expect(installer).not.toContain('rm -rf "$lock_path"');
   });
 
+  it("commits and disables signal rollback before releasing the verified activation", () => {
+    const finalProbeIndex = installer.lastIndexOf("curl --fail --silent --show-error");
+    const disableTrapsIndex = installer.indexOf("trap - EXIT HUP INT TERM", finalProbeIndex);
+    const committedIndex = installer.indexOf("install_complete=true", disableTrapsIndex);
+    const releaseIndex = installer.indexOf("release_update_lock", committedIndex);
+    expect(disableTrapsIndex).toBeGreaterThan(
+      installer.indexOf('while [ "$verified_seconds" -lt 120 ]'),
+    );
+    expect(committedIndex).toBeGreaterThan(disableTrapsIndex);
+    expect(releaseIndex).toBeGreaterThan(committedIndex);
+    expect(installer.indexOf("rollback_complete=true", disableTrapsIndex)).toBeLessThan(
+      releaseIndex,
+    );
+    expect(installer.indexOf("refusing rollback", releaseIndex)).toBeGreaterThan(releaseIndex);
+  });
+
   it("refuses a live second owner without changing metadata", () => {
     withStateDir((stateDir) => {
       expect(lockCommand("acquire", stateDir, process.pid, firstToken).status).toBe(0);
+      const lockPath = NodePath.join(stateDir, "fork-update.lock");
+      expect(NodeFS.statSync(lockPath).mode & 0o777).toBe(0o700);
+      expect(NodeFS.statSync(NodePath.join(lockPath, "pid")).mode & 0o777).toBe(0o600);
+      expect(NodeFS.statSync(NodePath.join(lockPath, "token")).mode & 0o777).toBe(0o600);
+      expect(
+        NodeFS.statSync(NodePath.join(stateDir, "test-guard-root", "guard")).mode & 0o777,
+      ).toBe(0o600);
       const before = ownerBytes(stateDir);
       expect(lockCommand("acquire", stateDir, process.pid, secondToken).status).not.toBe(0);
       expect(ownerBytes(stateDir)).toEqual(before);
@@ -117,9 +146,13 @@ describe("fork service bootstrap installer", () => {
   it("recovers a conclusively dead well-formed owner", () => {
     withStateDir((stateDir) => {
       const lockPath = NodePath.join(stateDir, "fork-update.lock");
-      NodeFS.mkdirSync(lockPath);
-      NodeFS.writeFileSync(NodePath.join(lockPath, "pid"), `${String(deadPid)}\n`);
-      NodeFS.writeFileSync(NodePath.join(lockPath, "token"), `${firstToken}\n`);
+      NodeFS.mkdirSync(lockPath, { mode: 0o700 });
+      NodeFS.writeFileSync(NodePath.join(lockPath, "pid"), `${String(deadPid)}\n`, {
+        mode: 0o600,
+      });
+      NodeFS.writeFileSync(NodePath.join(lockPath, "token"), `${firstToken}\n`, {
+        mode: 0o600,
+      });
       expect(lockCommand("acquire", stateDir, process.pid, secondToken).status).toBe(0);
       expect(ownerBytes(stateDir)).toEqual({
         pid: `${String(process.pid)}\n`,
@@ -176,6 +209,19 @@ describe("fork service bootstrap installer", () => {
       expect(lockCommand("release", stateDir, process.pid, secondToken).status).not.toBe(0);
       expect(ownerBytes(stateDir)).toEqual(before);
       expect(lockCommand("release", stateDir, process.pid, firstToken).status).toBe(0);
+      expect(NodeFS.existsSync(NodePath.join(stateDir, "fork-update.lock"))).toBe(false);
+    });
+  });
+
+  it("rejects a symlinked guard without changing foreign bytes", () => {
+    withStateDir((stateDir) => {
+      const guardParent = NodePath.join(stateDir, "test-guard-root");
+      NodeFS.mkdirSync(guardParent, { mode: 0o700 });
+      const foreignPath = NodePath.join(stateDir, "foreign-guard");
+      NodeFS.writeFileSync(foreignPath, "foreign-guard-bytes");
+      NodeFS.symlinkSync(foreignPath, NodePath.join(guardParent, "guard"));
+      expect(lockCommand("acquire", stateDir, process.pid, firstToken).status).not.toBe(0);
+      expect(NodeFS.readFileSync(foreignPath, "utf8")).toBe("foreign-guard-bytes");
       expect(NodeFS.existsSync(NodePath.join(stateDir, "fork-update.lock"))).toBe(false);
     });
   });

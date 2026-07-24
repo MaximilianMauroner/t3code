@@ -75,9 +75,13 @@ function writeOwner(
   owner: { readonly pid: number; readonly token: string },
 ): string {
   const lockPath = NodePath.join(stateDir, "fork-update.lock");
-  NodeFS.mkdirSync(lockPath);
-  NodeFS.writeFileSync(NodePath.join(lockPath, "pid"), `${String(owner.pid)}\n`);
-  NodeFS.writeFileSync(NodePath.join(lockPath, "token"), `${owner.token}\n`);
+  NodeFS.mkdirSync(lockPath, { mode: 0o700 });
+  NodeFS.writeFileSync(NodePath.join(lockPath, "pid"), `${String(owner.pid)}\n`, {
+    mode: 0o600,
+  });
+  NodeFS.writeFileSync(NodePath.join(lockPath, "token"), `${owner.token}\n`, {
+    mode: 0o600,
+  });
   return lockPath;
 }
 
@@ -164,6 +168,9 @@ describe("UpdateMaintenanceGate", () => {
       Effect.gen(function* () {
         yield* fixture.gate.acquire;
         const lockPath = NodePath.join(fixture.stateDir, "fork-update.lock");
+        expect(NodeFS.statSync(lockPath).mode & 0o777).toBe(0o700);
+        expect(NodeFS.statSync(NodePath.join(lockPath, "pid")).mode & 0o777).toBe(0o600);
+        expect(NodeFS.statSync(NodePath.join(lockPath, "token")).mode & 0o777).toBe(0o600);
         expect(NodeFS.readFileSync(NodePath.join(lockPath, "pid"), "utf8").trim()).toBe(
           String(process.pid),
         );

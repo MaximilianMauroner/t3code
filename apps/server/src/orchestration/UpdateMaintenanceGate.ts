@@ -106,12 +106,15 @@ function readOwner(
     lockStat === null ||
     !lockStat.isDirectory() ||
     lockStat.isSymbolicLink() ||
+    (lockStat.mode & 0o777) !== 0o700 ||
     ownerStat === null ||
     !ownerStat.isFile() ||
     ownerStat.isSymbolicLink() ||
+    (ownerStat.mode & 0o777) !== 0o600 ||
     tokenStat === null ||
     !tokenStat.isFile() ||
-    tokenStat.isSymbolicLink()
+    tokenStat.isSymbolicLink() ||
+    (tokenStat.mode & 0o777) !== 0o600
   ) {
     return null;
   }

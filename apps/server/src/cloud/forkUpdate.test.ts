@@ -179,6 +179,7 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       service,
       currentLink,
       releasesDir,
+      stateDir: path.join(root, "state", "userdata"),
       remake: () => makeOne,
       restartCount: () => restarts,
     };
@@ -269,6 +270,15 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
         yield* FileSystem.FileSystem.pipe(Effect.flatMap((fs) => fs.readLink(context.currentLink))),
         context.currentLink.replace("current", "releases/new-commit"),
       );
+      const fs = yield* FileSystem.FileSystem;
+      const verificationPath = `${context.stateDir}/fork-update-verification.json`;
+      const verification = yield* fs.readFileString(verificationPath);
+      const token = /"lockOwnerToken":"([^"]+)"/.exec(verification)?.[1] ?? "";
+      assert.match(token, /^[0-9a-f-]{36}$/i);
+      const verificationInfo = yield* fs.stat(verificationPath);
+      assert.equal(verificationInfo.mode & 0o777, 0o600);
+      const status = yield* fs.readFileString(`${context.stateDir}/fork-update.json`);
+      assert.notInclude(status, token);
     }),
   );
 

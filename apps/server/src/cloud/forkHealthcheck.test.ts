@@ -46,11 +46,14 @@ describe("t3code-fork-healthcheck", () => {
       }),
     );
     const lockPath = NodePath.join(stateDir, "fork-update.lock");
-    NodeFS.mkdirSync(lockPath);
-    NodeFS.writeFileSync(NodePath.join(lockPath, "pid"), `${String(process.pid)}\n`);
+    NodeFS.mkdirSync(lockPath, { mode: 0o700 });
+    NodeFS.writeFileSync(NodePath.join(lockPath, "pid"), `${String(process.pid)}\n`, {
+      mode: 0o600,
+    });
     NodeFS.writeFileSync(
       NodePath.join(lockPath, "token"),
       "123e4567-e89b-42d3-a456-426614174000\n",
+      { mode: 0o600 },
     );
     NodeFS.writeFileSync(healthState, "healthy\n");
     NodeFS.writeFileSync(timeState, "100\n");

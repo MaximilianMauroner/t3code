@@ -232,9 +232,22 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
         if (runningHere || awaitingHealthcheck) {
           return status;
         }
+        const latestStatus = yield* fs.readFileString(statusPath).pipe(
+          Effect.flatMap((raw) => decodeStatus(raw)),
+          Effect.orElseSucceed(() => status),
+        );
+        if (terminalStages.has(latestStatus.stage) || (yield* Ref.get(inFlight))) {
+          return latestStatus;
+        }
+        if (
+          (latestStatus.stage === "restarting" || latestStatus.stage === "verifying") &&
+          (yield* fs.exists(verificationPath).pipe(Effect.orElseSucceed(() => false)))
+        ) {
+          return latestStatus;
+        }
         const completedAt = yield* nowIso;
         const recovered: ServerForkUpdateStatus = {
-          ...status,
+          ...latestStatus,
           stage: "failed",
           message: "The previous update was interrupted before it completed.",
           completedAt,
@@ -630,6 +643,7 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
       const currentTimeMillis = yield* Clock.currentTimeMillis;
       yield* writeFileStringAtomically({
         filePath: verificationPath,
+        mode: 0o600,
         contents: `${encodeVerification({
           previousTarget,
           targetCommit,
