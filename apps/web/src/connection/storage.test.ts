@@ -2,10 +2,10 @@ import { ConnectionTransientError } from "@t3tools/client-runtime/connection";
 import { ConnectionCatalogDocument } from "@t3tools/client-runtime/platform";
 import {
   EnvironmentId,
+  OrchestrationThreadDetailSnapshot,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
-  type OrchestrationThreadDetailSnapshot,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -28,6 +28,16 @@ const emptyCatalog = {
   remoteDpopTokens: [],
 } as const;
 const decodeCatalog = Schema.decodeUnknownSync(Schema.fromJsonString(ConnectionCatalogDocument));
+const encodeV2ThreadSnapshot = Schema.encodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      schemaVersion: Schema.Literal(2),
+      environmentId: EnvironmentId,
+      threadId: ThreadId,
+      snapshot: OrchestrationThreadDetailSnapshot,
+    }),
+  ),
+);
 const environmentId = EnvironmentId.make("environment-1");
 const threadId = ThreadId.make("thread-1");
 const threadSnapshot: OrchestrationThreadDetailSnapshot = {
@@ -123,7 +133,7 @@ describe("thread snapshot cache codec", () => {
   it.effect("treats a v2 record as a cold cache", () =>
     Effect.gen(function* () {
       const cached = yield* decodeThreadSnapshotCache(
-        JSON.stringify({
+        encodeV2ThreadSnapshot({
           schemaVersion: 2,
           environmentId,
           threadId,
