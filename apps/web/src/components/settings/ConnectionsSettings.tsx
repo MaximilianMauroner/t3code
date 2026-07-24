@@ -41,7 +41,7 @@ import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { cn } from "../../lib/utils";
 import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestampFormat";
 import { resolveDesktopPairingUrl, resolveHostedPairingUrl } from "./pairingUrls";
-import { applyWslEnableSelection } from "./ConnectionsSettings.logic";
+import { applyWslEnableSelection, shouldShowForkUpdate } from "./ConnectionsSettings.logic";
 import {
   SettingsPageContainer,
   SettingsRow,
@@ -133,6 +133,7 @@ import {
 import { useAtomCommand } from "../../state/use-atom-command";
 import { ConnectionStatusDot } from "../ConnectionStatusDot";
 import { ServerUpdateAction } from "../ServerUpdateAction";
+import { ForkUpdateAction } from "../ForkUpdateAction";
 import { CloudEnvironmentConnectRows } from "../cloud/CloudEnvironmentConnectList";
 import { ITEM_ROW_CLASSNAME, ITEM_ROW_INNER_CLASSNAME } from "./itemRows";
 
@@ -2980,6 +2981,16 @@ export function ConnectionsSettings() {
       {canManageLocalBackend ? (
         <>
           <SettingsSection title="This environment">
+            {primaryEnvironmentId !== null &&
+            shouldShowForkUpdate(
+              primaryEnvironmentId,
+              primaryServerConfig?.environment.forkUpdate,
+            ) ? (
+              <ForkUpdateAction
+                environmentId={primaryEnvironmentId}
+                descriptor={primaryServerConfig.environment.forkUpdate}
+              />
+            ) : null}
             {primaryVersionMismatch ? (
               <SettingsRow
                 title="Version drift"
@@ -3307,6 +3318,16 @@ export function ConnectionsSettings() {
         </>
       ) : (
         <SettingsSection title="This environment">
+          {primaryEnvironmentId !== null &&
+          shouldShowForkUpdate(
+            primaryEnvironmentId,
+            primaryServerConfig?.environment.forkUpdate,
+          ) ? (
+            <ForkUpdateAction
+              environmentId={primaryEnvironmentId}
+              descriptor={primaryServerConfig.environment.forkUpdate}
+            />
+          ) : null}
           <SettingsRow
             title="Administrative access"
             description="Pairing links and client-session management require the access:write scope for this backend."

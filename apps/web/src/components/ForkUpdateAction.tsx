@@ -1,0 +1,232 @@
+import { useEffect, useRef, useState } from "react";
+import type {
+  EnvironmentId,
+  ForkUpdateDescriptor,
+  ServerForkUpdateStage,
+  ServerForkUpdateStatus,
+} from "@t3tools/contracts";
+import {
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
+
+import { useEnvironmentQuery } from "~/state/query";
+import { serverEnvironment } from "~/state/server";
+import { useAtomCommand } from "~/state/use-atom-command";
+import { SettingsRow } from "./settings/settingsLayout";
+import { Button } from "./ui/button";
+import { Spinner } from "./ui/spinner";
+
+const RECONNECT_PENDING_EXPIRY_MS = 12 * 60_000;
+
+const ACTIVE_STAGES = new Set<ServerForkUpdateStage>([
+  "checking",
+  "fetching",
+  "merging",
+  "validating",
+  "building",
+  "packaging",
+  "pushing",
+  "deploying",
+  "restarting",
+  "verifying",
+]);
+
+export function isForkUpdateActive(stage: ServerForkUpdateStage): boolean {
+  return ACTIVE_STAGES.has(stage);
+}
+
+function shortCommit(commit: string | null | undefined): string {
+  return commit?.slice(0, 8) ?? "unknown";
+}
+
+function failureMessage(error: unknown): string {
+  return error instanceof Error && error.message.trim().length > 0
+    ? error.message
+    : "The fork update request failed.";
+}
+
+function stageLabel(stage: ServerForkUpdateStage): string {
+  return stage.replace("-", " ");
+}
+
+export interface ForkUpdateStatusPresentation {
+  readonly source: string;
+  readonly stage: string | null;
+  readonly message: string | null;
+  readonly detail: string | null;
+  readonly showsRollbackWatch: boolean;
+  readonly failed: boolean;
+}
+
+export function presentForkUpdateStatus(
+  descriptor: ForkUpdateDescriptor,
+  status: ServerForkUpdateStatus | null,
+  queryError: string | null,
+): ForkUpdateStatusPresentation {
+  return {
+    source: `${descriptor.branch} · ${shortCommit(status?.currentCommit ?? descriptor.currentCommit)}`,
+    stage: status === null ? null : stageLabel(status.stage),
+    message: status?.message ?? null,
+    detail: status?.error ?? queryError,
+    showsRollbackWatch: status?.stage === "restarting" || status?.stage === "verifying",
+    failed: status?.stage === "failed",
+  };
+}
+
+function ForkUpdateStatusView({
+  descriptor,
+  status,
+  queryError,
+}: {
+  readonly descriptor: ForkUpdateDescriptor;
+  readonly status: ServerForkUpdateStatus | null;
+  readonly queryError: string | null;
+}) {
+  const presentation = presentForkUpdateStatus(descriptor, status, queryError);
+  return (
+    <div className="space-y-1">
+      <p>{presentation.source}</p>
+      {presentation.stage !== null && presentation.message !== null ? (
+        <p className={presentation.failed ? "text-destructive" : undefined}>
+          <span className="capitalize">{presentation.stage}</span>: {presentation.message}
+        </p>
+      ) : null}
+      {presentation.detail ? (
+        <p className="max-w-xl whitespace-pre-wrap text-destructive">{presentation.detail}</p>
+      ) : null}
+      {presentation.showsRollbackWatch ? (
+        <p>The new release is under a two-minute health watch and rolls back automatically.</p>
+      ) : null}
+    </div>
+  );
+}
+
+export function ForkUpdateAction({
+  environmentId,
+  descriptor,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly descriptor: ForkUpdateDescriptor;
+}) {
+  const statusQuery = useEnvironmentQuery(
+    serverEnvironment.forkUpdateStatus({
+      environmentId,
+      input: {},
+    }),
+  );
+  const startForkUpdate = useAtomCommand(serverEnvironment.startForkUpdate, {
+    reportFailure: false,
+  });
+  const [pending, setPending] = useState(false);
+  const [requestError, setRequestError] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
+  const observedActiveRef = useRef(false);
+  const expiryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const status = statusQuery.data?.status ?? null;
+  const active = status !== null && isForkUpdateActive(status.stage);
+
+  useEffect(() => {
+    if (active) {
+      observedActiveRef.current = true;
+      return;
+    }
+    if (!pending || !observedActiveRef.current) return;
+    inFlightRef.current = false;
+    observedActiveRef.current = false;
+    setPending(false);
+    if (expiryRef.current !== null) {
+      clearTimeout(expiryRef.current);
+      expiryRef.current = null;
+    }
+  }, [active, pending, status]);
+
+  useEffect(
+    () => () => {
+      if (expiryRef.current !== null) {
+        clearTimeout(expiryRef.current);
+      }
+      inFlightRef.current = false;
+      observedActiveRef.current = false;
+    },
+    [],
+  );
+
+  const handleStart = () => {
+    if (inFlightRef.current || active) return;
+    inFlightRef.current = true;
+    observedActiveRef.current = false;
+    setPending(true);
+    setRequestError(null);
+    expiryRef.current = setTimeout(() => {
+      expiryRef.current = null;
+      inFlightRef.current = false;
+      observedActiveRef.current = false;
+      setPending(false);
+      setRequestError(
+        "The update request timed out. The server may still be working; its persisted status will appear after reconnection.",
+      );
+    }, RECONNECT_PENDING_EXPIRY_MS);
+
+    void Promise.resolve()
+      .then(() => startForkUpdate({ environmentId, input: {} }))
+      .then((result) => {
+        if (result._tag === "Failure") {
+          if (!isAtomCommandInterrupted(result)) {
+            setRequestError(failureMessage(squashAtomCommandFailure(result)));
+            inFlightRef.current = false;
+            observedActiveRef.current = false;
+            setPending(false);
+            if (expiryRef.current !== null) {
+              clearTimeout(expiryRef.current);
+              expiryRef.current = null;
+            }
+          }
+          return;
+        }
+        if (isForkUpdateActive(result.value.status.stage)) {
+          observedActiveRef.current = true;
+        } else {
+          inFlightRef.current = false;
+          observedActiveRef.current = false;
+          setPending(false);
+          if (expiryRef.current !== null) {
+            clearTimeout(expiryRef.current);
+            expiryRef.current = null;
+          }
+        }
+        statusQuery.refresh();
+      })
+      .catch((error: unknown) => {
+        setRequestError(failureMessage(error));
+        inFlightRef.current = false;
+        observedActiveRef.current = false;
+        setPending(false);
+        if (expiryRef.current !== null) {
+          clearTimeout(expiryRef.current);
+          expiryRef.current = null;
+        }
+      });
+  };
+
+  const disabled = pending || active;
+  return (
+    <SettingsRow
+      title="Fork updates"
+      description={`Fetch upstream, merge into ${descriptor.repository}, validate, and deploy the exact commit from ${descriptor.branch}. Active turns block updates.`}
+      status={
+        <ForkUpdateStatusView
+          descriptor={descriptor}
+          status={status}
+          queryError={requestError ?? statusQuery.error}
+        />
+      }
+      control={
+        <Button size="xs" disabled={disabled} onClick={handleStart}>
+          {disabled ? <Spinner className="size-3.5" /> : null}
+          Fetch & deploy latest
+        </Button>
+      }
+    />
+  );
+}

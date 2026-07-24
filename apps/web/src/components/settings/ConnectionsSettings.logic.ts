@@ -1,4 +1,16 @@
-import type { DesktopBridge, DesktopWslState } from "@t3tools/contracts";
+import type {
+  DesktopBridge,
+  DesktopWslState,
+  EnvironmentId,
+  ForkUpdateDescriptor,
+} from "@t3tools/contracts";
+
+export function shouldShowForkUpdate(
+  environmentId: EnvironmentId | null,
+  descriptor: ForkUpdateDescriptor | undefined,
+): descriptor is ForkUpdateDescriptor {
+  return environmentId !== null && descriptor !== undefined;
+}
 
 type WslEnableBridge = Pick<DesktopBridge, "setWslBackendEnabled" | "setWslDistro" | "setWslOnly">;
 
