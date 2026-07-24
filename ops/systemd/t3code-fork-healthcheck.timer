@@ -1,0 +1,11 @@
+[Unit]
+Description=Check T3 Code fork release health
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+AccuracySec=1s
+Unit=t3code-fork-healthcheck.service
+
+[Install]
+WantedBy=timers.target

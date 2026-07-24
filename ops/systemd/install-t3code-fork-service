@@ -1,0 +1,215 @@
+#!/bin/sh
+set -eu
+
+[ "$(id -u)" -eq 0 ] || { printf '%s\n' "Run this installer as root." >&2; exit 1; }
+
+run_user="${T3CODE_RUN_USER:-codex}"
+repo="${T3CODE_REPOSITORY_PATH:-/home/codex/work/t3code}"
+state_dir="${T3CODE_STATE_DIR:-/home/codex/.t3code/userdata}"
+releases_dir="${state_dir}/fork-releases"
+current_link="${state_dir}/fork-current"
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+lock_helper="${script_dir}/t3code-fork-lock"
+node_path="${T3CODE_NODE_PATH:-/home/codex/.local/share/pnpm/bin/node}"
+pnpm_path="${T3CODE_PNPM_PATH:-/home/codex/.local/bin/pnpm}"
+dropin_dir="/etc/systemd/system/t3code.service.d"
+dropin_path="${dropin_dir}/zz-fork-update.conf"
+old_dropin_path="${dropin_dir}/fork-update.conf"
+health_script="/usr/local/sbin/t3code-fork-healthcheck"
+health_lock_helper="/usr/local/sbin/t3code-fork-lock"
+health_service="/etc/systemd/system/t3code-fork-healthcheck.service"
+health_timer="/etc/systemd/system/t3code-fork-healthcheck.timer"
+health_url="${T3CODE_HEALTH_URL:-http://127.0.0.1:41731/.well-known/t3/environment}"
+
+[ -x "$node_path" ] || { printf '%s\n' "Configured Node executable is unavailable." >&2; exit 1; }
+[ -x "$pnpm_path" ] || { printf '%s\n' "Configured pnpm executable is unavailable." >&2; exit 1; }
+[ -x "$lock_helper" ] || { printf '%s\n' "Update lock helper is unavailable." >&2; exit 1; }
+command -v flock >/dev/null 2>&1 || { printf '%s\n' "flock is unavailable." >&2; exit 1; }
+
+run_as_user() { runuser -u "$run_user" -- env "PATH=$(dirname "$node_path"):$(dirname "$pnpm_path"):/usr/bin:/bin" "$@"; }
+install -d -o "$run_user" -g "$run_user" "$state_dir"
+lock_token="$(cat /proc/sys/kernel/random/uuid)"
+lock_acquired=false
+release_update_lock() {
+  [ "$lock_acquired" = true ] || return
+  if "$lock_helper" release "$state_dir" "$$" "$lock_token"; then
+    lock_acquired=false
+  else
+    return 1
+  fi
+}
+early_exit_handler() {
+  status=$?
+  trap - EXIT
+  release_update_lock || true
+  exit "$status"
+}
+early_signal_handler() {
+  trap - EXIT HUP INT TERM
+  release_update_lock || true
+  exit 1
+}
+trap early_exit_handler EXIT
+trap early_signal_handler HUP INT TERM
+"$lock_helper" acquire "$state_dir" "$$" "$lock_token"
+lock_acquired=true
+
+pnpm_version="$(run_as_user "$pnpm_path" --version)"
+case "$pnpm_version" in
+  [0-9]*.[0-9]*.[0-9]*) ;;
+  *) printf '%s\n' "Configured pnpm executable did not return a version." >&2; exit 1 ;;
+esac
+remote_matches() {
+  case "$1" in
+    "https://github.com/$2"|"https://github.com/$2.git"|"git@github.com:$2"|"git@github.com:$2.git"|"ssh://git@github.com/$2"|"ssh://git@github.com/$2.git") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+[ "$(run_as_user git -C "$repo" status --porcelain)" = "" ] || { printf '%s\n' "Dirty checkout." >&2; exit 1; }
+[ "$(run_as_user git -C "$repo" branch --show-current)" = main ] || { printf '%s\n' "Checkout must be on main." >&2; exit 1; }
+origin_url="$(run_as_user git -C "$repo" remote get-url origin)"
+upstream_url="$(run_as_user git -C "$repo" remote get-url upstream)"
+remote_matches "$origin_url" "MaximilianMauroner/t3code" || { printf '%s\n' "Unexpected origin." >&2; exit 1; }
+remote_matches "$upstream_url" "pingdotgg/t3code" || { printf '%s\n' "Unexpected upstream." >&2; exit 1; }
+run_as_user git -C "$repo" fetch --prune origin refs/heads/main:refs/remotes/origin/main
+commit="$(run_as_user git -C "$repo" rev-parse HEAD)"
+origin_commit="$(run_as_user git -C "$repo" rev-parse origin/main)"
+[ "$commit" = "$origin_commit" ] || { printf '%s\n' "HEAD does not equal fetched origin/main." >&2; exit 1; }
+
+release_dir="${releases_dir}/${commit}"
+entry="${release_dir}/node_modules/t3/dist/bin.mjs"
+sentinel="${release_dir}/.t3-fork-release-complete"
+install -d -o "$run_user" -g "$run_user" "$releases_dir"
+if [ ! -f "$sentinel" ] || [ "$(cat "$sentinel")" != "$commit" ] || [ ! -f "$entry" ]; then
+  staged_release="${releases_dir}/.release-${commit}"
+  pack_dir="${releases_dir}/.pack-${commit}"
+  rm -rf "$staged_release" "$pack_dir"
+  install -d -o "$run_user" -g "$run_user" "$staged_release" "$pack_dir"
+  run_as_user "$pnpm_path" -C "$repo" install --frozen-lockfile
+  run_as_user "$pnpm_path" -C "$repo" exec vp test run packages/contracts/src/server.test.ts \
+    apps/server/src/cloud/forkUpdate.test.ts apps/server/src/cloud/forkHealthcheck.test.ts \
+    apps/server/src/cloud/forkInstaller.test.ts \
+    apps/server/src/orchestration/UpdateMaintenanceGate.test.ts \
+    apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts \
+    apps/web/src/components/ForkUpdateAction.test.tsx \
+    apps/web/src/components/settings/ConnectionsSettings.logic.test.ts
+  run_as_user "$pnpm_path" -C "$repo" exec vp run --filter @t3tools/contracts --filter @t3tools/web --filter t3 typecheck
+  run_as_user "$pnpm_path" -C "$repo" exec vp run --filter @t3tools/web build
+  run_as_user "$pnpm_path" -C "$repo" exec vp run --filter t3 build
+  run_as_user "$pnpm_path" -C "$repo" --filter t3 pack --pack-destination "$pack_dir"
+  tarball="$(find "$pack_dir" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+  [ -n "$tarball" ] || { printf '%s\n' "Package missing." >&2; exit 1; }
+  run_as_user sh -c 'printf "%s\n" "{ \"private\": true }" >"$1/package.json"' bootstrap "$staged_release"
+  run_as_user "$pnpm_path" --ignore-workspace --dir "$staged_release" add --prod "$tarball"
+  run_as_user "$node_path" "$staged_release/node_modules/t3/dist/bin.mjs" --version >/dev/null
+  run_as_user sh -c 'printf "%s\n" "$1" >"$2"' bootstrap "$commit" "$staged_release/.t3-fork-release-complete"
+  rm -rf "$release_dir"
+  mv "$staged_release" "$release_dir"
+  rm -rf "$pack_dir"
+fi
+"$node_path" "$entry" --version >/dev/null
+
+# Everything below is one reversible activation transaction.
+backup_dir="$(mktemp -d)"
+backup_file() {
+  label="$1"; source="$2"
+  if [ -e "$source" ] || [ -L "$source" ]; then cp -a "$source" "$backup_dir/$label"; else : >"$backup_dir/$label.absent"; fi
+}
+restore_file() {
+  label="$1"; target="$2"
+  rm -rf "$target"
+  [ -f "$backup_dir/$label.absent" ] || cp -a "$backup_dir/$label" "$target"
+}
+backup_file current "$current_link"
+backup_file old_dropin "$old_dropin_path"
+backup_file dropin "$dropin_path"
+backup_file health_script "$health_script"
+backup_file health_lock_helper "$health_lock_helper"
+backup_file health_service "$health_service"
+backup_file health_timer "$health_timer"
+nightly_enabled="$(systemctl is-enabled t3code-nightly-update.timer 2>/dev/null || true)"
+nightly_active="$(systemctl is-active t3code-nightly-update.timer 2>/dev/null || true)"
+health_enabled="$(systemctl is-enabled t3code-fork-healthcheck.timer 2>/dev/null || true)"
+health_active="$(systemctl is-active t3code-fork-healthcheck.timer 2>/dev/null || true)"
+service_active="$(systemctl is-active t3code.service 2>/dev/null || true)"
+install_complete=false
+rollback_complete=false
+rollback() {
+  [ "$rollback_complete" = true ] && return
+  rollback_complete=true
+  if [ "$install_complete" = true ]; then
+    rm -rf "$backup_dir"
+    release_update_lock || true
+    return
+  fi
+  restore_file current "$current_link"
+  restore_file old_dropin "$old_dropin_path"
+  restore_file dropin "$dropin_path"
+  restore_file health_script "$health_script"
+  restore_file health_lock_helper "$health_lock_helper"
+  restore_file health_service "$health_service"
+  restore_file health_timer "$health_timer"
+  systemctl daemon-reload || true
+  systemctl unmask t3code-nightly-update.timer >/dev/null 2>&1 || true
+  case "$nightly_enabled" in enabled) systemctl enable t3code-nightly-update.timer || true ;; masked) systemctl mask t3code-nightly-update.timer || true ;; *) systemctl disable t3code-nightly-update.timer || true ;; esac
+  [ "$nightly_active" = active ] && systemctl start t3code-nightly-update.timer || systemctl stop t3code-nightly-update.timer || true
+  systemctl unmask t3code-fork-healthcheck.timer >/dev/null 2>&1 || true
+  case "$health_enabled" in enabled) systemctl enable t3code-fork-healthcheck.timer || true ;; masked) systemctl mask t3code-fork-healthcheck.timer || true ;; *) systemctl disable t3code-fork-healthcheck.timer || true ;; esac
+  [ "$health_active" = active ] && systemctl start t3code-fork-healthcheck.timer || systemctl stop t3code-fork-healthcheck.timer || true
+  [ "$service_active" = active ] && systemctl restart t3code.service || systemctl stop t3code.service || true
+  rm -rf "$backup_dir"
+  release_update_lock || true
+}
+exit_handler() {
+  status=$?
+  trap - EXIT
+  rollback
+  exit "$status"
+}
+signal_handler() {
+  trap - EXIT HUP INT TERM
+  rollback
+  exit 1
+}
+trap exit_handler EXIT
+trap signal_handler HUP INT TERM
+
+next_link="${current_link}.bootstrap.$$"
+ln -s "$release_dir" "$next_link"
+mv -Tf "$next_link" "$current_link"
+install -d "$dropin_dir"
+rm -f "$old_dropin_path"
+install -m 0644 "$script_dir/t3code.service.d/zz-fork-update.conf" "$dropin_path"
+install -m 0755 "$script_dir/t3code-fork-healthcheck" "$health_script"
+install -m 0755 "$lock_helper" "$health_lock_helper"
+install -m 0644 "$script_dir/t3code-fork-healthcheck.service" "$health_service"
+install -m 0644 "$script_dir/t3code-fork-healthcheck.timer" "$health_timer"
+systemctl daemon-reload
+systemctl show t3code.service -p ExecStart --value | grep -F "fork-current/node_modules/t3/dist/bin.mjs" >/dev/null
+systemctl disable --now t3code-nightly-update.timer || true
+systemctl mask t3code-nightly-update.timer
+systemctl enable --now t3code-fork-healthcheck.timer
+systemctl restart t3code.service
+
+verified_seconds=0
+while [ "$verified_seconds" -lt 120 ]; do
+  body="$(curl --fail --silent --show-error --max-time 10 "$health_url")"
+  printf '%s' "$body" | grep -Eq "\"currentCommit\"[[:space:]]*:[[:space:]]*\"${commit}\""
+  sleep 5
+  verified_seconds=$((verified_seconds + 5))
+done
+body="$(curl --fail --silent --show-error --max-time 10 "$health_url")"
+printf '%s' "$body" | grep -Eq "\"currentCommit\"[[:space:]]*:[[:space:]]*\"${commit}\""
+
+# Commit activation before releasing ownership. From here on, failures leave
+# the verified deployment in place and never run rollback.
+trap - EXIT HUP INT TERM
+install_complete=true
+rollback_complete=true
+rm -rf "$backup_dir"
+if ! release_update_lock; then
+  printf '%s\n' "Verified activation is committed, but update lock ownership changed; refusing rollback." >&2
+  exit 1
+fi
+printf '%s\n' "Installed and verified immutable T3 Code fork release ${commit}."

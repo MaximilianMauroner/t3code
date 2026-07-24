@@ -45,6 +45,7 @@ import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
 } from "../Services/OrchestrationEngine.ts";
+import { UpdateMaintenanceGate, type UpdateDispatchAcceptance } from "../UpdateMaintenanceGate.ts";
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
@@ -52,6 +53,7 @@ const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvar
 
 interface CommandEnvelope {
   command: OrchestrationCommand;
+  maintenanceAcceptance: UpdateDispatchAcceptance;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   startedAtMs: number;
 }
@@ -83,6 +85,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const crypto = yield* Crypto.Crypto;
+  const maintenanceGate = yield* UpdateMaintenanceGate;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
@@ -150,69 +153,78 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
-        const eventBase = yield* decideOrchestrationCommand({
-          command: envelope.command,
-          readModel: commandReadModel,
-        }).pipe(
-          Effect.provideService(Crypto.Crypto, crypto),
-          Effect.mapError((cause) =>
-            isOrchestrationCommandInvariantError(cause)
-              ? cause
-              : new OrchestrationCommandInvariantError({
-                  commandType: envelope.command.type,
-                  detail: "Failed to generate an event identifier.",
-                  cause,
-                }),
-          ),
-        );
-        const eventBases = Array.isArray(eventBase) ? eventBase : [eventBase];
-        const committedCommand = yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              const committedEvents: OrchestrationEvent[] = [];
-              let nextCommandReadModel = commandReadModel;
-
-              for (const nextEvent of eventBases) {
-                const savedEvent = yield* eventStore.append(nextEvent);
-                nextCommandReadModel = yield* projectEvent(nextCommandReadModel, savedEvent);
-                yield* projectionPipeline.projectEvent(savedEvent);
-                committedEvents.push(savedEvent);
-              }
-
-              const lastSavedEvent = committedEvents.at(-1) ?? null;
-              if (lastSavedEvent === null) {
-                return yield* new OrchestrationCommandInvariantError({
-                  commandType: envelope.command.type,
-                  detail: "Command produced no events.",
-                });
-              }
-
-              yield* commandReceiptRepository.upsert({
-                commandId: envelope.command.commandId,
-                aggregateKind: lastSavedEvent.aggregateKind,
-                aggregateId: lastSavedEvent.aggregateId,
-                acceptedAt: lastSavedEvent.occurredAt,
-                resultSequence: lastSavedEvent.sequence,
-                status: "accepted",
-                error: null,
-              });
-
-              return {
-                committedEvents,
-                lastSequence: lastSavedEvent.sequence,
-                nextCommandReadModel,
-              } as const;
-            }),
-          )
-          .pipe(
-            Effect.catchTag("SqlError", (sqlError) =>
-              Effect.fail(
-                toPersistenceSqlError("OrchestrationEngine.processEnvelope:transaction")(sqlError),
+        const committedCommand = yield* maintenanceGate.withDispatchAllowed(
+          envelope.command,
+          envelope.maintenanceAcceptance,
+          Effect.gen(function* () {
+            const eventBase = yield* decideOrchestrationCommand({
+              command: envelope.command,
+              readModel: commandReadModel,
+            }).pipe(
+              Effect.provideService(Crypto.Crypto, crypto),
+              Effect.mapError((cause) =>
+                isOrchestrationCommandInvariantError(cause)
+                  ? cause
+                  : new OrchestrationCommandInvariantError({
+                      commandType: envelope.command.type,
+                      detail: "Failed to generate an event identifier.",
+                      cause,
+                    }),
               ),
-            ),
-          );
+            );
+            const eventBases = Array.isArray(eventBase) ? eventBase : [eventBase];
+            const committed = yield* sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  const committedEvents: OrchestrationEvent[] = [];
+                  let nextCommandReadModel = commandReadModel;
 
-        commandReadModel = committedCommand.nextCommandReadModel;
+                  for (const nextEvent of eventBases) {
+                    const savedEvent = yield* eventStore.append(nextEvent);
+                    nextCommandReadModel = yield* projectEvent(nextCommandReadModel, savedEvent);
+                    yield* projectionPipeline.projectEvent(savedEvent);
+                    committedEvents.push(savedEvent);
+                  }
+
+                  const lastSavedEvent = committedEvents.at(-1) ?? null;
+                  if (lastSavedEvent === null) {
+                    return yield* new OrchestrationCommandInvariantError({
+                      commandType: envelope.command.type,
+                      detail: "Command produced no events.",
+                    });
+                  }
+
+                  yield* commandReceiptRepository.upsert({
+                    commandId: envelope.command.commandId,
+                    aggregateKind: lastSavedEvent.aggregateKind,
+                    aggregateId: lastSavedEvent.aggregateId,
+                    acceptedAt: lastSavedEvent.occurredAt,
+                    resultSequence: lastSavedEvent.sequence,
+                    status: "accepted",
+                    error: null,
+                  });
+
+                  return {
+                    committedEvents,
+                    lastSequence: lastSavedEvent.sequence,
+                    nextCommandReadModel,
+                  } as const;
+                }),
+              )
+              .pipe(
+                Effect.catchTag("SqlError", (sqlError) =>
+                  Effect.fail(
+                    toPersistenceSqlError("OrchestrationEngine.processEnvelope:transaction")(
+                      sqlError,
+                    ),
+                  ),
+                ),
+              );
+            commandReadModel = committed.nextCommandReadModel;
+            return committed;
+          }),
+        );
+
         for (const [index, event] of committedCommand.committedEvents.entries()) {
           yield* PubSub.publish(eventPubSub, event);
           if (index === 0) {
@@ -311,9 +323,11 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
   const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
     Effect.gen(function* () {
+      const maintenanceAcceptance = yield* maintenanceGate.ensureDispatchAllowed(command);
       const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
       yield* Queue.offer(commandQueue, {
         command,
+        maintenanceAcceptance,
         result,
         startedAtMs: yield* Clock.currentTimeMillis,
       });

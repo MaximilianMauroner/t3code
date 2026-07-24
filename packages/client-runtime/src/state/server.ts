@@ -298,6 +298,12 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:process-resource-history",
       tag: WS_METHODS.serverGetProcessResourceHistory,
     }),
+    forkUpdateStatus: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:fork-update-status",
+      tag: WS_METHODS.serverGetForkUpdate,
+      staleTimeMs: 1_000,
+      refreshIntervalMs: 2_000,
+    }),
     configProjection,
     welcome: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:server:welcome",
@@ -326,6 +332,15 @@ export function createServerEnvironmentAtoms<R, E>(
       tag: WS_METHODS.serverUpdateServer,
       scheduler: configScheduler,
       concurrency: configConcurrency,
+    }),
+    startForkUpdate: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:start-fork-update",
+      tag: WS_METHODS.serverStartForkUpdate,
+      scheduler: configScheduler,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId }) => environmentId,
+      },
     }),
     upsertKeybinding: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:upsert-keybinding",

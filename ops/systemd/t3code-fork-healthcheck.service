@@ -1,0 +1,12 @@
+[Unit]
+Description=Check T3 Code health and roll back failed fork releases
+After=t3code.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/t3code-fork-healthcheck
+Environment=T3CODE_STATE_DIR=/home/codex/.t3code/userdata
+Environment=T3CODE_CURRENT_LINK=/home/codex/.t3code/userdata/fork-current
+Environment=T3CODE_RELEASES_DIR=/home/codex/.t3code/userdata/fork-releases
+Environment=T3CODE_SERVICE_NAME=t3code.service
+Environment=T3CODE_RUN_USER=codex

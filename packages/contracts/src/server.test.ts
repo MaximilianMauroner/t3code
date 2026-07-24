@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { ServerProvider } from "./server.ts";
+import { ServerForkUpdateStatus, ServerProvider } from "./server.ts";
 
 const decodeServerProvider = Schema.decodeUnknownSync(ServerProvider);
 
@@ -70,5 +70,35 @@ describe("ServerProvider", () => {
     });
 
     expect(parsed.continuation?.groupKey).toBe("codex:home:/Users/julius/.codex");
+  });
+});
+
+describe("ServerForkUpdateStatus", () => {
+  it("decodes persisted terminal status", () => {
+    const decoded = Schema.decodeUnknownSync(ServerForkUpdateStatus)({
+      stage: "failed",
+      message: "The current release was kept.",
+      startedAt: "2026-07-24T10:00:00.000Z",
+      completedAt: "2026-07-24T10:01:00.000Z",
+      currentCommit: "abc123",
+      targetCommit: "def456",
+      error: "Validation failed.",
+    });
+    expect(decoded.stage).toBe("failed");
+    expect(decoded.error).toBe("Validation failed.");
+  });
+
+  it("rejects unknown workflow stages", () => {
+    expect(() =>
+      Schema.decodeUnknownSync(ServerForkUpdateStatus)({
+        stage: "running-arbitrary-command",
+        message: "Unsafe",
+        startedAt: null,
+        completedAt: null,
+        currentCommit: null,
+        targetCommit: null,
+        error: null,
+      }),
+    ).toThrow();
   });
 });

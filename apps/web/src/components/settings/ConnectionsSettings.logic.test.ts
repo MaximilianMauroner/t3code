@@ -1,6 +1,6 @@
-import type { DesktopWslState } from "@t3tools/contracts";
+import { EnvironmentId, type DesktopWslState } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
-import { applyWslEnableSelection } from "./ConnectionsSettings.logic";
+import { applyWslEnableSelection, shouldShowForkUpdate } from "./ConnectionsSettings.logic";
 
 const baseWslState: DesktopWslState = {
   enabled: false,
@@ -71,5 +71,18 @@ describe("applyWslEnableSelection", () => {
     expect(calls).toEqual(["setWslOnly:true", "setWslBackendEnabled:true"]);
     expect(setWslDistro).not.toHaveBeenCalled();
     expect(state).toMatchObject({ enabled: true, wslOnly: true });
+  });
+});
+
+describe("shouldShowForkUpdate", () => {
+  it("depends on advertised fork metadata, not access-management scope", () => {
+    expect(
+      shouldShowForkUpdate(EnvironmentId.make("environment-1"), {
+        repository: "owner/fork",
+        branch: "main",
+        currentCommit: "0123456789abcdef",
+      }),
+    ).toBe(true);
+    expect(shouldShowForkUpdate(EnvironmentId.make("environment-1"), undefined)).toBe(false);
   });
 });

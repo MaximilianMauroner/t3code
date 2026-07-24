@@ -54,12 +54,23 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 
+export const ForkUpdateDescriptor = Schema.Struct({
+  repository: TrimmedNonEmptyString,
+  branch: TrimmedNonEmptyString,
+  currentCommit: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type ForkUpdateDescriptor = typeof ForkUpdateDescriptor.Type;
+
 export const ExecutionEnvironmentDescriptor = Schema.Struct({
   environmentId: EnvironmentId,
   label: TrimmedNonEmptyString,
   platform: ExecutionEnvironmentPlatform,
   serverVersion: TrimmedNonEmptyString,
   capabilities: ExecutionEnvironmentCapabilities,
+  /** Host-configured source updater. Omitted when this environment is not
+      deployed from a maintained fork. Repository paths and remotes are never
+      exposed to, or accepted from, clients. */
+  forkUpdate: Schema.optionalKey(ForkUpdateDescriptor),
 });
 export type ExecutionEnvironmentDescriptor = typeof ExecutionEnvironmentDescriptor.Type;
 
