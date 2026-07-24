@@ -326,7 +326,7 @@ describe("RpcSessionFactory", () => {
     ),
   );
 
-  it.effect("fails readiness when the websocket never opens", () =>
+  it.effect("classifies a websocket that never opens as a timeout", () =>
     Effect.gen(function* () {
       const { factory, sockets } = yield* makeFactory();
 
@@ -343,10 +343,33 @@ describe("RpcSessionFactory", () => {
 
       expect(error).toBeInstanceOf(ConnectionTransientError);
       expect(error).toMatchObject({
-        reason: "transport",
-        message: "Test environment could not establish a WebSocket connection.",
+        reason: "timeout",
+        message: "Test environment timed out while opening the WebSocket connection.",
       });
       expect(sockets[0]?.readyState).toBe(TestWebSocket.CLOSED);
     }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("classifies a close before the websocket opens as a transport failure", () =>
+    Effect.gen(function* () {
+      const { factory, sockets } = yield* makeFactory();
+
+      const error = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const session = yield* factory.connect(PREPARED);
+          const readyFiber = yield* Effect.forkChild(Effect.flip(session.ready));
+          const socket = yield* awaitSocket(sockets);
+
+          socket.close(1006, "connection failed");
+          return yield* Fiber.join(readyFiber);
+        }),
+      );
+
+      expect(error).toBeInstanceOf(ConnectionTransientError);
+      expect(error).toMatchObject({
+        reason: "transport",
+        message: "Test environment could not establish a WebSocket connection.",
+      });
+    }),
   );
 });

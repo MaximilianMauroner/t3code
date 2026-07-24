@@ -20,7 +20,10 @@ import {
   ConnectionTransientError as ConnectionTransientErrorClass,
 } from "../connection/model.ts";
 
-const SOCKET_OPEN_TIMEOUT = "15 seconds";
+const CONNECTION_OPEN_TIMEOUT = "15 seconds";
+// Keep the low-level socket timeout behind the user-facing timeout so a slow
+// handshake is classified as a timeout instead of a generic disconnect.
+const SOCKET_OPEN_TIMEOUT = "16 seconds";
 
 export interface RpcSession {
   readonly client: WsRpcProtocolClient;
@@ -130,11 +133,24 @@ export const make = Effect.gen(function* () {
       Effect.asVoid,
       Effect.withSpan("clientRuntime.connection.rpcSession.probe"),
     );
+    const opened = Deferred.await(connected).pipe(
+      Effect.timeoutOrElse({
+        duration: CONNECTION_OPEN_TIMEOUT,
+        orElse: () =>
+          Effect.fail(
+            new ConnectionTransientErrorClass({
+              reason: "timeout",
+              detail: `${connection.label} timed out while opening the WebSocket connection.`,
+            }),
+          ),
+      }),
+      Effect.raceFirst(Deferred.await(disconnected)),
+    );
 
     return {
       client,
       initialConfig,
-      ready: Deferred.await(connected).pipe(
+      ready: opened.pipe(
         Effect.andThen(initialConfig),
         Effect.asVoid,
         Effect.raceFirst(Deferred.await(disconnected)),
