@@ -54,6 +54,34 @@ function firstValidTimestampMs(...candidates: ReadonlyArray<string | null | unde
   return 0;
 }
 
+export function resolveThreadListV2SettledTimestamp(
+  thread: Pick<
+    EnvironmentThreadShell,
+    "settledAt" | "latestUserMessageAt" | "latestTurn" | "updatedAt"
+  >,
+): string | null {
+  if (thread.settledAt !== null && !Number.isNaN(Date.parse(thread.settledAt))) {
+    return thread.settledAt;
+  }
+  let latest: string | null = null;
+  let latestMs = Number.NEGATIVE_INFINITY;
+  for (const candidate of [
+    thread.latestUserMessageAt,
+    thread.latestTurn?.requestedAt,
+    thread.latestTurn?.startedAt,
+    thread.latestTurn?.completedAt,
+  ]) {
+    if (candidate == null) continue;
+    const parsed = Date.parse(candidate);
+    if (!Number.isNaN(parsed) && parsed > latestMs) {
+      latest = candidate;
+      latestMs = parsed;
+    }
+  }
+  if (latest !== null) return latest;
+  return !Number.isNaN(Date.parse(thread.updatedAt)) ? thread.updatedAt : null;
+}
+
 /**
  * v2 sort: static creation order, newest thread on top. Activity NEVER
  * reorders the list — a row holds its position from open until settled, so
@@ -192,11 +220,14 @@ export function buildThreadListV2Items(input: {
       firstValidTimestampMs(left.snoozedUntil) - firstValidTimestampMs(right.snoozedUntil) ||
       left.id.localeCompare(right.id),
   );
-  const orderedSettled = [...settled].sort(
-    (left, right) =>
-      firstValidTimestampMs(right.latestUserMessageAt, right.updatedAt) -
-      firstValidTimestampMs(left.latestUserMessageAt, left.updatedAt),
-  );
+  const orderedSettled = [...settled].sort((left, right) => {
+    const leftTimestamp = resolveThreadListV2SettledTimestamp(left);
+    const rightTimestamp = resolveThreadListV2SettledTimestamp(right);
+    return (
+      firstValidTimestampMs(rightTimestamp) - firstValidTimestampMs(leftTimestamp) ||
+      left.id.localeCompare(right.id)
+    );
+  });
   const settledLimit = input.settledLimit ?? Number.POSITIVE_INFINITY;
   const visibleSettled =
     orderedSettled.length > settledLimit ? orderedSettled.slice(0, settledLimit) : orderedSettled;

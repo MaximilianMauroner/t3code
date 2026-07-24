@@ -17,12 +17,12 @@ export {
  * rows subscribe at all.
  */
 export function useThreadPr(
-  thread: EnvironmentThreadShell,
+  thread: EnvironmentThreadShell | null,
   projectCwd: string | null,
 ): ThreadPrPresentation | null {
-  const cwd = thread.worktreePath ?? projectCwd;
+  const cwd = thread?.worktreePath ?? projectCwd;
   const gitStatus = useEnvironmentQuery(
-    thread.branch !== null && cwd !== null
+    thread !== null && thread.branch !== null && cwd !== null
       ? vcsEnvironment.status({
           environmentId: thread.environmentId,
           input: { cwd },
@@ -31,7 +31,12 @@ export function useThreadPr(
   );
 
   const status = gitStatus.data;
-  if (status === null || thread.branch === null || status.refName !== thread.branch) {
+  if (
+    thread === null ||
+    status === null ||
+    thread.branch === null ||
+    status.refName !== thread.branch
+  ) {
     return null;
   }
   if (!status.pr) {

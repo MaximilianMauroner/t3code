@@ -47,8 +47,10 @@ import {
 import { terminalDebugLog } from "../terminal/terminalDebugLog";
 import { ThreadDetailScreen } from "./ThreadDetailScreen";
 import { ThreadLifecycleNotice } from "./ThreadLifecycleNotice";
-import { effectiveSettled, effectiveSnoozed } from "@t3tools/client-runtime/state/thread-settled";
 import { useThreadListActions } from "../home/useThreadListActions";
+import { useThreadPr } from "../../state/use-thread-pr";
+import { resolveOpenThreadLifecycleState } from "./threadLifecyclePresentation";
+import { useThreadLifecycleClock } from "./useThreadLifecycleClock";
 import {
   ThreadGitControls,
   useThreadGitCenterHeaderItems,
@@ -194,6 +196,11 @@ function ThreadRouteContent(
   const selectedThreadDetailState = props.selectedThreadDetailState;
   const selectedThreadDetail = Option.getOrNull(selectedThreadDetailState.data);
   const { selectedThreadCwd } = useSelectedThreadWorktree();
+  const selectedThreadPr = useThreadPr(
+    selectedThread,
+    selectedThreadCwd ?? selectedThreadProject?.workspaceRoot ?? null,
+  );
+  const lifecycleNow = useThreadLifecycleClock(selectedThread?.snoozedUntil ?? null);
   const composer = useThreadComposerState();
   const gitState = useSelectedThreadGitState();
   const gitActions = useSelectedThreadGitActions();
@@ -747,21 +754,12 @@ function ThreadRouteContent(
   const serverConfig = routeEnvironmentRuntime?.serverConfig ?? null;
   const supportsSnooze = serverConfig?.environment.capabilities.threadSnooze === true;
   const supportsSettlement = serverConfig?.environment.capabilities.threadSettlement === true;
-  const lifecycleNow = new Date().toISOString();
-  const selectedThreadWorking =
-    selectedThread.session?.status === "starting" || selectedThread.session?.status === "running";
-  const parkedState =
-    supportsSnooze &&
-    !selectedThreadWorking &&
-    effectiveSnoozed(selectedThread, { now: lifecycleNow })
-      ? "snoozed"
-      : supportsSettlement &&
-          effectiveSettled(selectedThread, {
-            now: lifecycleNow,
-            autoSettleAfterDays: 3,
-          })
-        ? "settled"
-        : null;
+  const parkedState = resolveOpenThreadLifecycleState(selectedThread, {
+    now: lifecycleNow,
+    supportsSnooze,
+    supportsSettlement,
+    changeRequestState: selectedThreadPr?.state ?? null,
+  });
   const renderThreadRouteBody = (showActionControls: boolean) => (
     <>
       <ThreadGitControls {...threadGitControlProps} showActionControls={showActionControls} />

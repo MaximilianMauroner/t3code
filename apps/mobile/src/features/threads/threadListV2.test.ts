@@ -1,7 +1,11 @@
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
-import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId, TurnId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
-import { buildThreadListV2Items, resolveThreadListV2Status } from "./threadListV2";
+import {
+  buildThreadListV2Items,
+  resolveThreadListV2SettledTimestamp,
+  resolveThreadListV2Status,
+} from "./threadListV2";
 
 const environmentId = EnvironmentId.make("environment-1");
 const NOW = "2026-06-02T00:00:00.000Z";
@@ -191,6 +195,62 @@ describe("thread list v2 lifecycle model", () => {
     expect(rows(layout).map(({ thread }) => thread.id)).toEqual(["newer"]);
     expect(layout.settledCount).toBe(2);
     expect(layout.hiddenSettledCount).toBe(1);
+  });
+
+  it("reclassifies the same shell reference when the clock crosses a lifecycle boundary", () => {
+    const unchanged = makeThread({
+      id: ThreadId.make("same"),
+      title: "Same shell",
+      snoozedAt: "2026-06-01T00:00:00.000Z",
+      snoozedUntil: "2026-06-02T00:00:30.000Z",
+    });
+    const before = buildThreadListV2Items({
+      threads: [unchanged],
+      environmentId: null,
+      searchQuery: "",
+      now: "2026-06-02T00:00:00.000Z",
+    });
+    const after = buildThreadListV2Items({
+      threads: [unchanged],
+      environmentId: null,
+      searchQuery: "",
+      now: "2026-06-02T00:00:31.000Z",
+    });
+    expect(rows(before)[0]?.lifecycle).toBe("snoozed");
+    expect(rows(after)[0]?.lifecycle).toBe("active");
+    expect(rows(before)[0]?.thread).toBe(rows(after)[0]?.thread);
+  });
+
+  it("uses explicit settle time, then latest turn activity, for ordering and labels", () => {
+    const explicit = makeThread({
+      id: ThreadId.make("explicit"),
+      title: "Explicit",
+      settledAt: "2026-06-02T02:00:00.000Z",
+      settledOverride: "settled",
+      updatedAt: "2026-05-01T00:00:00.000Z",
+    });
+    const automatic = makeThread({
+      id: ThreadId.make("automatic"),
+      title: "Automatic",
+      settledOverride: "settled",
+      latestTurn: {
+        turnId: TurnId.make("turn"),
+        state: "completed",
+        requestedAt: "2026-06-02T00:00:00.000Z",
+        startedAt: "2026-06-02T00:10:00.000Z",
+        completedAt: "2026-06-02T01:00:00.000Z",
+        assistantMessageId: null,
+      },
+    });
+    expect(resolveThreadListV2SettledTimestamp(explicit)).toBe(explicit.settledAt);
+    expect(resolveThreadListV2SettledTimestamp(automatic)).toBe(automatic.latestTurn?.completedAt);
+    const layout = buildThreadListV2Items({
+      threads: [automatic, explicit],
+      environmentId: null,
+      searchQuery: "",
+      now: "2026-06-03T00:00:00.000Z",
+    });
+    expect(rows(layout).map(({ thread }) => thread.id)).toEqual(["explicit", "automatic"]);
   });
 });
 

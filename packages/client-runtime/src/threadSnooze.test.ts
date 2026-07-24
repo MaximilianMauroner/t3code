@@ -37,4 +37,14 @@ describe("thread snooze presentation", () => {
     );
     expect(snoozeWakeDescription(localDate(2026, 4, 13, 9).toISOString(), now)).toMatch(/Mon/);
   });
+
+  it("resolves fresh presets and countdowns from the supplied presentation clock", () => {
+    const firstNow = localDate(2026, 4, 8, 10);
+    const laterNow = localDate(2026, 4, 8, 10, 30);
+    const firstHour = resolveSnoozePresets(firstNow)[0]!;
+    const laterHour = resolveSnoozePresets(laterNow)[0]!;
+    expect(laterHour.snoozedUntil).not.toBe(firstHour.snoozedUntil);
+    expect(snoozeWakeLabel(firstHour.snoozedUntil, firstNow)).toBe("1h");
+    expect(snoozeWakeLabel(firstHour.snoozedUntil, laterNow)).toBe("30m");
+  });
 });

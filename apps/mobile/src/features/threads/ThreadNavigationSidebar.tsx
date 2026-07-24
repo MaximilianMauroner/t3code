@@ -48,7 +48,6 @@ import { buildHomeListFilterMenu } from "../home/home-list-filter-menu";
 import {
   buildHomeListLayout,
   DEFAULT_GROUP_DISPLAY_STATE,
-  homeListItemsAreEqual,
   nextGroupDisplayState,
   type HomeGroupDisplayAction,
   type HomeGroupDisplayState,
@@ -806,40 +805,6 @@ function ThreadNavigationSidebarPane(
       settledExpanded,
     ],
   );
-  const sidebarItemsAreEqual = useCallback(
-    (previous: SidebarListItem, item: SidebarListItem): boolean => {
-      if (previous.type === "v2-thread" && item.type === "v2-thread") {
-        if (previous.item.type !== item.item.type) return false;
-        if (previous.item.type === "section" && item.item.type === "section") {
-          return previous.key === item.key && previous.item.count === item.item.count;
-        }
-        return (
-          previous.key === item.key &&
-          previous.item.type === "thread" &&
-          item.item.type === "thread" &&
-          previous.item.thread === item.item.thread
-        );
-      }
-      if (previous.type === "v2-show-more" && item.type === "v2-show-more") {
-        return previous.hiddenCount === item.hiddenCount;
-      }
-      if (previous.type === "v2-pending-task" && item.type === "v2-pending-task") {
-        return previous.pendingTask === item.pendingTask && previous.isLast === item.isLast;
-      }
-      if (
-        previous.type === "v2-thread" ||
-        previous.type === "v2-show-more" ||
-        previous.type === "v2-pending-task" ||
-        item.type === "v2-thread" ||
-        item.type === "v2-show-more" ||
-        item.type === "v2-pending-task"
-      ) {
-        return false;
-      }
-      return homeListItemsAreEqual(previous, item);
-    },
-    [],
-  );
   const focusSearch = useCallback(() => {
     const focus = () => {
       if (props.nativeChrome) {
@@ -924,6 +889,7 @@ function ThreadNavigationSidebarPane(
               onArchiveThread={archiveThread}
               settlementSupported={settlementEnvironmentIds.has(thread.environmentId)}
               snoozeSupported={snoozeEnvironmentIds.has(thread.environmentId)}
+              now={`${nowMinute}:00.000Z`}
               onSettleThread={(target) => {
                 void handleParkThread(target, "settle");
               }}
@@ -1035,6 +1001,7 @@ function ThreadNavigationSidebarPane(
       handleSelectThread,
       handleSwipeableClose,
       handleSwipeableWillOpen,
+      nowMinute,
       openPendingTask,
       projectByKey,
       projectCwdByKey,
@@ -1159,7 +1126,6 @@ function ThreadNavigationSidebarPane(
                 estimatedItemSize={64}
                 extraData={listExtraData}
                 getItemType={(item) => item.type}
-                itemsAreEqual={sidebarItemsAreEqual}
                 keyExtractor={(item) => item.key}
                 renderItem={renderListItem}
                 automaticallyAdjustsScrollIndicatorInsets={NATIVE_LIQUID_GLASS_SUPPORTED}
@@ -1225,7 +1191,6 @@ function ThreadNavigationSidebarPane(
                 estimatedItemSize={64}
                 extraData={listExtraData}
                 getItemType={(item) => item.type}
-                itemsAreEqual={sidebarItemsAreEqual}
                 keyExtractor={(item) => item.key}
                 renderItem={renderListItem}
                 contentContainerStyle={[

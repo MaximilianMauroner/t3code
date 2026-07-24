@@ -625,6 +625,7 @@ export function HomeScreen(props: HomeScreenProps) {
           onArchiveThread={props.onArchiveThread}
           settlementSupported={settlementEnvironmentIds.has(item.thread.environmentId)}
           snoozeSupported={snoozeEnvironmentIds.has(item.thread.environmentId)}
+          now={`${nowMinute}:00.000Z`}
           onSettleThread={handleSettleThread}
           onUnsettleThread={handleUnsettleThread}
           onSnoozeThread={props.onSnoozeThread}
@@ -646,6 +647,7 @@ export function HomeScreen(props: HomeScreenProps) {
       handleSwipeableClose,
       handleSwipeableWillOpen,
       handleUnsettleThread,
+      nowMinute,
       projectByKey,
       projectCwdByKey,
       props.onArchiveThread,

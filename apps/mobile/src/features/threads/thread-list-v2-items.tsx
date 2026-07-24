@@ -17,7 +17,11 @@ import { relativeTime } from "../../lib/time";
 import { useThemeColor } from "../../lib/useThemeColor";
 import { useThreadPr } from "../../state/use-thread-pr";
 import { ThreadSwipeable } from "../home/thread-swipe-actions";
-import { resolveThreadListV2Status, type ThreadListV2Status } from "./threadListV2";
+import {
+  resolveThreadListV2SettledTimestamp,
+  resolveThreadListV2Status,
+  type ThreadListV2Status,
+} from "./threadListV2";
 
 /**
  * Thread List v2 renders one flat native list: rich edge-to-edge rows for
@@ -148,6 +152,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
       swipe + menu fall back to Archive instead of failing on use. */
   readonly settlementSupported: boolean;
   readonly snoozeSupported: boolean;
+  /** Controller-owned presentation clock. Rows are memoized, so time must be explicit. */
+  readonly now: string;
   readonly onSwipeableWillOpen: (methods: SwipeableMethods) => void;
   readonly onSwipeableClose: (methods: SwipeableMethods) => void;
   /** Reports this row's live PR state up so the partition can auto-settle
@@ -192,6 +198,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   const status = resolveThreadListV2Status(thread);
   const statusLabel = STATUS_LABEL_BY_STATUS[status];
   const timeLabel = threadTimeLabel(thread);
+  const presentationNow = useMemo(() => new Date(props.now), [props.now]);
 
   const handleDelete = useCallback(() => onDeleteThread(thread), [onDeleteThread, thread]);
   const handleSettle = useCallback(() => onSettleThread(thread), [onSettleThread, thread]);
@@ -273,7 +280,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
             id: "snooze",
             title: "Snooze",
             image: "moon.zzz",
-            subactions: resolveSnoozePresets(new Date()).map((preset) => ({
+            subactions: resolveSnoozePresets(presentationNow).map((preset) => ({
               id: `snooze:${preset.snoozedUntil}`,
               title: preset.label,
               subtitle: preset.whenLabel,
@@ -285,7 +292,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
       ...snoozeAction,
       ...(props.settlementSupported ? CARD_MENU_ACTIONS : LEGACY_MENU_ACTIONS),
     ];
-  }, [canUnsettle, canWake, props.settlementSupported, props.snoozeSupported]);
+  }, [canUnsettle, canWake, presentationNow, props.settlementSupported, props.snoozeSupported]);
 
   // The sidebar pane fills selected rows with the accent color (matching the
   // v1 sidebar), so every piece of row text needs a white-on-accent variant.
@@ -492,8 +499,12 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
             style={{ fontFamily: MONO_FONT }}
           >
             {props.lifecycle === "snoozed" && thread.snoozedUntil != null
-              ? snoozeWakeLabel(thread.snoozedUntil, new Date())
-              : relativeTime(thread.latestUserMessageAt ?? thread.updatedAt ?? thread.createdAt)}
+              ? snoozeWakeLabel(thread.snoozedUntil, presentationNow)
+              : relativeTime(
+                  props.lifecycle === "settled"
+                    ? (resolveThreadListV2SettledTimestamp(thread) ?? thread.createdAt)
+                    : (thread.latestUserMessageAt ?? thread.updatedAt ?? thread.createdAt),
+                )}
           </Text>
         </View>
       </Pressable>
