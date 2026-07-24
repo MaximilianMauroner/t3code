@@ -38,6 +38,7 @@ export interface ThreadFeedActivity {
   readonly detail: string | null;
   readonly fullDetail: string | null;
   readonly copyText: string;
+  readonly payloadOmitted?: true;
   readonly icon:
     | "agent"
     | "alert"
@@ -74,6 +75,7 @@ interface WorkLogEntry {
   requestKind?: PendingApproval["requestKind"];
   toolLifecycleStatus?: WorkLogToolLifecycleStatus;
   toolData?: unknown;
+  payloadOmitted?: true;
 }
 
 interface DerivedWorkLogEntry extends WorkLogEntry {
@@ -263,6 +265,18 @@ function isPlanBoundaryToolActivity(activity: OrchestrationThreadActivity): bool
 }
 
 function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWorkLogEntry {
+  if (activity.payloadOmitted === true) {
+    return {
+      id: activity.id,
+      createdAt: activity.createdAt,
+      turnId: activity.turnId,
+      label: activity.summary,
+      detail: "Full output omitted from reopened history",
+      tone: activity.tone === "approval" ? "info" : activity.tone,
+      activityKind: activity.kind,
+      payloadOmitted: true,
+    };
+  }
   const payload =
     activity.payload && typeof activity.payload === "object"
       ? (activity.payload as Record<string, unknown>)
@@ -366,6 +380,9 @@ function shouldCollapseToolLifecycleEntries(
   previous: DerivedWorkLogEntry,
   next: DerivedWorkLogEntry,
 ): boolean {
+  if (previous.payloadOmitted === true || next.payloadOmitted === true) {
+    return false;
+  }
   if (previous.activityKind !== "tool.updated" && previous.activityKind !== "tool.completed") {
     return false;
   }
@@ -392,6 +409,8 @@ function mergeDerivedWorkLogEntries(
   const collapseKey = next.collapseKey ?? previous.collapseKey;
   const toolLifecycleStatus = next.toolLifecycleStatus ?? previous.toolLifecycleStatus;
   const toolData = next.toolData ?? previous.toolData;
+  const payloadOmitted =
+    next.payloadOmitted === true || previous.payloadOmitted === true ? true : undefined;
   return {
     ...previous,
     ...next,
@@ -405,6 +424,7 @@ function mergeDerivedWorkLogEntries(
     ...(collapseKey ? { collapseKey } : {}),
     ...(toolLifecycleStatus ? { toolLifecycleStatus } : {}),
     ...(toolData !== undefined ? { toolData } : {}),
+    ...(payloadOmitted === true ? { payloadOmitted: true } : {}),
   };
 }
 
@@ -1353,7 +1373,8 @@ export function buildThreadFeed(
         .map<RawThreadFeedEntry>((entry) => {
           const summary = workEntryHeading(entry);
           const detail = workEntryPreview(entry);
-          const fullDetail = buildWorkEntryExpandedBody(entry);
+          const fullDetail =
+            entry.payloadOmitted === true ? null : buildWorkEntryExpandedBody(entry);
           return {
             type: "activity",
             id: entry.id,
@@ -1366,8 +1387,9 @@ export function buildThreadFeed(
               summary,
               detail,
               fullDetail,
+              ...(entry.payloadOmitted === true ? { payloadOmitted: true as const } : {}),
               icon: workEntryIcon(entry),
-              copyText: [summary, detail, fullDetail]
+              copyText: (entry.payloadOmitted === true ? [summary] : [summary, detail, fullDetail])
                 .filter((value, index, values): value is string => {
                   return Boolean(value) && values.indexOf(value) === index;
                 })

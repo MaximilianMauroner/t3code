@@ -1,4 +1,4 @@
-import { EnvironmentId, type VcsListRefsResult } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId, type VcsListRefsResult } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -57,6 +57,27 @@ function makeDatabase() {
 }
 
 describe("mobile SQLite environment cache store", () => {
+  it.effect("removes a v2 thread snapshot and treats it as a cold cache", () =>
+    Effect.gen(function* () {
+      const memory = makeDatabase();
+      const store = yield* make().pipe(Effect.provideService(MobileDatabase, memory.database));
+      const threadId = ThreadId.make("thread-v2");
+      const id = cacheId(ENVIRONMENT_ID, "thread", threadId);
+      memory.values.set(
+        id,
+        JSON.stringify({
+          schemaVersion: 2,
+          environmentId: ENVIRONMENT_ID,
+          threadId,
+          snapshot: {},
+        }),
+      );
+
+      expect(yield* store.loadThread(ENVIRONMENT_ID, threadId)).toEqual(Option.none());
+      expect(memory.removed).toEqual([id]);
+    }),
+  );
+
   it.effect("round-trips schema-validated VCS refs", () =>
     Effect.gen(function* () {
       const memory = makeDatabase();

@@ -450,6 +450,96 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
     }),
   );
 
+  it.effect("bounds and compacts only persisted detail snapshot activities", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("thread-1");
+
+      yield* sql`DELETE FROM projection_thread_activities WHERE thread_id = 'thread-1'`;
+      for (let sequence = 0; sequence < 502; sequence += 1) {
+        yield* sql`
+          INSERT INTO projection_thread_activities (
+            activity_id, thread_id, turn_id, tone, kind, summary,
+            payload_json, sequence, created_at
+          ) VALUES (
+            ${`bounded-${String(sequence).padStart(3, "0")}`},
+            'thread-1', NULL, 'tool', 'tool.updated', ${`activity ${String(sequence)}`},
+            '{"itemType":"command_execution","detail":"small"}',
+            ${sequence}, '2026-06-01T00:00:00.000Z'
+          )
+        `;
+      }
+
+      const bounded = yield* snapshotQuery.getThreadDetailSnapshot(threadId);
+      assert.equal(bounded._tag, "Some");
+      if (bounded._tag === "Some") {
+        assert.equal(bounded.value.thread.activities.length, 500);
+        assert.equal(bounded.value.thread.activities[0]?.id, asEventId("bounded-002"));
+        assert.equal(bounded.value.thread.activities[499]?.id, asEventId("bounded-501"));
+      }
+      const fullBounded = yield* snapshotQuery.getThreadDetailById(threadId);
+      assert.equal(fullBounded._tag, "Some");
+      if (fullBounded._tag === "Some") {
+        assert.equal(fullBounded.value.activities.length, 502);
+      }
+
+      yield* sql`DELETE FROM projection_thread_activities WHERE thread_id = 'thread-1'`;
+      const prefix = '{"itemType":"command_execution","detail":"';
+      const suffix = '"}';
+      const exactPayload = `${prefix}${"x".repeat(65_536 - prefix.length - suffix.length)}${suffix}`;
+      const oversizedPayload = `${prefix}${"x".repeat(
+        65_537 - prefix.length - suffix.length,
+      )}${suffix}`;
+      const unicodePayload = JSON.stringify({
+        itemType: "command_execution",
+        detail: "😀".repeat(20_000),
+      });
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary,
+          payload_json, sequence, created_at
+        ) VALUES
+          ('boundary-exact', 'thread-1', NULL, 'tool', 'tool.updated', 'exact',
+           ${exactPayload}, 1, '2026-06-01T00:00:01.000Z'),
+          ('boundary-over', 'thread-1', NULL, 'tool', 'tool.updated', 'over',
+           ${oversizedPayload}, 2, '2026-06-01T00:00:02.000Z'),
+          ('boundary-unicode', 'thread-1', NULL, 'tool', 'tool.updated', 'unicode',
+           ${unicodePayload}, 3, '2026-06-01T00:00:03.000Z')
+      `;
+
+      const compacted = yield* snapshotQuery.getThreadDetailSnapshot(threadId);
+      assert.equal(compacted._tag, "Some");
+      if (compacted._tag === "Some") {
+        const exact = compacted.value.thread.activities[0]!;
+        const over = compacted.value.thread.activities[1]!;
+        const unicode = compacted.value.thread.activities[2]!;
+        assert.isUndefined(exact.payloadOmitted);
+        assert.equal(
+          (exact.payload as { readonly detail?: string }).detail?.length,
+          65_536 - prefix.length - suffix.length,
+        );
+        assert.isTrue(over.payloadOmitted);
+        assert.isTrue(unicode.payloadOmitted);
+        const unicodeDetail = (unicode.payload as { readonly detail?: string }).detail ?? "";
+        assert.isAtMost(Buffer.byteLength(unicodeDetail, "utf8"), 8_192);
+      }
+      const full = yield* snapshotQuery.getThreadDetailById(threadId);
+      assert.equal(full._tag, "Some");
+      if (full._tag === "Some") {
+        assert.isUndefined(full.value.activities[1]?.payloadOmitted);
+        assert.equal(
+          (full.value.activities[1]!.payload as { readonly detail?: string }).detail?.length,
+          65_537 - prefix.length - suffix.length,
+        );
+        assert.equal(
+          (full.value.activities[2]!.payload as { readonly detail?: string }).detail,
+          "😀".repeat(20_000),
+        );
+      }
+    }),
+  );
+
   it.effect("keeps archived threads out of the main shell snapshot", () =>
     Effect.gen(function* () {
       const snapshotQuery = yield* ProjectionSnapshotQuery;

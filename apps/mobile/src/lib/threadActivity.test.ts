@@ -56,6 +56,34 @@ function makeThread(
 }
 
 describe("buildThreadFeed", () => {
+  it("does not build expanded or clipboard payloads for omitted reopened output", () => {
+    const thread = makeThread({
+      id: ThreadId.make("thread-omitted"),
+      projectId: ProjectId.make("project-1"),
+      title: "Omitted output",
+      activities: [
+        makeActivity({
+          id: EventId.make("activity-omitted"),
+          kind: "tool.completed",
+          summary: "Large tool output",
+          createdAt: "2026-04-01T00:00:01.000Z",
+          payload: { itemType: "mcp_tool_call", detail: "preview" },
+          payloadOmitted: true,
+        }),
+      ],
+    });
+    const [group] = buildThreadFeed(thread);
+    expect(group?.type).toBe("activity-group");
+    if (group?.type !== "activity-group") return;
+    expect(group.activities[0]).toMatchObject({
+      summary: "Large tool output",
+      detail: "Full output omitted from reopened history",
+      fullDetail: null,
+      copyText: "Large tool output",
+      payloadOmitted: true,
+    });
+  });
+
   it("keeps historic work entries attributed to their turns", () => {
     const thread = makeThread({
       id: ThreadId.make("thread-1"),

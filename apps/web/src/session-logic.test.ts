@@ -34,6 +34,7 @@ function makeActivity(overrides: {
   payload?: Record<string, unknown>;
   turnId?: string;
   sequence?: number;
+  payloadOmitted?: true;
 }): OrchestrationThreadActivity {
   const payload = overrides.payload ?? {};
   return {
@@ -45,6 +46,7 @@ function makeActivity(overrides: {
     payload,
     turnId: overrides.turnId ? TurnId.make(overrides.turnId) : null,
     ...(overrides.sequence !== undefined ? { sequence: overrides.sequence } : {}),
+    ...(overrides.payloadOmitted === true ? { payloadOmitted: true } : {}),
   };
 }
 
@@ -691,6 +693,24 @@ describe("workEntryIndicatesToolFailure", () => {
 });
 
 describe("deriveWorkLogEntries", () => {
+  it("keeps omitted payload rows quiet and non-detailed", () => {
+    const [entry] = deriveWorkLogEntries([
+      makeActivity({
+        id: "omitted",
+        kind: "tool.completed",
+        summary: "Large tool output",
+        payload: { itemType: "mcp_tool_call", detail: "preview" },
+        payloadOmitted: true,
+      }),
+    ]);
+    expect(entry).toMatchObject({
+      label: "Large tool output",
+      detail: "Full output omitted from reopened history",
+      payloadOmitted: true,
+    });
+    expect(entry?.toolData).toBeUndefined();
+  });
+
   it("omits tool started entries and keeps completed entries", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({

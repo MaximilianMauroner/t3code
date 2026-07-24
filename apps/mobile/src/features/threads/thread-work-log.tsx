@@ -121,9 +121,11 @@ export function ThreadWorkLog(props: {
                 accessibilityRole={canExpand ? "button" : undefined}
                 accessibilityLabel={displayText}
                 accessibilityHint={
-                  canExpand
-                    ? "Double tap to show full details. Long press to copy."
-                    : "Long press to copy."
+                  row.payloadOmitted
+                    ? "Full output was omitted from reopened history."
+                    : canExpand
+                      ? "Double tap to show full details. Long press to copy."
+                      : "Long press to copy."
                 }
                 accessibilityState={canExpand ? { expanded } : undefined}
                 hitSlop={4}
@@ -133,7 +135,9 @@ export function ThreadWorkLog(props: {
                     props.onToggleRow(row.id);
                   }
                 }}
-                onLongPress={() => props.onCopyRow(row.id, row.copyText)}
+                onLongPress={
+                  row.payloadOmitted ? undefined : () => props.onCopyRow(row.id, row.copyText)
+                }
                 style={({ pressed }) => ({
                   backgroundColor: pressed ? pressedBackground : "transparent",
                 })}
