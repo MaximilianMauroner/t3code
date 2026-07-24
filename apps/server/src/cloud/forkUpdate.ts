@@ -525,7 +525,6 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
         );
       const releaseDir = path.join(configuration.releasesDir, targetCommit);
       const stagedRelease = path.join(configuration.releasesDir, `.release-${targetCommit}`);
-      const packDir = path.join(configuration.releasesDir, `.pack-${targetCommit}`);
       const entryRelative = path.join("node_modules", "t3", "dist", "bin.mjs");
       const entryPath = path.join(releaseDir, entryRelative);
       const sentinelPath = path.join(releaseDir, RELEASE_SENTINEL);
@@ -538,7 +537,12 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
         (yield* fs.exists(entryPath).pipe(Effect.orElseSucceed(() => false)));
       if (!existingReady) {
         yield* fs.remove(stagedRelease, { recursive: true, force: true }).pipe(Effect.ignore);
-        yield* fs.remove(packDir, { recursive: true, force: true }).pipe(Effect.ignore);
+        yield* fs
+          .remove(path.join(configuration.releasesDir, `.pack-${targetCommit}`), {
+            recursive: true,
+            force: true,
+          })
+          .pipe(Effect.ignore);
         yield* fs
           .makeDirectory(stagedRelease, { recursive: true })
           .pipe(
@@ -546,45 +550,13 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
               statusError(`Could not create staged release: ${String(cause)}`),
             ),
           );
-        yield* fs
-          .makeDirectory(packDir, { recursive: true })
-          .pipe(
-            Effect.mapError((cause) =>
-              statusError(`Could not create pack staging: ${String(cause)}`),
-            ),
-          );
-        yield* run("pnpm", ["--filter", "t3", "pack", "--pack-destination", packDir], repo);
-        const packed = yield* fs
-          .readDirectory(packDir)
-          .pipe(
-            Effect.mapError((cause) =>
-              statusError(`Could not inspect release package: ${String(cause)}`),
-            ),
-          );
-        const tarball = packed.find((name) => name.endsWith(".tgz"));
-        if (tarball === undefined) {
-          return yield* statusError("Packaging did not produce a t3 tarball.");
-        }
-        yield* fs
-          .writeFileString(path.join(stagedRelease, "package.json"), '{ "private": true }\n')
-          .pipe(
-            Effect.mapError((cause) =>
-              statusError(`Could not initialize staged release: ${String(cause)}`),
-            ),
-          );
+        const stagedPackage = path.join(stagedRelease, "node_modules", "t3");
         yield* run(
           "pnpm",
-          [
-            "--ignore-workspace",
-            "--dir",
-            stagedRelease,
-            "add",
-            "--prod",
-            path.join(packDir, tarball),
-          ],
+          ["--filter", "t3", "deploy", "--prod", "--legacy", "--offline", stagedPackage],
           repo,
         );
-        const stagedEntry = path.join(stagedRelease, entryRelative);
+        const stagedEntry = path.join(stagedPackage, "dist", "bin.mjs");
         const preflight = yield* run(nodeExecutable, [stagedEntry, "--version"], repo);
         if (preflight === "") {
           return yield* statusError("The packaged server entry point returned no version.");
@@ -610,7 +582,12 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
               statusError(`Could not publish the staged release: ${String(cause)}`),
             ),
           );
-        yield* fs.remove(packDir, { recursive: true, force: true }).pipe(Effect.ignore);
+        yield* fs
+          .remove(path.join(configuration.releasesDir, `.pack-${targetCommit}`), {
+            recursive: true,
+            force: true,
+          })
+          .pipe(Effect.ignore);
       }
 
       // Deliberately check immediately before push. A turn can still start in

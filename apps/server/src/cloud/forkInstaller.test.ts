@@ -160,11 +160,37 @@ describe("fork service bootstrap installer", () => {
     expect(acquireIndex).toBeLessThan(
       installer.indexOf('install -d -o "$run_user" -g "$run_user" "$releases_dir"'),
     );
-    expect(installer.match(/\brun_pnpm\b/g)?.length).toBe(9);
+    expect(installer.match(/\brun_pnpm\b/g)?.length).toBe(8);
     expect(installer).not.toMatch(/run_as_user\s+"\$[^"]*pnpm/);
     expect(installer).not.toContain("backup_file update_lock");
     expect(installer).not.toContain("restore_file update_lock");
     expect(installer).not.toContain('rm -rf "$lock_path"');
+  });
+
+  it("deploys the built server offline before publishing the immutable release", () => {
+    const buildIndex = installer.indexOf('run_pnpm -C "$repo" exec vp run --filter t3 build');
+    const deployIndex = installer.indexOf(
+      'run_pnpm -C "$repo" --filter t3 deploy --prod --legacy --offline "$staged_package"',
+    );
+    const stagedPreflightIndex = installer.indexOf(
+      'run_as_user "$node_path" "$staged_package/dist/bin.mjs" --version',
+    );
+    const sentinelIndex = installer.indexOf(
+      '"$commit" "$staged_release/.t3-fork-release-complete"',
+    );
+    const renameIndex = installer.indexOf('mv "$staged_release" "$release_dir"');
+    const finalPreflightIndex = installer.indexOf('"$node_path" "$entry" --version');
+    expect(installer).toContain('staged_package="${staged_release}/node_modules/t3"');
+    expect(deployIndex).toBeGreaterThan(buildIndex);
+    expect(stagedPreflightIndex).toBeGreaterThan(deployIndex);
+    expect(sentinelIndex).toBeGreaterThan(stagedPreflightIndex);
+    expect(renameIndex).toBeGreaterThan(sentinelIndex);
+    expect(finalPreflightIndex).toBeGreaterThan(renameIndex);
+    expect(installer.match(/--filter t3 deploy --prod --legacy --offline/g)).toHaveLength(1);
+    expect(installer).not.toContain("--filter t3 pack");
+    expect(installer).not.toContain(" add --prod ");
+    expect(installer).not.toContain("tarball=");
+    expect(installer).not.toContain("package.json");
   });
 
   it("commits and disables signal rollback before releasing the verified activation", () => {

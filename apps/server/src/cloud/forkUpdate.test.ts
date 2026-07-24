@@ -117,18 +117,10 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
             return yield* Effect.interrupt;
           }
           const response = input.output?.(request.command, request.args) ?? {};
-          if (request.command === "pnpm" && request.args.includes("pack")) {
-            const destination = request.args.at(-1);
-            if (destination !== undefined) {
-              yield* fs.makeDirectory(destination, { recursive: true });
-              yield* fs.writeFileString(path.join(destination, "t3-test.tgz"), "test");
-            }
-          }
-          if (request.command === "pnpm" && request.args.includes("add")) {
-            const dirIndex = request.args.indexOf("--dir");
-            const releaseDir = request.args[dirIndex + 1];
-            if (releaseDir !== undefined) {
-              const entry = path.join(releaseDir, "node_modules", "t3", "dist", "bin.mjs");
+          if (request.command === "pnpm" && request.args.includes("deploy")) {
+            const stagedPackage = request.args.at(-1);
+            if (stagedPackage !== undefined) {
+              const entry = path.join(stagedPackage, "dist", "bin.mjs");
               yield* fs.makeDirectory(path.dirname(entry), { recursive: true });
               yield* fs.writeFileString(entry, "export {};\n");
             }
@@ -255,12 +247,27 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       const pushIndex = commands.findIndex((command) =>
         command.includes("git push origin HEAD:refs/heads/main"),
       );
-      const packageIndex = commands.findIndex((command) =>
-        command.includes("pnpm --filter t3 pack"),
+      const buildIndex = commands.findIndex((command) =>
+        command.includes("pnpm exec vp run --filter t3 build"),
+      );
+      const deployCommand = `pnpm --filter t3 deploy --prod --legacy --offline ${context.releasesDir}/.release-new-commit/node_modules/t3`;
+      const deployIndex = commands.indexOf(deployCommand);
+      const stagedPreflightIndex = commands.findIndex((command) =>
+        command.endsWith(
+          ` ${context.releasesDir}/.release-new-commit/node_modules/t3/dist/bin.mjs --version`,
+        ),
       );
       const focusedTests = commands.find((command) => command.includes("vp test run")) ?? "";
       assert.isAtLeast(pushIndex, 0);
-      assert.isAbove(pushIndex, packageIndex);
+      assert.isAbove(deployIndex, buildIndex);
+      assert.isAbove(stagedPreflightIndex, deployIndex);
+      assert.isAbove(pushIndex, stagedPreflightIndex);
+      assert.lengthOf(
+        commands.filter((command) => command.includes(" deploy ")),
+        1,
+      );
+      assert.isFalse(commands.some((command) => command.includes(" pack ")));
+      assert.isFalse(commands.some((command) => command.includes(" add ")));
       assert.include(focusedTests, "apps/web/src/components/ForkUpdateAction.test.tsx");
       assert.include(
         focusedTests,
@@ -499,7 +506,13 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       yield* context.service.start;
       const result = yield* awaitStatus(context.service, new Set(["restarting", "failed"]));
       assert.equal(result.stage, "restarting");
-      assert.isTrue(commands.some((command) => command.includes(" add --prod ")));
+      assert.isTrue(
+        commands.some(
+          (command) =>
+            command ===
+            `pnpm --filter t3 deploy --prod --legacy --offline ${context.releasesDir}/.release-new-commit/node_modules/t3`,
+        ),
+      );
       const fs = yield* FileSystem.FileSystem;
       assert.equal(
         (yield* fs.readFileString(

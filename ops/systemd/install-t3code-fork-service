@@ -120,9 +120,9 @@ sentinel="${release_dir}/.t3-fork-release-complete"
 install -d -o "$run_user" -g "$run_user" "$releases_dir"
 if [ ! -f "$sentinel" ] || [ "$(cat "$sentinel")" != "$commit" ] || [ ! -f "$entry" ]; then
   staged_release="${releases_dir}/.release-${commit}"
-  pack_dir="${releases_dir}/.pack-${commit}"
-  rm -rf "$staged_release" "$pack_dir"
-  install -d -o "$run_user" -g "$run_user" "$staged_release" "$pack_dir"
+  staged_package="${staged_release}/node_modules/t3"
+  rm -rf "$staged_release" "${releases_dir}/.pack-${commit}"
+  install -d -o "$run_user" -g "$run_user" "$staged_release"
   run_pnpm -C "$repo" install --frozen-lockfile
   run_pnpm -C "$repo" exec vp test run packages/contracts/src/server.test.ts \
     apps/server/src/cloud/forkUpdate.test.ts apps/server/src/cloud/forkHealthcheck.test.ts \
@@ -134,16 +134,12 @@ if [ ! -f "$sentinel" ] || [ "$(cat "$sentinel")" != "$commit" ] || [ ! -f "$ent
   run_pnpm -C "$repo" exec vp run --filter @t3tools/contracts --filter @t3tools/web --filter t3 typecheck
   run_pnpm -C "$repo" exec vp run --filter @t3tools/web build
   run_pnpm -C "$repo" exec vp run --filter t3 build
-  run_pnpm -C "$repo" --filter t3 pack --pack-destination "$pack_dir"
-  tarball="$(find "$pack_dir" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
-  [ -n "$tarball" ] || { printf '%s\n' "Package missing." >&2; exit 1; }
-  run_as_user sh -c 'printf "%s\n" "{ \"private\": true }" >"$1/package.json"' bootstrap "$staged_release"
-  run_pnpm --ignore-workspace --dir "$staged_release" add --prod "$tarball"
-  run_as_user "$node_path" "$staged_release/node_modules/t3/dist/bin.mjs" --version >/dev/null
+  run_pnpm -C "$repo" --filter t3 deploy --prod --legacy --offline "$staged_package"
+  run_as_user "$node_path" "$staged_package/dist/bin.mjs" --version >/dev/null
   run_as_user sh -c 'printf "%s\n" "$1" >"$2"' bootstrap "$commit" "$staged_release/.t3-fork-release-complete"
   rm -rf "$release_dir"
   mv "$staged_release" "$release_dir"
-  rm -rf "$pack_dir"
+  rm -rf "${releases_dir}/.pack-${commit}"
 fi
 "$node_path" "$entry" --version >/dev/null
 
