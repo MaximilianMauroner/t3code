@@ -11,6 +11,7 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
@@ -24,6 +25,7 @@ const asTurnId = (value: string): TurnId => TurnId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asEventId = (value: string): EventId => EventId.make(value);
 const asCheckpointRef = (value: string): CheckpointRef => CheckpointRef.make(value);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
 const projectionSnapshotLayer = it.layer(
   OrchestrationProjectionSnapshotQueryLive.pipe(
@@ -491,7 +493,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       const oversizedPayload = `${prefix}${"x".repeat(
         65_537 - prefix.length - suffix.length,
       )}${suffix}`;
-      const unicodePayload = JSON.stringify({
+      const unicodePayload = encodeUnknownJson({
         itemType: "command_execution",
         detail: "😀".repeat(20_000),
       });
@@ -745,7 +747,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       const sql = yield* SqlClient.SqlClient;
       const threadId = ThreadId.make("thread-1");
       const padding = "x".repeat(70_000);
-      const approvalPayload = JSON.stringify({
+      const approvalPayload = encodeUnknownJson({
         requestId: "approval-large",
         requestKind: "file-change",
         detail: "d".repeat(70_000),
@@ -765,8 +767,8 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         questions: userInputQuestions,
         padding,
       };
-      const userInputPayload = JSON.stringify(userInputPayloadValue);
-      const planPayload = JSON.stringify({
+      const userInputPayload = encodeUnknownJson(userInputPayloadValue);
+      const planPayload = encodeUnknownJson({
         explanation: "e".repeat(70_000),
         plan: [{ step: "Keep every required field", status: "inProgress" }],
         padding,
@@ -819,7 +821,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         });
         for (const activity of [approval, plan]) {
           assert.isDefined(activity);
-          assert.isBelow(Buffer.byteLength(JSON.stringify(activity.payload), "utf8"), 16_384);
+          assert.isBelow(Buffer.byteLength(encodeUnknownJson(activity.payload), "utf8"), 16_384);
           assert.notProperty(activity.payload, "padding");
         }
       }
