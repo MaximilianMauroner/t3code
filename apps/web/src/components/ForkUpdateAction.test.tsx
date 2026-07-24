@@ -86,11 +86,18 @@ vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: () => testState.startForkUpdate,
 }));
 
-import { ForkUpdateAction, isForkUpdateActive, presentForkUpdateStatus } from "./ForkUpdateAction";
+import {
+  ForkUpdateAction,
+  forkUpdateCompareUrl,
+  isForkUpdateActive,
+  presentForkUpdateStatus,
+} from "./ForkUpdateAction";
 
 const DESCRIPTOR: ForkUpdateDescriptor = {
   repository: "owner/fork",
+  upstreamRepository: "upstream/project",
   branch: "main",
+  upstreamBranch: "nightly",
   currentCommit: "0123456789abcdef",
 };
 
@@ -148,6 +155,20 @@ describe("ForkUpdateAction", () => {
       });
       expect(renderAction().props.control?.props.disabled).toBe(true);
     });
+  });
+
+  it("links to the commits between the deployed release and upstream branch", () => {
+    expect(forkUpdateCompareUrl(DESCRIPTOR)).toBe(
+      "https://github.com/owner/fork/compare/0123456789abcdef...upstream:nightly",
+    );
+    expect(
+      forkUpdateCompareUrl({
+        repository: DESCRIPTOR.repository,
+        upstreamRepository: DESCRIPTOR.upstreamRepository,
+        branch: DESCRIPTOR.branch,
+        upstreamBranch: DESCRIPTOR.upstreamBranch,
+      }),
+    ).toBeNull();
   });
 
   it("keeps the action disabled throughout every active persisted stage", () => {

@@ -46,6 +46,7 @@ it("only enables fork updates when both host-fixed repository values are present
     repository: "owner/t3code",
     upstreamRepository: "pingdotgg/t3code",
     branch: "main",
+    upstreamBranch: "nightly",
     forkRemote: "origin",
     upstreamRemote: "upstream",
     releasesDir: "/state/fork-releases",
@@ -205,7 +206,10 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
         revisionReads += 1;
         return { stdout: revisionReads === 1 ? "old-commit\n" : "new-commit\n" };
       }
-      if (invocation.includes("merge-base --is-ancestor") && invocation.includes("upstream/main")) {
+      if (
+        invocation.includes("merge-base --is-ancestor") &&
+        invocation.includes("upstream/nightly")
+      ) {
         return { code: ancestryCode };
       }
       if (invocation.includes("merge-base --is-ancestor") && invocation.includes("origin/main")) {
@@ -356,7 +360,7 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
           if (invocation.includes("merge-base --is-ancestor HEAD origin/main")) {
             return { code: 0 };
           }
-          if (invocation.includes("merge-base --is-ancestor upstream/main HEAD")) {
+          if (invocation.includes("merge-base --is-ancestor upstream/nightly HEAD")) {
             return { code: 0 };
           }
           if (invocation === "git rev-parse HEAD") return { stdout: "fork-new\n" };

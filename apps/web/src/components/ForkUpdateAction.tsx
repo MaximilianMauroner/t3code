@@ -50,6 +50,20 @@ function stageLabel(stage: ServerForkUpdateStage): string {
   return stage.replace("-", " ");
 }
 
+export function forkUpdateCompareUrl(descriptor: ForkUpdateDescriptor): string | null {
+  if (descriptor.currentCommit === undefined) return null;
+  const [upstreamOwner] = descriptor.upstreamRepository.split("/");
+  if (!upstreamOwner) return null;
+
+  const repository = descriptor.repository
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  const base = encodeURIComponent(descriptor.currentCommit);
+  const head = `${encodeURIComponent(upstreamOwner)}:${encodeURIComponent(descriptor.upstreamBranch)}`;
+  return `https://github.com/${repository}/compare/${base}...${head}`;
+}
+
 export interface ForkUpdateStatusPresentation {
   readonly source: string;
   readonly stage: string | null;
@@ -84,9 +98,23 @@ function ForkUpdateStatusView({
   readonly queryError: string | null;
 }) {
   const presentation = presentForkUpdateStatus(descriptor, status, queryError);
+  const compareUrl = forkUpdateCompareUrl(descriptor);
   return (
     <div className="space-y-1">
       <p>{presentation.source}</p>
+      {compareUrl !== null ? (
+        <p>
+          <a
+            className="text-primary underline underline-offset-2 hover:no-underline"
+            href={compareUrl}
+            target="_blank"
+            rel="noreferrer"
+          >
+            Review incoming commits
+          </a>{" "}
+          from {descriptor.upstreamRepository}:{descriptor.upstreamBranch}
+        </p>
+      ) : null}
       {presentation.stage !== null && presentation.message !== null ? (
         <p className={presentation.failed ? "text-destructive" : undefined}>
           <span className="capitalize">{presentation.stage}</span>: {presentation.message}
@@ -212,8 +240,8 @@ export function ForkUpdateAction({
   const disabled = pending || active;
   return (
     <SettingsRow
-      title="Fork updates"
-      description={`Fetch upstream, merge into ${descriptor.repository}, validate, and deploy the exact commit from ${descriptor.branch}. Active turns block updates.`}
+      title="Nightly updates"
+      description={`Pull from ${descriptor.upstreamRepository}:${descriptor.upstreamBranch}, merge into ${descriptor.repository}:${descriptor.branch}, validate, and deploy the exact commit. Active turns block updates.`}
       status={
         <ForkUpdateStatusView
           descriptor={descriptor}
@@ -224,7 +252,7 @@ export function ForkUpdateAction({
       control={
         <Button size="xs" disabled={disabled} onClick={handleStart}>
           {disabled ? <Spinner className="size-3.5" /> : null}
-          Fetch & deploy latest
+          Pull from nightly
         </Button>
       }
     />

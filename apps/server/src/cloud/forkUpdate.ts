@@ -57,6 +57,7 @@ export interface ForkUpdateConfiguration {
   readonly repository: string;
   readonly upstreamRepository: string;
   readonly branch: string;
+  readonly upstreamBranch: string;
   readonly forkRemote: string;
   readonly upstreamRemote: string;
   readonly releasesDir: string;
@@ -85,6 +86,7 @@ export function resolveForkUpdateConfiguration(
     upstreamRepository:
       env.T3_FORK_UPDATE_UPSTREAM_REPOSITORY?.trim() || EXPECTED_UPSTREAM_REPOSITORY,
     branch: env.T3_FORK_UPDATE_BRANCH?.trim() || "main",
+    upstreamBranch: env.T3_FORK_UPDATE_UPSTREAM_BRANCH?.trim() || "nightly",
     forkRemote: env.T3_FORK_UPDATE_FORK_REMOTE?.trim() || "origin",
     upstreamRemote: env.T3_FORK_UPDATE_UPSTREAM_REMOTE?.trim() || "upstream",
     releasesDir: env.T3_FORK_UPDATE_RELEASES_DIR?.trim() || join(stateDir, "fork-releases"),
@@ -95,7 +97,7 @@ export function resolveForkUpdateConfiguration(
 
 const idleStatus = (): ServerForkUpdateStatus => ({
   stage: "idle",
-  message: "Ready to fetch the latest fork changes.",
+  message: "Ready to pull the latest nightly changes.",
   startedAt: null,
   completedAt: null,
   currentCommit: null,
@@ -363,7 +365,11 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
           "The configured fork or upstream remote does not match its exact GitHub repository.",
         );
       }
-      status = yield* updateStage(status, "fetching", "Reconciling the fork's main branch.");
+      status = yield* updateStage(
+        status,
+        "fetching",
+        `Reconciling the fork's ${configuration.branch} branch.`,
+      );
       yield* run(
         "git",
         [
@@ -404,14 +410,14 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
           );
         if (forkBehindLocal.code !== 0) {
           return yield* statusError(
-            "The local main branch and fork main have diverged; reconcile them manually.",
+            `The local ${configuration.branch} branch and fork ${configuration.branch} have diverged; reconcile them manually.`,
           );
         }
         return yield* statusError(
-          "The local main branch is ahead of fork main; publish or remove the local-only commits before updating.",
+          `The local ${configuration.branch} branch is ahead of fork ${configuration.branch}; publish or remove the local-only commits before updating.`,
         );
       } else {
-        return yield* statusError("Could not determine the fork main ancestry.");
+        return yield* statusError(`Could not determine the fork ${configuration.branch} ancestry.`);
       }
       originalCommit = yield* run("git", ["rev-parse", "HEAD"], repo);
       const currentExists = yield* fs
@@ -432,20 +438,23 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
         : null;
       const deployedCommit = deployedTarget === null ? null : path.basename(deployedTarget);
 
-      status = yield* updateStage(status, "fetching", "Fetching the latest upstream changes.", {
-        currentCommit: deployedCommit,
-      });
+      status = yield* updateStage(
+        status,
+        "fetching",
+        `Pulling the latest upstream ${configuration.upstreamBranch} changes.`,
+        { currentCommit: deployedCommit },
+      );
       yield* run(
         "git",
         [
           "fetch",
           "--prune",
           configuration.upstreamRemote,
-          `refs/heads/${configuration.branch}:refs/remotes/${configuration.upstreamRemote}/${configuration.branch}`,
+          `refs/heads/${configuration.upstreamBranch}:refs/remotes/${configuration.upstreamRemote}/${configuration.upstreamBranch}`,
         ],
         repo,
       );
-      const upstreamRef = `${configuration.upstreamRemote}/${configuration.branch}`;
+      const upstreamRef = `${configuration.upstreamRemote}/${configuration.upstreamBranch}`;
       const ancestry = yield* runner
         .run({
           command: "git",
