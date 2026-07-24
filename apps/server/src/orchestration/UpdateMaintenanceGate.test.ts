@@ -57,9 +57,8 @@ function withFixture<A, E, R>(
       setup?.(stateDir);
       const gate = yield* UpdateMaintenanceGate.make.pipe(
         Effect.provide(
-          ServerConfig.layerTest(root, baseDir).pipe(Layer.provide(NodeServices.layer)),
+          ServerConfig.layerTest(root, baseDir).pipe(Layer.provideMerge(NodeServices.layer)),
         ),
-        Effect.provide(NodeServices.layer),
       );
       return { root, stateDir, gate };
     }),
