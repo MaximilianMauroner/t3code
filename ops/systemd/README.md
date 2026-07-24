@@ -10,6 +10,11 @@ immutable release, and atomically creates `fork-current` before installing the
 `ExecStart` override. A bootstrap failure therefore leaves the old service
 configuration in place.
 
+The override is deliberately named `zz-fork-update.conf` so it sorts after the
+host's existing `https-proxy.conf`; the installer removes the stale
+`fork-update.conf` name and verifies systemd's effective `ExecStart` before it
+disables the nightly updater.
+
 The application writes update state as the `codex` user. The healthcheck runs
 as root so it can restart the system service, but atomically changes ownership
 of status files back to `codex`. Outside an update it preserves the existing

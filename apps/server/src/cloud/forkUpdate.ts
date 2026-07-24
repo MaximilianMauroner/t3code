@@ -6,7 +6,6 @@ import {
 } from "@t3tools/contracts";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import * as NodeChildProcess from "node:child_process";
-import * as NodeFS from "node:fs";
 import * as Clock from "effect/Clock";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -24,6 +23,7 @@ import { HostProcessExecutablePath } from "@t3tools/shared/hostProcess";
 import { writeFileStringAtomically } from "../atomicWrite.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as UpdateMaintenanceGate from "../orchestration/UpdateMaintenanceGate.ts";
 import type { ProjectionRepositoryError } from "../persistence/Errors.ts";
 import * as ProcessRunner from "../processRunner.ts";
 
@@ -154,14 +154,13 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
   const env = yield* HostProcessEnvironment;
   const nodeExecutable = yield* HostProcessExecutablePath;
   const snapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+  const maintenanceGate = yield* UpdateMaintenanceGate.UpdateMaintenanceGate;
   const configuration =
     options !== undefined && Object.hasOwn(options, "configuration")
       ? (options.configuration ?? null)
       : resolveForkUpdateConfiguration(env, config.stateDir, (...parts) => path.join(...parts));
   const statusPath = path.join(config.stateDir, "fork-update.json");
   const verificationPath = path.join(config.stateDir, "fork-update-verification.json");
-  const lockPath = path.join(config.stateDir, "fork-update.lock");
-  const lockOwnerPath = path.join(lockPath, "pid");
   const inFlight = yield* Ref.make(false);
 
   const host: ForkUpdateHost = {
@@ -289,48 +288,10 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
     ),
   );
 
-  const releaseLock = Effect.try({
-    try: () => NodeFS.rmSync(lockPath, { recursive: true, force: true }),
-    catch: () => statusError("Could not release the update lock."),
-  }).pipe(Effect.ignore);
-
-  const acquireLock = Effect.try({
-    try: () => {
-      try {
-        NodeFS.mkdirSync(lockPath);
-      } catch (cause) {
-        const nodeError: NodeJS.ErrnoException | null = cause instanceof Error ? cause : null;
-        if (nodeError?.code !== "EEXIST") throw cause;
-        if (NodeFS.existsSync(verificationPath)) {
-          throw new Error("The deployed release is still being verified.", { cause });
-        }
-        let owner = Number.NaN;
-        try {
-          owner = Number.parseInt(NodeFS.readFileSync(lockOwnerPath, "utf8").trim(), 10);
-        } catch {
-          owner = Number.NaN;
-        }
-        let ownerAlive = Number.isSafeInteger(owner) && owner > 0;
-        if (ownerAlive) {
-          try {
-            process.kill(owner, 0);
-          } catch {
-            ownerAlive = false;
-          }
-        }
-        if (ownerAlive) {
-          throw new Error("Another fork update is already in progress.", { cause });
-        }
-        NodeFS.rmSync(lockPath, { recursive: true, force: true });
-        NodeFS.mkdirSync(lockPath);
-      }
-      NodeFS.writeFileSync(lockOwnerPath, `${String(process.pid)}\n`, {
-        mode: 0o600,
-      });
-    },
-    catch: (cause) =>
-      statusError(cause instanceof Error ? cause.message : "Could not acquire the update lock."),
-  });
+  const releaseLock = maintenanceGate.release;
+  const acquireLock = maintenanceGate.acquire.pipe(
+    Effect.mapError((cause) => statusError(cause.message)),
+  );
 
   const start: ForkUpdate["Service"]["start"] = Effect.gen(function* () {
     if (configuration === null) {
@@ -386,6 +347,53 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
         return yield* statusError(
           "The configured fork or upstream remote does not match its exact GitHub repository.",
         );
+      }
+      status = yield* updateStage(status, "fetching", "Reconciling the fork's main branch.");
+      yield* run(
+        "git",
+        [
+          "fetch",
+          "--prune",
+          configuration.forkRemote,
+          `refs/heads/${configuration.branch}:refs/remotes/${configuration.forkRemote}/${configuration.branch}`,
+        ],
+        repo,
+      );
+      const forkRef = `${configuration.forkRemote}/${configuration.branch}`;
+      const localBehindFork = yield* runner
+        .run({
+          command: "git",
+          args: ["merge-base", "--is-ancestor", "HEAD", forkRef],
+          cwd: repo,
+          timeout: Duration.seconds(30),
+        })
+        .pipe(
+          Effect.mapError((cause) =>
+            statusError(`Could not compare fork commits: ${cause.message}`),
+          ),
+        );
+      if (localBehindFork.code === 0) {
+        yield* run("git", ["merge", "--ff-only", forkRef], repo);
+      } else if (localBehindFork.code === 1) {
+        const forkBehindLocal = yield* runner
+          .run({
+            command: "git",
+            args: ["merge-base", "--is-ancestor", forkRef, "HEAD"],
+            cwd: repo,
+            timeout: Duration.seconds(30),
+          })
+          .pipe(
+            Effect.mapError((cause) =>
+              statusError(`Could not compare local and fork commits: ${cause.message}`),
+            ),
+          );
+        if (forkBehindLocal.code !== 0) {
+          return yield* statusError(
+            "The local main branch and fork main have diverged; reconcile them manually.",
+          );
+        }
+      } else {
+        return yield* statusError("Could not determine the fork main ancestry.");
       }
       originalCommit = yield* run("git", ["rev-parse", "HEAD"], repo);
       const currentExists = yield* fs
@@ -462,6 +470,8 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
           "run",
           "packages/contracts/src/server.test.ts",
           "apps/server/src/cloud/forkUpdate.test.ts",
+          "apps/server/src/cloud/forkHealthcheck.test.ts",
+          "apps/server/src/cloud/forkInstaller.test.ts",
         ],
         repo,
       );
@@ -703,4 +713,7 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
   });
 });
 
-export const layer = Layer.effect(ForkUpdate, make()).pipe(Layer.provide(ProcessRunner.layer));
+export const layer = Layer.effect(ForkUpdate, make()).pipe(
+  Layer.provide(ProcessRunner.layer),
+  Layer.provide(UpdateMaintenanceGate.layer),
+);

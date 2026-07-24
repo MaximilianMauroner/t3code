@@ -38,6 +38,7 @@ import {
 } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ServerConfig } from "../../config.ts";
+import * as UpdateMaintenanceGate from "../UpdateMaintenanceGate.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
@@ -49,9 +50,11 @@ async function createOrchestrationSystem() {
     prefix: "t3-orchestration-engine-test-",
   });
   const orchestrationLayer = Layer.mergeAll(
+    UpdateMaintenanceGate.layer,
     OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
       Layer.provide(OrchestrationProjectionPipelineLive),
+      Layer.provide(UpdateMaintenanceGate.layer),
     ),
     OrchestrationProjectionSnapshotQueryLive,
   ).pipe(
@@ -65,8 +68,12 @@ async function createOrchestrationSystem() {
   const runtime = ManagedRuntime.make(orchestrationLayer);
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
+  const maintenanceGate = await runtime.runPromise(
+    Effect.service(UpdateMaintenanceGate.UpdateMaintenanceGate),
+  );
   return {
     engine,
+    maintenanceGate,
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
     dispose: () => runtime.dispose(),
@@ -89,6 +96,31 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
+  it("blocks turn dispatch while the shared update maintenance gate is held", async () => {
+    const system = await createOrchestrationSystem();
+    await system.run(system.maintenanceGate.acquire);
+    await expect(
+      system.run(
+        system.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-maintenance-gated-turn"),
+          threadId: ThreadId.make("thread-maintenance-gated"),
+          message: {
+            messageId: asMessageId("msg-maintenance-gated"),
+            role: "user",
+            text: "hello",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: now(),
+        }),
+      ),
+    ).rejects.toThrow("server update is in progress");
+    await system.run(system.maintenanceGate.release);
+    await system.dispose();
+  });
+
   it("bootstraps command handling from persisted projections without reading the full snapshot", async () => {
     let nextSequence = 8;
     const eventStore: OrchestrationEventStoreShape = {

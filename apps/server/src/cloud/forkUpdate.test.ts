@@ -212,7 +212,12 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
         revisionReads += 1;
         return { stdout: revisionReads === 1 ? "old-commit\n" : "new-commit\n" };
       }
-      if (invocation.includes("merge-base --is-ancestor")) return { code: ancestryCode };
+      if (invocation.includes("merge-base --is-ancestor") && invocation.includes("upstream/main")) {
+        return { code: ancestryCode };
+      }
+      if (invocation.includes("merge-base --is-ancestor") && invocation.includes("origin/main")) {
+        return { code: 0 };
+      }
       return {};
     };
   };
@@ -303,6 +308,75 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       assert.equal(result.stage, "restarting");
       assert.isTrue(commands.some((command) => command === "pnpm install --frozen-lockfile"));
       assert.isTrue(commands.some((command) => command.includes("git push origin")));
+    }),
+  );
+
+  it.effect("fast-forwards local main when fork main is ahead before fetching upstream", () =>
+    Effect.gen(function* () {
+      const commands: Array<string> = [];
+      const context = yield* makeService({
+        active: false,
+        commands,
+        deployedCommit: "old-deployed",
+        output: (command, args) => {
+          const invocation = [command, ...args].join(" ");
+          if (invocation === "git branch --show-current") return { stdout: "main\n" };
+          if (invocation === "git remote get-url origin") {
+            return { stdout: "https://github.com/owner/t3code.git\n" };
+          }
+          if (invocation === "git remote get-url upstream") {
+            return { stdout: "git@github.com:upstream/t3code.git\n" };
+          }
+          if (invocation.includes("merge-base --is-ancestor HEAD origin/main")) {
+            return { code: 0 };
+          }
+          if (invocation.includes("merge-base --is-ancestor upstream/main HEAD")) {
+            return { code: 0 };
+          }
+          if (invocation === "git rev-parse HEAD") return { stdout: "fork-new\n" };
+          return {};
+        },
+      });
+      yield* context.service.start;
+      const result = yield* awaitStatus(context.service, new Set(["restarting", "failed"]));
+      assert.equal(result.stage, "restarting");
+      const fastForwardIndex = commands.indexOf("git merge --ff-only origin/main");
+      const upstreamFetchIndex = commands.findIndex((command) =>
+        command.startsWith("git fetch --prune upstream "),
+      );
+      assert.isAtLeast(fastForwardIndex, 0);
+      assert.isAbove(upstreamFetchIndex, fastForwardIndex);
+    }),
+  );
+
+  it.effect("fails clearly when local main and fork main have diverged", () =>
+    Effect.gen(function* () {
+      const commands: Array<string> = [];
+      const context = yield* makeService({
+        active: false,
+        commands,
+        output: (command, args) => {
+          const invocation = [command, ...args].join(" ");
+          if (invocation === "git branch --show-current") return { stdout: "main\n" };
+          if (invocation === "git remote get-url origin") {
+            return { stdout: "https://github.com/owner/t3code.git\n" };
+          }
+          if (invocation === "git remote get-url upstream") {
+            return { stdout: "git@github.com:upstream/t3code.git\n" };
+          }
+          if (
+            invocation.includes("merge-base --is-ancestor") &&
+            invocation.includes("origin/main")
+          ) {
+            return { code: 1 };
+          }
+          return {};
+        },
+      });
+      yield* context.service.start;
+      const result = yield* awaitStatus(context.service, new Set(["failed"]));
+      assert.include(result.error ?? "", "diverged");
+      assert.isFalse(commands.some((command) => command.startsWith("git fetch --prune upstream ")));
     }),
   );
 
