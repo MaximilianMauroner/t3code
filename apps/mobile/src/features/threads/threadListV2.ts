@@ -131,6 +131,28 @@ export interface ThreadListV2Layout {
   readonly nextSnoozeWakeAt: string | null;
 }
 
+export function resolveAllSnoozedMessage(input: {
+  readonly activeCount: number;
+  readonly snoozedCount: number;
+  readonly settledCount: number;
+  readonly pendingCount: number;
+  readonly searchQuery: string;
+  readonly snoozedExpanded: boolean;
+}): string | null {
+  if (
+    input.snoozedExpanded ||
+    input.snoozedCount === 0 ||
+    input.activeCount > 0 ||
+    input.settledCount > 0 ||
+    input.pendingCount > 0
+  ) {
+    return null;
+  }
+  return input.searchQuery.trim().length > 0
+    ? "All matching threads are snoozed. They’ll return at their wake times."
+    : "All threads are snoozed. They’ll return at their wake times.";
+}
+
 /**
  * Partitions visible threads into the active card block (creation order) and
  * the settled recency tail, matching the web v2 list. `autoSettleAfterDays`

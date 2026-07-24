@@ -3,6 +3,7 @@ import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId, TurnId } from "
 import { describe, expect, it } from "vite-plus/test";
 import {
   buildThreadListV2Items,
+  resolveAllSnoozedMessage,
   resolveThreadListV2SettledTimestamp,
   resolveThreadListV2Status,
 } from "./threadListV2";
@@ -261,5 +262,40 @@ describe("resolveThreadListV2Status", () => {
         makeThread({ id: ThreadId.make("a"), title: "a", hasPendingApprovals: true }),
       ),
     ).toBe("approval");
+  });
+});
+
+describe("resolveAllSnoozedMessage", () => {
+  const allSnoozed = {
+    activeCount: 0,
+    snoozedCount: 2,
+    settledCount: 0,
+    pendingCount: 0,
+    snoozedExpanded: false,
+  } as const;
+
+  it("describes unfiltered and filtered collapsed shelves without repeating the count", () => {
+    expect(resolveAllSnoozedMessage({ ...allSnoozed, searchQuery: "" })).toBe(
+      "All threads are snoozed. They’ll return at their wake times.",
+    );
+    expect(resolveAllSnoozedMessage({ ...allSnoozed, searchQuery: "login" })).toBe(
+      "All matching threads are snoozed. They’ll return at their wake times.",
+    );
+  });
+
+  it("hides the status when the shelf is expanded or other visible work exists", () => {
+    expect(
+      resolveAllSnoozedMessage({
+        ...allSnoozed,
+        searchQuery: "",
+        snoozedExpanded: true,
+      }),
+    ).toBeNull();
+    expect(
+      resolveAllSnoozedMessage({ ...allSnoozed, searchQuery: "", pendingCount: 1 }),
+    ).toBeNull();
+    expect(
+      resolveAllSnoozedMessage({ ...allSnoozed, searchQuery: "", settledCount: 1 }),
+    ).toBeNull();
   });
 });

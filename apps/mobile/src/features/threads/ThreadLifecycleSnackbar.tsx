@@ -3,12 +3,12 @@ import { useEffect, useRef } from "react";
 import { Pressable, View } from "react-native";
 import { AppText as Text } from "../../components/AppText";
 import { OverlayPortal } from "../../components/OverlayPortal";
+import {
+  createThreadLifecycleUndoCoordinator,
+  type ThreadLifecycleSnackbarState,
+} from "./threadLifecycleSnackbarState";
 
-export interface ThreadLifecycleSnackbarState {
-  readonly id: number;
-  readonly snoozedUntil: string;
-  readonly onUndo: () => void;
-}
+export type { ThreadLifecycleSnackbarState } from "./threadLifecycleSnackbarState";
 
 export function ThreadLifecycleSnackbar(props: {
   readonly state: ThreadLifecycleSnackbarState | null;
@@ -16,6 +16,9 @@ export function ThreadLifecycleSnackbar(props: {
 }) {
   const onDismissRef = useRef(props.onDismiss);
   onDismissRef.current = props.onDismiss;
+  const stateRef = useRef(props.state);
+  stateRef.current = props.state;
+  const undoCoordinatorRef = useRef(createThreadLifecycleUndoCoordinator());
   useEffect(() => {
     if (props.state === null) return;
     const id = setTimeout(() => onDismissRef.current(), 5_000);
@@ -34,8 +37,13 @@ export function ThreadLifecycleSnackbar(props: {
             accessibilityRole="button"
             accessibilityLabel="Undo snooze"
             onPress={() => {
-              props.state?.onUndo();
-              props.onDismiss();
+              const state = stateRef.current;
+              if (state === null) return;
+              void undoCoordinatorRef.current.execute(
+                state,
+                () => stateRef.current?.id ?? null,
+                () => onDismissRef.current(),
+              );
             }}
           >
             <Text className="font-t3-medium text-sm text-sky-600 dark:text-sky-400">Undo</Text>

@@ -42,6 +42,7 @@ import {
 import { ThreadListV2Row, ThreadListV2SectionHeader } from "../threads/thread-list-v2-items";
 import {
   buildThreadListV2Items,
+  resolveAllSnoozedMessage,
   THREAD_LIST_V2_SETTLED_INITIAL_COUNT,
   THREAD_LIST_V2_SETTLED_PAGE_COUNT,
   type ThreadListV2Item,
@@ -572,6 +573,25 @@ export function HomeScreen(props: HomeScreenProps) {
     // unchanged: after a clamped fire (wake beyond the 32-bit setTimeout
     // range) the boundary string is identical and the chain would die.
   }, [nextSnoozeWakeAt, snoozeWakeTick]);
+  const v2SearchQuery = props.searchQuery.trim().toLocaleLowerCase();
+  const v2PendingTasks = props.pendingTasks.filter(
+    (pendingTask) =>
+      (props.selectedEnvironmentId === null ||
+        pendingTask.message.environmentId === props.selectedEnvironmentId) &&
+      (v2ScopedProjectKeys === null ||
+        v2ScopedProjectKeys.has(
+          scopedProjectKey(pendingTask.message.environmentId, pendingTask.creation.projectId),
+        )) &&
+      (v2SearchQuery.length === 0 || pendingTask.title.toLocaleLowerCase().includes(v2SearchQuery)),
+  );
+  const allSnoozedMessage = resolveAllSnoozedMessage({
+    activeCount: threadListV2Layout.activeCount,
+    snoozedCount: threadListV2Layout.snoozedCount,
+    settledCount: threadListV2Layout.settledCount,
+    pendingCount: v2PendingTasks.length,
+    searchQuery: props.searchQuery,
+    snoozedExpanded,
+  });
   const threadListV2Items = threadListV2Layout.items.filter(
     (item) =>
       item.type === "section" ||
@@ -586,6 +606,7 @@ export function HomeScreen(props: HomeScreenProps) {
           lifecycle={item.lifecycle}
           count={item.count}
           expanded={item.lifecycle === "snoozed" ? snoozedExpanded : settledExpanded}
+          statusMessage={item.lifecycle === "snoozed" ? allSnoozedMessage : null}
           onToggle={
             item.lifecycle === "snoozed"
               ? () => setSnoozedExpanded((expanded) => !expanded)
@@ -642,6 +663,7 @@ export function HomeScreen(props: HomeScreenProps) {
       ),
     [
       handleChangeRequestState,
+      allSnoozedMessage,
       handleDeleteThread,
       handleSettleThread,
       handleSwipeableClose,
@@ -848,17 +870,6 @@ export function HomeScreen(props: HomeScreenProps) {
   // thread shells, so the v2 item builder never sees them, but they must
   // stay visible and deletable while their environment is offline. They
   // respect the same environment scope and search filter as the list.
-  const v2SearchQuery = props.searchQuery.trim().toLocaleLowerCase();
-  const v2PendingTasks = props.pendingTasks.filter(
-    (pendingTask) =>
-      (props.selectedEnvironmentId === null ||
-        pendingTask.message.environmentId === props.selectedEnvironmentId) &&
-      (v2ScopedProjectKeys === null ||
-        v2ScopedProjectKeys.has(
-          scopedProjectKey(pendingTask.message.environmentId, pendingTask.creation.projectId),
-        )) &&
-      (v2SearchQuery.length === 0 || pendingTask.title.toLocaleLowerCase().includes(v2SearchQuery)),
-  );
   // Project scoping lives in the header filter menu (no inline chip row on
   // mobile — the menu is the one filter surface).
   const v2ListHeader = (

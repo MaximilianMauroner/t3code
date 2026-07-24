@@ -22,6 +22,7 @@ import {
   ThreadLifecycleSnackbar,
   type ThreadLifecycleSnackbarState,
 } from "../threads/ThreadLifecycleSnackbar";
+import { reduceThreadLifecycleSnackbar } from "../threads/threadLifecycleSnackbarState";
 
 /* ─── Route screen ───────────────────────────────────────────────────── */
 
@@ -152,13 +153,16 @@ export function HomeRouteScreen() {
           onSnoozeThread={(thread, until) => {
             void snoozeThread(thread, until).then((succeeded) => {
               if (!succeeded) return;
-              setLifecycleSnackbar({
-                id: Date.now(),
-                snoozedUntil: until,
-                onUndo: () => {
-                  void wakeThread(thread);
-                },
-              });
+              setLifecycleSnackbar((current) =>
+                reduceThreadLifecycleSnackbar(current, {
+                  type: "show",
+                  state: {
+                    id: Date.now(),
+                    snoozedUntil: until,
+                    onUndo: () => wakeThread(thread),
+                  },
+                }),
+              );
             });
           }}
           onWakeThread={(thread) => {
@@ -207,7 +211,11 @@ export function HomeRouteScreen() {
         />
         <ThreadLifecycleSnackbar
           state={lifecycleSnackbar}
-          onDismiss={() => setLifecycleSnackbar(null)}
+          onDismiss={() =>
+            setLifecycleSnackbar((current) =>
+              reduceThreadLifecycleSnackbar(current, { type: "dismiss" }),
+            )
+          }
         />
       </>
     </AndroidHomeFabLayout>

@@ -96,23 +96,26 @@ export const ThreadListV2SectionHeader = memo(function ThreadListV2SectionHeader
   readonly expanded: boolean;
   readonly pane?: "screen" | "sidebar";
   readonly onToggle: () => void;
+  readonly statusMessage?: string | null;
 }) {
   const title = props.lifecycle === "snoozed" ? "Snoozed" : "Settled";
   return (
     <Pressable
-      accessibilityLabel={`${title}, ${props.count} ${props.count === 1 ? "thread" : "threads"}`}
+      accessibilityLabel={`${title}, ${props.count} ${props.count === 1 ? "thread" : "threads"}${props.statusMessage ? `. ${props.statusMessage}` : ""}`}
       accessibilityRole="button"
       accessibilityState={{ expanded: props.expanded }}
       onPress={props.onToggle}
-      className={cn(
-        "mt-3 min-h-11 flex-row items-center gap-2",
-        props.pane === "sidebar" ? "px-3" : "px-5",
-      )}
+      className={cn("mt-3 min-h-11", props.pane === "sidebar" ? "px-3" : "px-5")}
     >
-      <Text className="flex-1 text-xs font-t3-medium text-foreground-tertiary">
-        {title} · {props.count}
-      </Text>
-      <Text className="text-xs text-foreground-tertiary">{props.expanded ? "⌃" : "⌄"}</Text>
+      <View className="min-h-11 flex-row items-center gap-2">
+        <Text className="flex-1 text-xs font-t3-medium text-foreground-tertiary">
+          {title} · {props.count}
+        </Text>
+        <Text className="text-xs text-foreground-tertiary">{props.expanded ? "⌃" : "⌄"}</Text>
+      </View>
+      {props.statusMessage ? (
+        <Text className="pb-3 text-sm text-foreground-muted">{props.statusMessage}</Text>
+      ) : null}
     </Pressable>
   );
 });

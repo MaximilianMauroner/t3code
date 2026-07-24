@@ -67,6 +67,8 @@ import {
   ThreadLifecycleSnackbar,
   type ThreadLifecycleSnackbarState,
 } from "./ThreadLifecycleSnackbar";
+import { resolveParkingNavigation } from "./threadLifecycleNavigation";
+import { reduceThreadLifecycleSnackbar } from "./threadLifecycleSnackbarState";
 import {
   PendingTaskListRow,
   ThreadListGroupHeader,
@@ -76,6 +78,7 @@ import {
 import { ThreadListV2Row, ThreadListV2SectionHeader } from "./thread-list-v2-items";
 import {
   buildThreadListV2Items,
+  resolveAllSnoozedMessage,
   THREAD_LIST_V2_SETTLED_INITIAL_COUNT,
   THREAD_LIST_V2_SETTLED_PAGE_COUNT,
   type ThreadListV2Item,
@@ -522,6 +525,7 @@ function ThreadNavigationSidebarPane(
   const handleParkThread = useCallback(
     async (thread: EnvironmentThreadShell, action: "settle" | "snooze", snoozedUntil?: string) => {
       const parkedKey = scopedThreadKey(thread.environmentId, thread.id);
+      const selectedKeyBefore = selectedThreadKeyRef.current;
       const selectedIndex = activeV2Threads.findIndex(
         (candidate) => scopedThreadKey(candidate.environmentId, candidate.id) === parkedKey,
       );
@@ -534,19 +538,28 @@ function ThreadNavigationSidebarPane(
           ? await settleThread(thread)
           : await snoozeThread(thread, snoozedUntil ?? "");
       if (succeeded && action === "snooze" && snoozedUntil !== undefined) {
-        setLifecycleSnackbar({
-          id: Date.now(),
-          snoozedUntil,
-          onUndo: () => {
-            void wakeThread(thread);
-          },
-        });
+        setLifecycleSnackbar((current) =>
+          reduceThreadLifecycleSnackbar(current, {
+            type: "show",
+            state: {
+              id: Date.now(),
+              snoozedUntil,
+              onUndo: () => wakeThread(thread),
+            },
+          }),
+        );
       }
-      if (!succeeded || selectedThreadKeyRef.current !== parkedKey) return;
-      if (destination === null) {
+      const navigation = resolveParkingNavigation({
+        parkedKey,
+        selectedKeyBefore,
+        selectedKeyAfter: selectedThreadKeyRef.current,
+        succeeded,
+        destination,
+      });
+      if (navigation.type === "clear") {
         props.onClearSelection();
-      } else {
-        props.onSelectThread(destination);
+      } else if (navigation.type === "select") {
+        props.onSelectThread(navigation.destination);
       }
     },
     [
@@ -558,6 +571,25 @@ function ThreadNavigationSidebarPane(
       wakeThread,
     ],
   );
+  const v2SearchQuery = props.searchQuery.trim().toLocaleLowerCase();
+  const v2PendingTasks = pendingTasks.filter(
+    (pendingTask) =>
+      (options.selectedEnvironmentId === null ||
+        pendingTask.message.environmentId === options.selectedEnvironmentId) &&
+      (selectedProjectRefs === null ||
+        selectedProjectRefs.has(
+          scopedProjectKey(pendingTask.message.environmentId, pendingTask.creation.projectId),
+        )) &&
+      (v2SearchQuery.length === 0 || pendingTask.title.toLocaleLowerCase().includes(v2SearchQuery)),
+  );
+  const allSnoozedMessage = resolveAllSnoozedMessage({
+    activeCount: threadListV2Layout.activeCount,
+    snoozedCount: threadListV2Layout.snoozedCount,
+    settledCount: threadListV2Layout.settledCount,
+    pendingCount: v2PendingTasks.length,
+    searchQuery: props.searchQuery,
+    snoozedExpanded,
+  });
   const listItems = useMemo<readonly SidebarListItem[]>(() => {
     if (!threadListV2Enabled) return listLayout.items;
     // Queued offline tasks render above the thread rows (mirrors the
@@ -565,18 +597,6 @@ function ThreadNavigationSidebarPane(
     // builder never sees them, but they must stay visible and deletable
     // while their environment is offline. Same environment scope and
     // search filter as the list.
-    const v2SearchQuery = props.searchQuery.trim().toLocaleLowerCase();
-    const v2PendingTasks = pendingTasks.filter(
-      (pendingTask) =>
-        (options.selectedEnvironmentId === null ||
-          pendingTask.message.environmentId === options.selectedEnvironmentId) &&
-        (selectedProjectRefs === null ||
-          selectedProjectRefs.has(
-            scopedProjectKey(pendingTask.message.environmentId, pendingTask.creation.projectId),
-          )) &&
-        (v2SearchQuery.length === 0 ||
-          pendingTask.title.toLocaleLowerCase().includes(v2SearchQuery)),
-    );
     const items: SidebarListItem[] = v2PendingTasks.map((pendingTask, index) => ({
       type: "v2-pending-task" as const,
       key: `v2-pending:${pendingTask.message.messageId}`,
@@ -610,14 +630,11 @@ function ThreadNavigationSidebarPane(
     return items;
   }, [
     listLayout.items,
-    options.selectedEnvironmentId,
-    pendingTasks,
-    props.searchQuery,
-    selectedProjectRefs,
     snoozedExpanded,
     settledExpanded,
     threadListV2Enabled,
     threadListV2Layout,
+    v2PendingTasks,
   ]);
   const showsConnectionStatus = shouldShowWorkspaceConnectionStatus(catalogState);
   const listMenuActions = useMemo<MenuAction[]>(
@@ -846,6 +863,7 @@ function ThreadNavigationSidebarPane(
                 lifecycle={item.item.lifecycle}
                 count={item.item.count}
                 expanded={item.item.lifecycle === "snoozed" ? snoozedExpanded : settledExpanded}
+                statusMessage={item.item.lifecycle === "snoozed" ? allSnoozedMessage : null}
                 pane="sidebar"
                 onToggle={
                   item.item.lifecycle === "snoozed"
@@ -994,6 +1012,7 @@ function ThreadNavigationSidebarPane(
       }
     },
     [
+      allSnoozedMessage,
       archiveThread,
       confirmDeletePendingTask,
       confirmDeleteThread,
@@ -1164,7 +1183,11 @@ function ThreadNavigationSidebarPane(
         </View>
         <ThreadLifecycleSnackbar
           state={lifecycleSnackbar}
-          onDismiss={() => setLifecycleSnackbar(null)}
+          onDismiss={() =>
+            setLifecycleSnackbar((current) =>
+              reduceThreadLifecycleSnackbar(current, { type: "dismiss" }),
+            )
+          }
         />
       </>
     );
@@ -1296,7 +1319,11 @@ function ThreadNavigationSidebarPane(
       </View>
       <ThreadLifecycleSnackbar
         state={lifecycleSnackbar}
-        onDismiss={() => setLifecycleSnackbar(null)}
+        onDismiss={() =>
+          setLifecycleSnackbar((current) =>
+            reduceThreadLifecycleSnackbar(current, { type: "dismiss" }),
+          )
+        }
       />
     </>
   );
