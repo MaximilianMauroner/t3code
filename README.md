@@ -21,6 +21,13 @@ npx t3@latest
 
 Tip: Use `npx t3@latest --help` for the full CLI reference.
 
+### Fork service updates
+
+The fork service installer waits up to 60 seconds for the restarted server to report the exact
+deployed commit. Once ready, it continuously verifies that commit for another 120 seconds before
+enabling the periodic fork health check. A connection failure or commit mismatch during continuous
+verification rolls the activation back.
+
 ### Desktop app
 
 Install the latest version of the desktop app from [GitHub Releases](https://github.com/pingdotgg/t3code/releases), or from your favorite package registry:
