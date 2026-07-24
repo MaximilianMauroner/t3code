@@ -6,6 +6,10 @@ import * as NodePath from "node:path";
 
 const opsDir = NodePath.resolve(import.meta.dirname, "../../../../ops/systemd");
 const installer = NodeFS.readFileSync(NodePath.join(opsDir, "install-t3code-fork-service"), "utf8");
+const packageJson = NodeFS.readFileSync(
+  NodePath.resolve(import.meta.dirname, "../../../../package.json"),
+  "utf8",
+);
 const lockHelper = NodePath.join(opsDir, "t3code-fork-lock");
 const firstToken = "123e4567-e89b-42d3-a456-426614174000";
 const secondToken = "987e6543-e21b-42d3-b456-426614174000";
@@ -78,8 +82,27 @@ describe("fork service bootstrap installer", () => {
     expect(installer).toContain("exit 1");
   });
 
-  it("uses controlled tools, exact origin HEAD, and the complete focused validation set", () => {
-    expect(installer).toContain('pnpm_path="${T3CODE_PNPM_PATH:-/home/codex/.local/bin/pnpm}"');
+  it("pins the package.json pnpm version through fixed offline Corepack", () => {
+    const packageVersion = /"packageManager"\s*:\s*"pnpm@([^"]+)"/.exec(packageJson)?.[1];
+    const installerVersion = /expected_pnpm_version="([^"]+)"/.exec(installer)?.[1];
+    expect(packageVersion).toBe("11.10.0");
+    expect(installerVersion).toBe(packageVersion);
+    expect(installer).toContain('corepack_path="/usr/bin/corepack"');
+    expect(installer).toContain('corepack_home="${run_home}/.cache/node/corepack"');
+    expect(installer).toContain('"COREPACK_HOME=$corepack_home"');
+    expect(installer).toContain('"COREPACK_ENABLE_NETWORK=0"');
+    expect(installer).toContain('"COREPACK_ENABLE_PROJECT_SPEC=0"');
+    expect(installer).toContain('"COREPACK_ENV_FILE=0"');
+    expect(installer).toContain('node_dir="/home/codex/.local/share/pnpm/bin"');
+    expect(installer).toContain('"PATH=$node_dir:/usr/bin:/bin"');
+    expect(installer).toContain('passwd_entry="$(/usr/bin/getent passwd "$run_user")"');
+    expect(installer).toContain('"$corepack_path" "pnpm@${expected_pnpm_version}"');
+    expect(installer).not.toContain("T3CODE_PNPM_PATH");
+    expect(installer).not.toContain("T3CODE_NODE_PATH");
+    expect(installer).not.toContain("/home/codex/.local/bin/pnpm");
+  });
+
+  it("uses exact origin HEAD and the complete focused validation set", () => {
     expect(installer).toContain('run_as_user git -C "$repo" fetch --prune origin');
     expect(installer).toContain('[ "$commit" = "$origin_commit" ]');
     expect(installer).toContain("apps/server/src/cloud/forkHealthcheck.test.ts");
@@ -92,19 +115,53 @@ describe("fork service bootstrap installer", () => {
     expect(installer).toContain('while [ "$verified_seconds" -lt 120 ]');
   });
 
-  it("uses a working executable at the target host pnpm path", () => {
-    const pnpmPath = "/home/codex/.local/bin/pnpm";
-    NodeFS.accessSync(pnpmPath, NodeFS.constants.X_OK);
-    const result = NodeChildProcess.spawnSync(pnpmPath, ["--version"], { encoding: "utf8" });
+  it("runs the exact cached pnpm version through fixed offline Corepack", () => {
+    const corepackPath = "/usr/bin/corepack";
+    NodeFS.accessSync(corepackPath, NodeFS.constants.X_OK);
+    const passwd = NodeChildProcess.spawnSync("getent", ["passwd", "codex"], {
+      encoding: "utf8",
+    });
+    expect(passwd.status).toBe(0);
+    const codexHome = passwd.stdout.trim().split(":")[5];
+    expect(codexHome).toBe("/home/codex");
+    const result = NodeChildProcess.spawnSync(corepackPath, ["pnpm@11.10.0", "--version"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: codexHome,
+        COREPACK_HOME: `${codexHome}/.cache/node/corepack`,
+        COREPACK_ENABLE_NETWORK: "0",
+        COREPACK_ENABLE_PROJECT_SPEC: "0",
+        COREPACK_ENV_FILE: "0",
+        PATH: "/home/codex/.local/share/pnpm/bin:/usr/bin:/bin",
+      },
+    });
     expect(result.status).toBe(0);
-    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    expect(result.stdout.trim()).toBe("11.10.0");
   });
 
-  it("acquires before repository or package operations and holds through verification", () => {
+  it("preflights exact pnpm before state mutation then locks before package operations", () => {
+    const preflightIndex = installer.indexOf('pnpm_version="$(run_pnpm --version)"');
+    const exactCheckIndex = installer.indexOf(
+      '[ "$pnpm_version" = "$expected_pnpm_version" ]',
+      preflightIndex,
+    );
+    const stateDirectoryIndex = installer.indexOf(
+      'install -d -o "$run_user" -g "$run_user" "$state_dir"',
+    );
     const acquireIndex = installer.indexOf('"$lock_helper" acquire');
+    expect(preflightIndex).toBeGreaterThan(-1);
+    expect(exactCheckIndex).toBeGreaterThan(preflightIndex);
+    expect(stateDirectoryIndex).toBeGreaterThan(exactCheckIndex);
     expect(installer.indexOf("trap early_exit_handler EXIT")).toBeLessThan(acquireIndex);
-    expect(acquireIndex).toBeLessThan(installer.indexOf('pnpm_version="$(run_as_user'));
+    expect(acquireIndex).toBeGreaterThan(stateDirectoryIndex);
     expect(acquireIndex).toBeLessThan(installer.indexOf("run_as_user git"));
+    expect(acquireIndex).toBeLessThan(installer.indexOf('run_pnpm -C "$repo" install'));
+    expect(acquireIndex).toBeLessThan(
+      installer.indexOf('install -d -o "$run_user" -g "$run_user" "$releases_dir"'),
+    );
+    expect(installer.match(/\brun_pnpm\b/g)?.length).toBe(9);
+    expect(installer).not.toMatch(/run_as_user\s+"\$[^"]*pnpm/);
     expect(installer).not.toContain("backup_file update_lock");
     expect(installer).not.toContain("restore_file update_lock");
     expect(installer).not.toContain('rm -rf "$lock_path"');
