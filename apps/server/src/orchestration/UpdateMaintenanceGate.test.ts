@@ -15,6 +15,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import type * as PlatformError from "effect/PlatformError";
 import { describe, expect } from "vite-plus/test";
 
 import { ServerConfig } from "../config.ts";
@@ -46,7 +47,7 @@ interface Fixture {
 function withFixture<A, E, R>(
   use: (fixture: Fixture) => Effect.Effect<A, E, R>,
   setup?: (stateDir: string) => void,
-): Effect.Effect<A, E, R> {
+): Effect.Effect<A, E | PlatformError.PlatformError, R> {
   return Effect.acquireUseRelease(
     Effect.gen(function* () {
       const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-update-gate-test-"));

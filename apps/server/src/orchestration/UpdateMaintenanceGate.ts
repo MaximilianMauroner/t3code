@@ -45,6 +45,8 @@ export class UpdateMaintenanceGateError extends Schema.TaggedErrorClass<UpdateMa
   }
 }
 
+const isUpdateMaintenanceGateError = Schema.is(UpdateMaintenanceGateError);
+
 const allowAll: UpdateMaintenanceGateService = {
   acquire: Effect.succeed({ pid: process.pid, token: "00000000-0000-4000-8000-000000000000" }),
   release: Effect.void,
@@ -265,7 +267,7 @@ export const make = Effect.gen(function* () {
           return token;
         },
         catch: (cause) =>
-          cause instanceof UpdateMaintenanceGateError
+          isUpdateMaintenanceGateError(cause)
             ? cause
             : new UpdateMaintenanceGateError({ reason: "Could not acquire update gate." }),
       }).pipe(Effect.exit);
