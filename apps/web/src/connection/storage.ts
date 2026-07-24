@@ -49,11 +49,9 @@ const StoredShellSnapshot = Schema.Struct({
   snapshot: OrchestrationShellSnapshot,
 });
 const StoredShellSnapshotJson = Schema.fromJsonString(StoredShellSnapshot);
-// v2 stores the snapshot sequence alongside the thread so a warm cache can
-// resume via `afterSequence` instead of re-downloading the full thread body.
-// Older v1 entries (no sequence) fail to decode and are treated as a cold cache.
+// v3 cold-starts caches created before persisted activity payload bounding.
 const StoredThreadSnapshot = Schema.Struct({
-  schemaVersion: Schema.Literal(2),
+  schemaVersion: Schema.Literal(3),
   environmentId: EnvironmentId,
   threadId: ThreadId,
   snapshot: OrchestrationThreadDetailSnapshot,
@@ -83,6 +81,28 @@ const decodeStoredServerConfig = Schema.decodeUnknownEffect(StoredServerConfigJs
 const encodeStoredServerConfig = Schema.encodeEffect(StoredServerConfigJson);
 const decodeStoredVcsRefs = Schema.decodeUnknownEffect(StoredVcsRefsJson);
 const encodeStoredVcsRefs = Schema.encodeEffect(StoredVcsRefsJson);
+
+export const decodeThreadSnapshotCache = Effect.fn("web.connectionStorage.decodeThreadSnapshot")(
+  (raw: string, environmentId: EnvironmentId, threadId: ThreadId) =>
+    decodeStoredThreadSnapshot(raw).pipe(
+      Effect.map((stored) =>
+        stored.environmentId === environmentId && stored.threadId === threadId
+          ? Option.some(stored.snapshot)
+          : Option.none(),
+      ),
+      Effect.catch(() => Effect.succeed(Option.none())),
+    ),
+);
+
+export const encodeThreadSnapshotCache = Effect.fn("web.connectionStorage.encodeThreadSnapshot")(
+  (environmentId: EnvironmentId, snapshot: OrchestrationThreadDetailSnapshot) =>
+    encodeStoredThreadSnapshot({
+      schemaVersion: 3,
+      environmentId,
+      threadId: snapshot.thread.id,
+      snapshot,
+    }),
+);
 
 function catalogError(operation: string, cause: unknown) {
   return new ConnectionTransientError({
@@ -541,14 +561,7 @@ export const connectionStorageLayer = Layer.effectContext(
             if (typeof raw !== "string") {
               return Effect.succeed(Option.none());
             }
-            return decodeStoredThreadSnapshot(raw).pipe(
-              Effect.mapError((cause) => persistenceError("load-thread", cause)),
-              Effect.map((stored) =>
-                stored.environmentId === environmentId && stored.threadId === threadId
-                  ? Option.some(stored.snapshot)
-                  : Option.none(),
-              ),
-            );
+            return decodeThreadSnapshotCache(raw, environmentId, threadId);
           }),
           Effect.mapError((cause) =>
             cause._tag === "ConnectionPersistenceError"
@@ -558,12 +571,9 @@ export const connectionStorageLayer = Layer.effectContext(
         ),
       saveThread: (environmentId, snapshot) =>
         Effect.gen(function* () {
-          const encoded = yield* encodeStoredThreadSnapshot({
-            schemaVersion: 2,
-            environmentId,
-            threadId: snapshot.thread.id,
-            snapshot,
-          }).pipe(Effect.mapError((cause) => persistenceError("save-thread", cause)));
+          const encoded = yield* encodeThreadSnapshotCache(environmentId, snapshot).pipe(
+            Effect.mapError((cause) => persistenceError("save-thread", cause)),
+          );
           yield* writeDatabaseValue(
             database,
             THREAD_STORE_NAME,

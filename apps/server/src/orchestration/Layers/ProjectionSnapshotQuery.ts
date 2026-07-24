@@ -83,6 +83,7 @@ const ProjectionThreadDbRowSchema = ProjectionThread.mapFields(
 const ProjectionThreadActivityDbRowSchema = ProjectionThreadActivity.mapFields(
   Struct.assign({
     payload: Schema.fromJsonString(Schema.Unknown),
+    payloadOmitted: Schema.optional(Schema.Number),
     sequence: Schema.NullOr(NonNegativeInt),
   }),
 );
@@ -842,6 +843,249 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         FROM projection_thread_activities
         WHERE thread_id = ${threadId}
         ORDER BY
+          sequence ASC,
+          created_at ASC,
+          activity_id ASC
+      `,
+  });
+
+  const listSnapshotThreadActivityRowsByThread = SqlSchema.findAll({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionThreadActivityDbRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        WITH
+          thread_activities AS (
+            SELECT
+              activity_id, thread_id, turn_id, tone, kind, summary,
+              payload_json, sequence, created_at
+            FROM projection_thread_activities
+            WHERE thread_id = ${threadId}
+          ),
+          recent_activities AS (
+            SELECT *
+            FROM thread_activities
+            ORDER BY
+              (sequence IS NULL) DESC,
+              sequence DESC,
+              created_at DESC,
+              activity_id DESC
+            LIMIT 500
+          ),
+          lifecycle_activities AS MATERIALIZED (
+            SELECT *
+            FROM thread_activities
+            WHERE kind IN (
+              'approval.requested',
+              'approval.resolved',
+              'provider.approval.respond.failed',
+              'user-input.requested',
+              'user-input.resolved',
+              'provider.user-input.respond.failed',
+              'turn.plan.updated'
+            )
+          ),
+          approval_lifecycle AS (
+            SELECT
+              activity.*,
+              row_number() OVER (
+                PARTITION BY json_extract(payload_json, '$.requestId')
+                ORDER BY
+                  (sequence IS NULL) DESC,
+                  sequence DESC,
+                  created_at DESC,
+                  activity_id DESC
+              ) AS lifecycle_rank
+            FROM lifecycle_activities activity
+            WHERE
+              json_type(payload_json, '$.requestId') = 'text'
+              AND (
+                (
+                  kind = 'approval.requested'
+                  AND (
+                    json_extract(payload_json, '$.requestKind')
+                      IN ('command', 'file-read', 'file-change')
+                    OR json_extract(payload_json, '$.requestType')
+                      IN (
+                        'command_execution_approval',
+                        'exec_command_approval',
+                        'dynamic_tool_call',
+                        'file_read_approval',
+                        'file_change_approval',
+                        'apply_patch_approval'
+                      )
+                  )
+                )
+                OR kind = 'approval.resolved'
+                OR (
+                  kind = 'provider.approval.respond.failed'
+                  AND (
+                    lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%stale pending approval request%'
+                    OR lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%unknown pending approval request%'
+                    OR lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%unknown pending permission request%'
+                  )
+                )
+              )
+          ),
+          user_input_lifecycle AS (
+            SELECT
+              activity.*,
+              row_number() OVER (
+                PARTITION BY json_extract(payload_json, '$.requestId')
+                ORDER BY
+                  (sequence IS NULL) DESC,
+                  sequence DESC,
+                  created_at DESC,
+                  activity_id DESC
+              ) AS lifecycle_rank
+            FROM lifecycle_activities activity
+            WHERE
+              json_type(payload_json, '$.requestId') = 'text'
+              AND (
+                (
+                  kind = 'user-input.requested'
+                  AND json_type(payload_json, '$.questions') = 'array'
+                )
+                OR kind = 'user-input.resolved'
+                OR (
+                  kind = 'provider.user-input.respond.failed'
+                  AND (
+                    lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%stale pending user-input request%'
+                    OR lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%unknown pending user-input request%'
+                    OR lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%unknown pending user input request%'
+                    OR lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%unknown pending codex user input request%'
+                  )
+                )
+              )
+          ),
+          current_state_activities AS (
+            SELECT
+              activity_id, thread_id, turn_id, tone, kind, summary,
+              payload_json, sequence, created_at
+            FROM approval_lifecycle
+            WHERE lifecycle_rank = 1 AND kind = 'approval.requested'
+            UNION
+            SELECT
+              activity_id, thread_id, turn_id, tone, kind, summary,
+              payload_json, sequence, created_at
+            FROM user_input_lifecycle
+            WHERE lifecycle_rank = 1 AND kind = 'user-input.requested'
+            UNION
+            SELECT *
+            FROM (
+              SELECT *
+              FROM lifecycle_activities
+              WHERE kind = 'turn.plan.updated'
+              ORDER BY
+                (sequence IS NULL) DESC,
+                sequence DESC,
+                created_at DESC,
+                activity_id DESC
+              LIMIT 1
+            )
+            UNION
+            SELECT *
+            FROM (
+              SELECT *
+              FROM lifecycle_activities
+              WHERE
+                kind = 'turn.plan.updated'
+                AND turn_id = (
+                  SELECT latest_turn_id
+                  FROM projection_threads
+                  WHERE thread_id = ${threadId}
+                )
+              ORDER BY
+                (sequence IS NULL) DESC,
+                sequence DESC,
+                created_at DESC,
+                activity_id DESC
+              LIMIT 1
+            )
+          ),
+          snapshot_activities AS (
+            SELECT * FROM recent_activities
+            UNION
+            SELECT * FROM current_state_activities
+          )
+        SELECT
+          activity_id AS "activityId",
+          thread_id AS "threadId",
+          turn_id AS "turnId",
+          tone,
+          kind,
+          summary,
+          -- User-input payloads contain protocol identifiers and option values
+          -- that must round-trip exactly. Other oversized state is projected to
+          -- bounded UI-safe fields.
+          CASE
+            WHEN
+              length(CAST(payload_json AS BLOB)) <= 65536
+              OR kind IN (
+                'user-input.requested',
+                'user-input.resolved',
+                'provider.user-input.respond.failed'
+              )
+            THEN payload_json
+            WHEN kind = 'turn.plan.updated'
+            THEN json_object(
+              'explanation', substr(json_extract(payload_json, '$.explanation'), 1, 4096),
+              'plan', json(COALESCE((
+                SELECT json_group_array(json_object(
+                  'step', substr(json_extract(plan_step.value, '$.step'), 1, 8192),
+                  'status', json_extract(plan_step.value, '$.status')
+                ))
+                FROM (
+                  SELECT value
+                  FROM json_each(payload_json, '$.plan')
+                  LIMIT 256
+                ) plan_step
+              ), '[]'))
+            )
+            WHEN kind IN (
+              'approval.requested',
+              'approval.resolved',
+              'provider.approval.respond.failed'
+            )
+            THEN json_object(
+              'requestId', json_extract(payload_json, '$.requestId'),
+              'requestKind', json_extract(payload_json, '$.requestKind'),
+              'requestType', json_extract(payload_json, '$.requestType'),
+              'status', json_extract(payload_json, '$.status'),
+              'detail', substr(json_extract(payload_json, '$.detail'), 1, 2048)
+            )
+            ELSE json_object(
+              'itemType', json_extract(payload_json, '$.itemType'),
+              'detail', substr(
+                COALESCE(json_extract(payload_json, '$.detail'), summary),
+                1,
+                2048
+              )
+            )
+          END AS "payload",
+          CASE
+            WHEN
+              length(CAST(payload_json AS BLOB)) > 65536
+              AND kind NOT IN (
+                'user-input.requested',
+                'user-input.resolved',
+                'provider.user-input.respond.failed'
+              )
+            THEN 1
+            ELSE 0
+          END AS "payloadOmitted",
+          sequence,
+          created_at AS "createdAt"
+        FROM snapshot_activities
+        ORDER BY
+          (sequence IS NULL) ASC,
           sequence ASC,
           created_at ASC,
           activity_id ASC
@@ -1931,7 +2175,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       } satisfies OrchestrationThreadShell);
     });
 
-  const getThreadDetailById: ProjectionSnapshotQueryShape["getThreadDetailById"] = (threadId) =>
+  const readThreadDetailById = (threadId: ThreadId, forSnapshot: boolean) =>
     Effect.gen(function* () {
       const [
         threadRow,
@@ -1966,7 +2210,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             ),
           ),
         ),
-        listThreadActivityRowsByThread({ threadId }).pipe(
+        (forSnapshot
+          ? listSnapshotThreadActivityRowsByThread({ threadId })
+          : listThreadActivityRowsByThread({ threadId })
+        ).pipe(
           Effect.mapError(
             toPersistenceSqlOrDecodeError(
               "ProjectionSnapshotQuery.getThreadDetailById:listActivities:query",
@@ -2047,6 +2294,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             payload: row.payload,
             turnId: row.turnId,
             createdAt: row.createdAt,
+            ...(row.payloadOmitted === 1 ? { payloadOmitted: true as const } : {}),
           };
           if (row.sequence !== null) {
             return Object.assign(activity, { sequence: row.sequence });
@@ -2074,6 +2322,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       );
     });
 
+  const getThreadDetailById: ProjectionSnapshotQueryShape["getThreadDetailById"] = (threadId) =>
+    readThreadDetailById(threadId, false);
+
   const getThreadDetailSnapshot: ProjectionSnapshotQueryShape["getThreadDetailSnapshot"] = (
     threadId,
   ) =>
@@ -2085,7 +2336,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     sql
       .withTransaction(
         Effect.gen(function* () {
-          const thread = yield* getThreadDetailById(threadId);
+          const thread = yield* readThreadDetailById(threadId, true);
           if (Option.isNone(thread)) {
             return Option.none<OrchestrationThreadDetailSnapshot>();
           }

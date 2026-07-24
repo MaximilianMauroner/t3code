@@ -2,8 +2,27 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import { ServerForkUpdateStatus, ServerProvider } from "./server.ts";
+import { OrchestrationThreadActivity } from "./orchestration.ts";
 
 const decodeServerProvider = Schema.decodeUnknownSync(ServerProvider);
+const encodeThreadActivity = Schema.encodeUnknownSync(OrchestrationThreadActivity);
+const decodeThreadActivity = Schema.decodeUnknownSync(OrchestrationThreadActivity);
+
+it("round-trips omitted persisted activity payload markers", () => {
+  const activity = {
+    id: "activity-omitted",
+    tone: "tool",
+    kind: "tool.completed",
+    summary: "Large tool output",
+    payload: { itemType: "command_execution", detail: "preview" },
+    payloadOmitted: true,
+    turnId: null,
+    sequence: 42,
+    createdAt: "2026-07-24T00:00:00.000Z",
+  } as const;
+  const encoded = encodeThreadActivity(activity);
+  expect(decodeThreadActivity(encoded)).toEqual(activity);
+});
 
 describe("ServerProvider", () => {
   it("defaults capability arrays when decoding provider snapshots", () => {

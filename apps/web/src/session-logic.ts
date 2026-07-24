@@ -74,6 +74,7 @@ export interface WorkLogEntry {
   toolData?: unknown;
   itemType?: ToolLifecycleItemType;
   requestKind?: PendingApproval["requestKind"];
+  payloadOmitted?: true;
   /** From runtime item / task payload `status` when present (e.g. tool.updated). */
   toolLifecycleStatus?: WorkLogToolLifecycleStatus;
   /** Originating orchestration activity kind (e.g. `user-input.requested`) for row chrome. */
@@ -675,6 +676,18 @@ function extractWorkLogToolLifecycleStatus(
 }
 
 function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWorkLogEntry {
+  if (activity.payloadOmitted === true) {
+    return {
+      id: activity.id,
+      createdAt: activity.createdAt,
+      turnId: activity.turnId,
+      label: activity.summary,
+      detail: "Full output omitted from reopened history",
+      tone: activity.tone === "approval" ? "info" : activity.tone,
+      activityKind: activity.kind,
+      payloadOmitted: true,
+    };
+  }
   const payload =
     activity.payload && typeof activity.payload === "object"
       ? (activity.payload as Record<string, unknown>)
@@ -782,6 +795,9 @@ function shouldCollapseToolLifecycleEntries(
   previous: DerivedWorkLogEntry,
   next: DerivedWorkLogEntry,
 ): boolean {
+  if (previous.payloadOmitted === true || next.payloadOmitted === true) {
+    return false;
+  }
   if (previous.activityKind !== "tool.updated" && previous.activityKind !== "tool.completed") {
     return false;
   }
@@ -818,6 +834,8 @@ function mergeDerivedWorkLogEntries(
   const toolCallId = next.toolCallId ?? previous.toolCallId;
   const toolLifecycleStatus = next.toolLifecycleStatus ?? previous.toolLifecycleStatus;
   const toolData = next.toolData ?? previous.toolData;
+  const payloadOmitted =
+    next.payloadOmitted === true || previous.payloadOmitted === true ? true : undefined;
   return {
     ...previous,
     ...next,
@@ -832,6 +850,7 @@ function mergeDerivedWorkLogEntries(
     ...(toolCallId ? { toolCallId } : {}),
     ...(toolLifecycleStatus !== undefined ? { toolLifecycleStatus } : {}),
     ...(toolData !== undefined ? { toolData } : {}),
+    ...(payloadOmitted === true ? { payloadOmitted: true } : {}),
   };
 }
 

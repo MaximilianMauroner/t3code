@@ -34,6 +34,7 @@ function makeActivity(overrides: {
   payload?: Record<string, unknown>;
   turnId?: string;
   sequence?: number;
+  payloadOmitted?: true;
 }): OrchestrationThreadActivity {
   const payload = overrides.payload ?? {};
   return {
@@ -45,6 +46,7 @@ function makeActivity(overrides: {
     payload,
     turnId: overrides.turnId ? TurnId.make(overrides.turnId) : null,
     ...(overrides.sequence !== undefined ? { sequence: overrides.sequence } : {}),
+    ...(overrides.payloadOmitted === true ? { payloadOmitted: true } : {}),
   };
 }
 
@@ -371,6 +373,70 @@ describe("deriveActivePlanState", () => {
   });
 });
 
+describe("compacted actionable activity payloads", () => {
+  it("keeps approval, user-input, and plan state functional", () => {
+    const activities = [
+      makeActivity({
+        id: "compacted-approval",
+        kind: "approval.requested",
+        tone: "approval",
+        summary: "Approval required",
+        payloadOmitted: true,
+        payload: {
+          requestId: "approval-compacted",
+          requestKind: "command",
+          detail: "Run tests?",
+        },
+      }),
+      makeActivity({
+        id: "compacted-input",
+        kind: "user-input.requested",
+        tone: "approval",
+        summary: "Input required",
+        payloadOmitted: true,
+        payload: {
+          requestId: "input-compacted",
+          questions: [
+            {
+              id: "choice",
+              header: "Choice",
+              question: "Continue?",
+              options: [{ label: "Yes", description: "Continue" }],
+              multiSelect: false,
+            },
+          ],
+        },
+      }),
+      makeActivity({
+        id: "compacted-plan",
+        kind: "turn.plan.updated",
+        tone: "info",
+        summary: "Plan updated",
+        turnId: "turn-1",
+        payloadOmitted: true,
+        payload: {
+          explanation: "Current plan",
+          plan: [{ step: "Finish tests", status: "inProgress" }],
+        },
+      }),
+    ];
+
+    expect(derivePendingApprovals(activities)).toMatchObject([
+      { requestId: "approval-compacted", requestKind: "command" },
+    ]);
+    expect(derivePendingUserInputs(activities)).toMatchObject([
+      {
+        requestId: "input-compacted",
+        questions: [{ id: "choice", options: [{ label: "Yes" }] }],
+      },
+    ]);
+    expect(deriveActivePlanState(activities, TurnId.make("turn-1"))).toMatchObject({
+      explanation: "Current plan",
+      steps: [{ step: "Finish tests", status: "inProgress" }],
+    });
+  });
+});
+
 describe("findLatestProposedPlan", () => {
   it("prefers the latest proposed plan for the active turn", () => {
     expect(
@@ -691,6 +757,24 @@ describe("workEntryIndicatesToolFailure", () => {
 });
 
 describe("deriveWorkLogEntries", () => {
+  it("keeps omitted payload rows quiet and non-detailed", () => {
+    const [entry] = deriveWorkLogEntries([
+      makeActivity({
+        id: "omitted",
+        kind: "tool.completed",
+        summary: "Large tool output",
+        payload: { itemType: "mcp_tool_call", detail: "preview" },
+        payloadOmitted: true,
+      }),
+    ]);
+    expect(entry).toMatchObject({
+      label: "Large tool output",
+      detail: "Full output omitted from reopened history",
+      payloadOmitted: true,
+    });
+    expect(entry?.toolData).toBeUndefined();
+  });
+
   it("omits tool started entries and keeps completed entries", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
