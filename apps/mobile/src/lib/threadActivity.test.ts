@@ -13,6 +13,8 @@ import {
 
 import {
   buildThreadFeed,
+  derivePendingApprovals,
+  derivePendingUserInputs,
   deriveThreadFeedPresentation,
   type ThreadFeedActivity,
   type ThreadFeedEntry,
@@ -508,5 +510,55 @@ describe("buildThreadFeed", () => {
       type: "work-toggle",
       expanded: true,
     });
+  });
+});
+
+describe("compacted actionable activity payloads", () => {
+  it("keeps mobile approval and user-input state functional", () => {
+    const activities = [
+      makeActivity({
+        id: EventId.make("compacted-approval"),
+        kind: "approval.requested",
+        tone: "approval",
+        summary: "Approval required",
+        payloadOmitted: true,
+        payload: {
+          requestId: "approval-compacted",
+          requestKind: "file-change",
+          detail: "Approve edit?",
+        },
+        createdAt: "2026-04-01T00:00:01.000Z",
+      }),
+      makeActivity({
+        id: EventId.make("compacted-input"),
+        kind: "user-input.requested",
+        tone: "approval",
+        summary: "Input required",
+        payloadOmitted: true,
+        payload: {
+          requestId: "input-compacted",
+          questions: [
+            {
+              id: "choice",
+              header: "Choice",
+              question: "Continue?",
+              options: [{ label: "Yes", description: "Continue" }],
+              multiSelect: false,
+            },
+          ],
+        },
+        createdAt: "2026-04-01T00:00:02.000Z",
+      }),
+    ];
+
+    expect(derivePendingApprovals(activities)).toMatchObject([
+      { requestId: "approval-compacted", requestKind: "file-change" },
+    ]);
+    expect(derivePendingUserInputs(activities)).toMatchObject([
+      {
+        requestId: "input-compacted",
+        questions: [{ id: "choice", options: [{ label: "Yes" }] }],
+      },
+    ]);
   });
 });

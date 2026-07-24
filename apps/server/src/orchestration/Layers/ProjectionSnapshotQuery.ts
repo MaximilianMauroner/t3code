@@ -865,17 +865,38 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           recent_activities AS (
             SELECT *
             FROM thread_activities
-            ORDER BY sequence DESC, created_at DESC, activity_id DESC
+            ORDER BY
+              (sequence IS NULL) DESC,
+              sequence DESC,
+              created_at DESC,
+              activity_id DESC
             LIMIT 500
+          ),
+          lifecycle_activities AS MATERIALIZED (
+            SELECT *
+            FROM thread_activities
+            WHERE kind IN (
+              'approval.requested',
+              'approval.resolved',
+              'provider.approval.respond.failed',
+              'user-input.requested',
+              'user-input.resolved',
+              'provider.user-input.respond.failed',
+              'turn.plan.updated'
+            )
           ),
           approval_lifecycle AS (
             SELECT
               activity.*,
               row_number() OVER (
                 PARTITION BY json_extract(payload_json, '$.requestId')
-                ORDER BY sequence DESC, created_at DESC, activity_id DESC
+                ORDER BY
+                  (sequence IS NULL) DESC,
+                  sequence DESC,
+                  created_at DESC,
+                  activity_id DESC
               ) AS lifecycle_rank
-            FROM thread_activities activity
+            FROM lifecycle_activities activity
             WHERE
               json_type(payload_json, '$.requestId') = 'text'
               AND (
@@ -914,9 +935,13 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               activity.*,
               row_number() OVER (
                 PARTITION BY json_extract(payload_json, '$.requestId')
-                ORDER BY sequence DESC, created_at DESC, activity_id DESC
+                ORDER BY
+                  (sequence IS NULL) DESC,
+                  sequence DESC,
+                  created_at DESC,
+                  activity_id DESC
               ) AS lifecycle_rank
-            FROM thread_activities activity
+            FROM lifecycle_activities activity
             WHERE
               json_type(payload_json, '$.requestId') = 'text'
               AND (
@@ -956,16 +981,20 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             SELECT *
             FROM (
               SELECT *
-              FROM thread_activities
+              FROM lifecycle_activities
               WHERE kind = 'turn.plan.updated'
-              ORDER BY sequence DESC, created_at DESC, activity_id DESC
+              ORDER BY
+                (sequence IS NULL) DESC,
+                sequence DESC,
+                created_at DESC,
+                activity_id DESC
               LIMIT 1
             )
             UNION
             SELECT *
             FROM (
               SELECT *
-              FROM thread_activities
+              FROM lifecycle_activities
               WHERE
                 kind = 'turn.plan.updated'
                 AND turn_id = (
@@ -973,7 +1002,11 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   FROM projection_threads
                   WHERE thread_id = ${threadId}
                 )
-              ORDER BY sequence DESC, created_at DESC, activity_id DESC
+              ORDER BY
+                (sequence IS NULL) DESC,
+                sequence DESC,
+                created_at DESC,
+                activity_id DESC
               LIMIT 1
             )
           ),
@@ -989,19 +1022,78 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           tone,
           kind,
           summary,
+          -- Required interaction fields use generous UI-safe ceilings: at most
+          -- 32 questions/options, 256 plan steps, and 8 KiB primary prompt text.
           CASE
-            WHEN
-              length(CAST(payload_json AS BLOB)) > 65536
-              AND kind NOT IN (
-                'approval.requested',
-                'approval.resolved',
-                'provider.approval.respond.failed',
-                'user-input.requested',
-                'user-input.resolved',
-                'provider.user-input.respond.failed',
-                'turn.plan.updated'
-              )
+            WHEN length(CAST(payload_json AS BLOB)) <= 65536
+            THEN payload_json
+            WHEN kind = 'user-input.requested'
             THEN json_object(
+              'requestId', json_extract(payload_json, '$.requestId'),
+              'status', json_extract(payload_json, '$.status'),
+              'questions', json(COALESCE((
+                SELECT json_group_array(json_object(
+                  'id', substr(json_extract(question.value, '$.id'), 1, 256),
+                  'header', substr(json_extract(question.value, '$.header'), 1, 512),
+                  'question', substr(json_extract(question.value, '$.question'), 1, 8192),
+                  'options', json(COALESCE((
+                    SELECT json_group_array(json_object(
+                      'label', substr(json_extract(option.value, '$.label'), 1, 512),
+                      'description', substr(
+                        json_extract(option.value, '$.description'),
+                        1,
+                        2048
+                      )
+                    ))
+                    FROM (
+                      SELECT value
+                      FROM json_each(question.value, '$.options')
+                      LIMIT 32
+                    ) option
+                  ), '[]')),
+                  'multiSelect', CASE
+                    WHEN json_extract(question.value, '$.multiSelect') = 1
+                    THEN json('true')
+                    ELSE json('false')
+                  END
+                ))
+                FROM (
+                  SELECT value
+                  FROM json_each(payload_json, '$.questions')
+                  LIMIT 32
+                ) question
+              ), '[]'))
+            )
+            WHEN kind = 'turn.plan.updated'
+            THEN json_object(
+              'explanation', substr(json_extract(payload_json, '$.explanation'), 1, 4096),
+              'plan', json(COALESCE((
+                SELECT json_group_array(json_object(
+                  'step', substr(json_extract(plan_step.value, '$.step'), 1, 8192),
+                  'status', json_extract(plan_step.value, '$.status')
+                ))
+                FROM (
+                  SELECT value
+                  FROM json_each(payload_json, '$.plan')
+                  LIMIT 256
+                ) plan_step
+              ), '[]'))
+            )
+            WHEN kind IN (
+              'approval.requested',
+              'approval.resolved',
+              'provider.approval.respond.failed',
+              'user-input.resolved',
+              'provider.user-input.respond.failed'
+            )
+            THEN json_object(
+              'requestId', json_extract(payload_json, '$.requestId'),
+              'requestKind', json_extract(payload_json, '$.requestKind'),
+              'requestType', json_extract(payload_json, '$.requestType'),
+              'status', json_extract(payload_json, '$.status'),
+              'detail', substr(json_extract(payload_json, '$.detail'), 1, 2048)
+            )
+            ELSE json_object(
               'itemType', json_extract(payload_json, '$.itemType'),
               'detail', substr(
                 COALESCE(json_extract(payload_json, '$.detail'), summary),
@@ -1009,27 +1101,19 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 2048
               )
             )
-            ELSE payload_json
           END AS "payload",
           CASE
-            WHEN
-              length(CAST(payload_json AS BLOB)) > 65536
-              AND kind NOT IN (
-                'approval.requested',
-                'approval.resolved',
-                'provider.approval.respond.failed',
-                'user-input.requested',
-                'user-input.resolved',
-                'provider.user-input.respond.failed',
-                'turn.plan.updated'
-              )
-            THEN 1
+            WHEN length(CAST(payload_json AS BLOB)) > 65536 THEN 1
             ELSE 0
           END AS "payloadOmitted",
           sequence,
           created_at AS "createdAt"
         FROM snapshot_activities
-        ORDER BY sequence ASC, created_at ASC, activity_id ASC
+        ORDER BY
+          (sequence IS NULL) ASC,
+          sequence ASC,
+          created_at ASC,
+          activity_id ASC
       `,
   });
 

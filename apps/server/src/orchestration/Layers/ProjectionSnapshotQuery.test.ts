@@ -540,6 +540,96 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
     }),
   );
 
+  it.effect("treats unsequenced activities as newest when selecting and ordering the tail", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("thread-1");
+
+      yield* sql`DELETE FROM projection_thread_activities WHERE thread_id = 'thread-1'`;
+      for (let sequence = 0; sequence < 502; sequence += 1) {
+        yield* sql`
+          INSERT INTO projection_thread_activities (
+            activity_id, thread_id, turn_id, tone, kind, summary,
+            payload_json, sequence, created_at
+          ) VALUES (
+            ${`mixed-${String(sequence).padStart(3, "0")}`},
+            'thread-1', NULL, 'tool', 'tool.updated', ${`activity ${String(sequence)}`},
+            '{"itemType":"command_execution","detail":"small"}',
+            ${sequence}, '2026-06-01T00:00:00.000Z'
+          )
+        `;
+      }
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary,
+          payload_json, sequence, created_at
+        ) VALUES
+          (
+            'mixed-unsequenced-a', 'thread-1', NULL, 'tool', 'tool.updated', 'unsequenced a',
+            '{"itemType":"command_execution","detail":"small"}',
+            NULL, '2026-06-01T00:00:01.000Z'
+          ),
+          (
+            'mixed-unsequenced-b', 'thread-1', NULL, 'tool', 'tool.updated', 'unsequenced b',
+            '{"itemType":"command_execution","detail":"small"}',
+            NULL, '2026-06-01T00:00:02.000Z'
+          )
+      `;
+
+      const snapshot = yield* snapshotQuery.getThreadDetailSnapshot(threadId);
+      assert.equal(snapshot._tag, "Some");
+      if (snapshot._tag === "Some") {
+        const activities = snapshot.value.thread.activities;
+        assert.equal(activities.length, 500);
+        assert.equal(activities[0]?.id, asEventId("mixed-004"));
+        assert.deepEqual(
+          activities.slice(-2).map((activity) => activity.id),
+          [asEventId("mixed-unsequenced-a"), asEventId("mixed-unsequenced-b")],
+        );
+      }
+    }),
+  );
+
+  it.effect("does not parse non-lifecycle JSON while deriving current state", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("thread-1");
+
+      yield* sql`DELETE FROM projection_thread_activities WHERE thread_id = 'thread-1'`;
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary,
+          payload_json, sequence, created_at
+        ) VALUES (
+          'old-generic-invalid-json', 'thread-1', NULL, 'tool', 'tool.updated',
+          'Old generic row', 'not-json', 0, '2026-06-01T00:00:00.000Z'
+        )
+      `;
+      for (let sequence = 1; sequence <= 500; sequence += 1) {
+        yield* sql`
+          INSERT INTO projection_thread_activities (
+            activity_id, thread_id, turn_id, tone, kind, summary,
+            payload_json, sequence, created_at
+          ) VALUES (
+            ${`valid-tail-${String(sequence).padStart(3, "0")}`},
+            'thread-1', NULL, 'tool', 'tool.updated', ${`activity ${String(sequence)}`},
+            '{"itemType":"command_execution","detail":"small"}',
+            ${sequence}, '2026-06-01T01:00:00.000Z'
+          )
+        `;
+      }
+
+      const snapshot = yield* snapshotQuery.getThreadDetailSnapshot(threadId);
+      assert.equal(snapshot._tag, "Some");
+      if (snapshot._tag === "Some") {
+        assert.equal(snapshot.value.thread.activities.length, 500);
+        assert.equal(snapshot.value.thread.activities[0]?.id, asEventId("valid-tail-001"));
+      }
+    }),
+  );
+
   it.effect(
     "unions old unresolved request and active-plan state into the bounded activity tail",
     () =>
@@ -619,7 +709,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           (
             'approval-resolved', 'thread-1', 'turn-1', 'approval', 'approval.resolved',
             'Approval resolved', '{"requestId":"approval-old"}',
-            503, '2026-06-02T02:00:00.000Z'
+            NULL, '2026-06-02T02:00:00.000Z'
           ),
           (
             'input-cleared', 'thread-1', 'turn-1', 'approval',
@@ -630,7 +720,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           (
             'plan-cleared', 'thread-1', 'turn-1', 'info', 'turn.plan.updated',
             'Plan cleared', '{"plan":[]}',
-            505, '2026-06-02T02:00:02.000Z'
+            NULL, '2026-06-02T02:00:02.000Z'
           )
       `;
 
@@ -649,38 +739,40 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       }),
   );
 
-  it.effect("preserves oversized state-bearing payloads and leaves stored JSON untouched", () =>
-    Effect.gen(function* () {
-      const snapshotQuery = yield* ProjectionSnapshotQuery;
-      const sql = yield* SqlClient.SqlClient;
-      const threadId = ThreadId.make("thread-1");
-      const padding = "x".repeat(70_000);
-      const approvalPayload = JSON.stringify({
-        requestId: "approval-large",
-        requestKind: "file-change",
-        detail: "Approve edit?",
-        padding,
-      });
-      const userInputPayload = JSON.stringify({
-        requestId: "input-large",
-        questions: [
-          {
-            id: "choice",
-            header: "Choice",
-            question: "Continue?",
-            options: [{ label: "Yes", description: "Continue" }],
-          },
-        ],
-        padding,
-      });
-      const planPayload = JSON.stringify({
-        explanation: "Large plan",
-        plan: [{ step: "Keep every required field", status: "inProgress" }],
-        padding,
-      });
+  it.effect(
+    "bounds oversized state payloads while preserving actionable fields and stored JSON",
+    () =>
+      Effect.gen(function* () {
+        const snapshotQuery = yield* ProjectionSnapshotQuery;
+        const sql = yield* SqlClient.SqlClient;
+        const threadId = ThreadId.make("thread-1");
+        const padding = "x".repeat(70_000);
+        const approvalPayload = JSON.stringify({
+          requestId: "approval-large",
+          requestKind: "file-change",
+          detail: "d".repeat(70_000),
+          padding,
+        });
+        const userInputPayload = JSON.stringify({
+          requestId: "input-large",
+          questions: [
+            {
+              id: "choice",
+              header: "Choice",
+              question: "Continue?",
+              options: [{ label: "Yes", description: "Continue" }],
+            },
+          ],
+          padding,
+        });
+        const planPayload = JSON.stringify({
+          explanation: "e".repeat(70_000),
+          plan: [{ step: "Keep every required field", status: "inProgress" }],
+          padding,
+        });
 
-      yield* sql`DELETE FROM projection_thread_activities WHERE thread_id = 'thread-1'`;
-      yield* sql`
+        yield* sql`DELETE FROM projection_thread_activities WHERE thread_id = 'thread-1'`;
+        yield* sql`
         INSERT INTO projection_thread_activities (
           activity_id, thread_id, turn_id, tone, kind, summary,
           payload_json, sequence, created_at
@@ -698,33 +790,58 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             'Plan updated', ${planPayload}, 3, '2026-06-03T00:00:03.000Z'
           )
       `;
-      const storedBefore = yield* sql<{ readonly activityId: string; readonly payload: string }>`
+        const storedBefore = yield* sql<{ readonly activityId: string; readonly payload: string }>`
         SELECT activity_id AS "activityId", payload_json AS "payload"
         FROM projection_thread_activities
         WHERE thread_id = 'thread-1'
         ORDER BY sequence ASC
       `;
 
-      const snapshot = yield* snapshotQuery.getThreadDetailSnapshot(threadId);
-      assert.equal(snapshot._tag, "Some");
-      if (snapshot._tag === "Some") {
-        const [approval, userInput, plan] = snapshot.value.thread.activities;
-        assert.isUndefined(approval?.payloadOmitted);
-        assert.isUndefined(userInput?.payloadOmitted);
-        assert.isUndefined(plan?.payloadOmitted);
-        assert.deepEqual(approval?.payload, JSON.parse(approvalPayload));
-        assert.deepEqual(userInput?.payload, JSON.parse(userInputPayload));
-        assert.deepEqual(plan?.payload, JSON.parse(planPayload));
-      }
+        const snapshot = yield* snapshotQuery.getThreadDetailSnapshot(threadId);
+        assert.equal(snapshot._tag, "Some");
+        if (snapshot._tag === "Some") {
+          const [approval, userInput, plan] = snapshot.value.thread.activities;
+          assert.isTrue(approval?.payloadOmitted);
+          assert.isTrue(userInput?.payloadOmitted);
+          assert.isTrue(plan?.payloadOmitted);
+          assert.deepEqual(approval?.payload, {
+            requestId: "approval-large",
+            requestKind: "file-change",
+            requestType: null,
+            status: null,
+            detail: "d".repeat(2_048),
+          });
+          assert.deepEqual(userInput?.payload, {
+            requestId: "input-large",
+            status: null,
+            questions: [
+              {
+                id: "choice",
+                header: "Choice",
+                question: "Continue?",
+                options: [{ label: "Yes", description: "Continue" }],
+                multiSelect: false,
+              },
+            ],
+          });
+          assert.deepEqual(plan?.payload, {
+            explanation: "e".repeat(4_096),
+            plan: [{ step: "Keep every required field", status: "inProgress" }],
+          });
+          for (const activity of snapshot.value.thread.activities) {
+            assert.isBelow(Buffer.byteLength(JSON.stringify(activity.payload), "utf8"), 16_384);
+            assert.notProperty(activity.payload, "padding");
+          }
+        }
 
-      const storedAfter = yield* sql<{ readonly activityId: string; readonly payload: string }>`
+        const storedAfter = yield* sql<{ readonly activityId: string; readonly payload: string }>`
         SELECT activity_id AS "activityId", payload_json AS "payload"
         FROM projection_thread_activities
         WHERE thread_id = 'thread-1'
         ORDER BY sequence ASC
       `;
-      assert.deepEqual(storedAfter, storedBefore);
-    }),
+        assert.deepEqual(storedAfter, storedBefore);
+      }),
   );
 
   it.effect("keeps archived threads out of the main shell snapshot", () =>
