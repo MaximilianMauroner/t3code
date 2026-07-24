@@ -1,4 +1,11 @@
-import { EnvironmentId, ThreadId, type VcsListRefsResult } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  type OrchestrationThreadDetailSnapshot,
+  type VcsListRefsResult,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -7,6 +14,34 @@ import { type ClientCacheKind, MobileDatabase } from "../persistence/mobile-data
 import { make } from "./environment-cache-store";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
+const THREAD_SNAPSHOT: OrchestrationThreadDetailSnapshot = {
+  snapshotSequence: 7,
+  thread: {
+    id: ThreadId.make("thread-v3"),
+    projectId: ProjectId.make("project-1"),
+    title: "Cached thread",
+    modelSelection: {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5.4",
+    },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: "main",
+    worktreePath: null,
+    latestTurn: null,
+    createdAt: "2026-07-01T00:00:00.000Z",
+    updatedAt: "2026-07-01T00:00:00.000Z",
+    archivedAt: null,
+    settledOverride: null,
+    settledAt: null,
+    deletedAt: null,
+    messages: [],
+    proposedPlans: [],
+    activities: [],
+    checkpoints: [],
+    session: null,
+  },
+};
 const REFS: VcsListRefsResult = {
   refs: [
     {
@@ -75,6 +110,19 @@ describe("mobile SQLite environment cache store", () => {
 
       expect(yield* store.loadThread(ENVIRONMENT_ID, threadId)).toEqual(Option.none());
       expect(memory.removed).toEqual([id]);
+    }),
+  );
+
+  it.effect("round-trips a v3 thread snapshot", () =>
+    Effect.gen(function* () {
+      const memory = makeDatabase();
+      const store = yield* make().pipe(Effect.provideService(MobileDatabase, memory.database));
+
+      yield* store.saveThread(ENVIRONMENT_ID, THREAD_SNAPSHOT);
+
+      expect(yield* store.loadThread(ENVIRONMENT_ID, THREAD_SNAPSHOT.thread.id)).toEqual(
+        Option.some(THREAD_SNAPSHOT),
+      );
     }),
   );
 

@@ -854,6 +854,134 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     Result: ProjectionThreadActivityDbRowSchema,
     execute: ({ threadId }) =>
       sql`
+        WITH
+          thread_activities AS (
+            SELECT
+              activity_id, thread_id, turn_id, tone, kind, summary,
+              payload_json, sequence, created_at
+            FROM projection_thread_activities
+            WHERE thread_id = ${threadId}
+          ),
+          recent_activities AS (
+            SELECT *
+            FROM thread_activities
+            ORDER BY sequence DESC, created_at DESC, activity_id DESC
+            LIMIT 500
+          ),
+          approval_lifecycle AS (
+            SELECT
+              activity.*,
+              row_number() OVER (
+                PARTITION BY json_extract(payload_json, '$.requestId')
+                ORDER BY sequence DESC, created_at DESC, activity_id DESC
+              ) AS lifecycle_rank
+            FROM thread_activities activity
+            WHERE
+              json_type(payload_json, '$.requestId') = 'text'
+              AND (
+                (
+                  kind = 'approval.requested'
+                  AND (
+                    json_extract(payload_json, '$.requestKind')
+                      IN ('command', 'file-read', 'file-change')
+                    OR json_extract(payload_json, '$.requestType')
+                      IN (
+                        'command_execution_approval',
+                        'exec_command_approval',
+                        'dynamic_tool_call',
+                        'file_read_approval',
+                        'file_change_approval',
+                        'apply_patch_approval'
+                      )
+                  )
+                )
+                OR kind = 'approval.resolved'
+                OR (
+                  kind = 'provider.approval.respond.failed'
+                  AND (
+                    lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%stale pending approval request%'
+                    OR lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%unknown pending approval request%'
+                    OR lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%unknown pending permission request%'
+                  )
+                )
+              )
+          ),
+          user_input_lifecycle AS (
+            SELECT
+              activity.*,
+              row_number() OVER (
+                PARTITION BY json_extract(payload_json, '$.requestId')
+                ORDER BY sequence DESC, created_at DESC, activity_id DESC
+              ) AS lifecycle_rank
+            FROM thread_activities activity
+            WHERE
+              json_type(payload_json, '$.requestId') = 'text'
+              AND (
+                (
+                  kind = 'user-input.requested'
+                  AND json_type(payload_json, '$.questions') = 'array'
+                )
+                OR kind = 'user-input.resolved'
+                OR (
+                  kind = 'provider.user-input.respond.failed'
+                  AND (
+                    lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%stale pending user-input request%'
+                    OR lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%unknown pending user-input request%'
+                    OR lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%unknown pending user input request%'
+                    OR lower(json_extract(payload_json, '$.detail'))
+                      LIKE '%unknown pending codex user input request%'
+                  )
+                )
+              )
+          ),
+          current_state_activities AS (
+            SELECT
+              activity_id, thread_id, turn_id, tone, kind, summary,
+              payload_json, sequence, created_at
+            FROM approval_lifecycle
+            WHERE lifecycle_rank = 1 AND kind = 'approval.requested'
+            UNION
+            SELECT
+              activity_id, thread_id, turn_id, tone, kind, summary,
+              payload_json, sequence, created_at
+            FROM user_input_lifecycle
+            WHERE lifecycle_rank = 1 AND kind = 'user-input.requested'
+            UNION
+            SELECT *
+            FROM (
+              SELECT *
+              FROM thread_activities
+              WHERE kind = 'turn.plan.updated'
+              ORDER BY sequence DESC, created_at DESC, activity_id DESC
+              LIMIT 1
+            )
+            UNION
+            SELECT *
+            FROM (
+              SELECT *
+              FROM thread_activities
+              WHERE
+                kind = 'turn.plan.updated'
+                AND turn_id = (
+                  SELECT latest_turn_id
+                  FROM projection_threads
+                  WHERE thread_id = ${threadId}
+                )
+              ORDER BY sequence DESC, created_at DESC, activity_id DESC
+              LIMIT 1
+            )
+          ),
+          snapshot_activities AS (
+            SELECT * FROM recent_activities
+            UNION
+            SELECT * FROM current_state_activities
+          )
         SELECT
           activity_id AS "activityId",
           thread_id AS "threadId",
@@ -862,7 +990,17 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           kind,
           summary,
           CASE
-            WHEN length(CAST(payload_json AS BLOB)) > 65536
+            WHEN
+              length(CAST(payload_json AS BLOB)) > 65536
+              AND kind NOT IN (
+                'approval.requested',
+                'approval.resolved',
+                'provider.approval.respond.failed',
+                'user-input.requested',
+                'user-input.resolved',
+                'provider.user-input.respond.failed',
+                'turn.plan.updated'
+              )
             THEN json_object(
               'itemType', json_extract(payload_json, '$.itemType'),
               'detail', substr(
@@ -873,16 +1011,24 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             )
             ELSE payload_json
           END AS "payload",
-          CASE WHEN length(CAST(payload_json AS BLOB)) > 65536 THEN 1 ELSE 0 END AS "payloadOmitted",
+          CASE
+            WHEN
+              length(CAST(payload_json AS BLOB)) > 65536
+              AND kind NOT IN (
+                'approval.requested',
+                'approval.resolved',
+                'provider.approval.respond.failed',
+                'user-input.requested',
+                'user-input.resolved',
+                'provider.user-input.respond.failed',
+                'turn.plan.updated'
+              )
+            THEN 1
+            ELSE 0
+          END AS "payloadOmitted",
           sequence,
           created_at AS "createdAt"
-        FROM (
-          SELECT *
-          FROM projection_thread_activities
-          WHERE thread_id = ${threadId}
-          ORDER BY sequence DESC, created_at DESC, activity_id DESC
-          LIMIT 500
-        )
+        FROM snapshot_activities
         ORDER BY sequence ASC, created_at ASC, activity_id ASC
       `,
   });

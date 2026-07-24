@@ -292,6 +292,35 @@ const titleUpdated = (title: string, sequence = 2): OrchestrationThreadStreamIte
   },
 });
 
+const activityAppended = (): OrchestrationThreadStreamItem => ({
+  kind: "event",
+  event: {
+    eventId: EventId.make("event-activity-live"),
+    sequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+    occurredAt: "2026-04-01T01:00:00.000Z",
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+    aggregateKind: "thread",
+    aggregateId: THREAD_ID,
+    type: "thread.activity-appended",
+    payload: {
+      threadId: THREAD_ID,
+      activity: {
+        id: EventId.make("activity-live"),
+        tone: "tool",
+        kind: "tool.updated",
+        summary: "Live activity",
+        payload: { detail: "complete live payload" },
+        turnId: null,
+        sequence: CACHED_SNAPSHOT_SEQUENCE + 1,
+        createdAt: "2026-04-01T01:00:00.000Z",
+      },
+    },
+  },
+});
+
 const deleted = (): OrchestrationThreadStreamItem => ({
   kind: "event",
   event: {
@@ -364,6 +393,51 @@ describe("EnvironmentThreads", () => {
       expect(Option.getOrThrow(state.data).title).toBe("Live title");
       expect((yield* Ref.get(harness.savedThreads)).at(-1)?.thread.title).toBe("Live title");
       expect((yield* Ref.get(harness.savedThreads)).at(-1)?.snapshotSequence).toBe(2);
+    }),
+  );
+
+  it.effect("persists a live activity on a bounded snapshot and reopens it from cache", () =>
+    Effect.gen(function* () {
+      const boundedThread: OrchestrationThread = {
+        ...BASE_THREAD,
+        activities: [
+          {
+            id: EventId.make("activity-bounded"),
+            tone: "tool",
+            kind: "tool.updated",
+            summary: "Bounded persisted activity",
+            payload: { itemType: "command_execution", detail: "preview" },
+            payloadOmitted: true,
+            turnId: null,
+            sequence: 1,
+            createdAt: "2026-04-01T00:30:00.000Z",
+          },
+        ],
+      };
+      const liveHarness = yield* makeHarness({ cached: boundedThread });
+      yield* Queue.offer(liveHarness.inputs, activityAppended());
+      yield* awaitThreadState(
+        liveHarness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.activities.some((activity) => activity.id === "activity-live"),
+      );
+      yield* TestClock.adjust("500 millis");
+      yield* Effect.yieldNow;
+
+      const persisted = (yield* Ref.get(liveHarness.savedThreads)).at(-1);
+      expect(persisted?.snapshotSequence).toBe(CACHED_SNAPSHOT_SEQUENCE + 1);
+      expect(persisted?.thread.activities[0]?.payloadOmitted).toBe(true);
+      expect(persisted?.thread.activities[1]?.payload).toEqual({
+        detail: "complete live payload",
+      });
+
+      const reopenedHarness = yield* makeHarness({ cached: persisted!.thread });
+      const reopened = yield* awaitThreadState(reopenedHarness.observed, (value) =>
+        Option.isSome(value.data),
+      );
+      expect(Option.getOrThrow(reopened.data).activities).toEqual(persisted!.thread.activities);
     }),
   );
 

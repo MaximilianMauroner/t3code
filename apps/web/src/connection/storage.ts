@@ -82,6 +82,28 @@ const encodeStoredServerConfig = Schema.encodeEffect(StoredServerConfigJson);
 const decodeStoredVcsRefs = Schema.decodeUnknownEffect(StoredVcsRefsJson);
 const encodeStoredVcsRefs = Schema.encodeEffect(StoredVcsRefsJson);
 
+export const decodeThreadSnapshotCache = Effect.fn("web.connectionStorage.decodeThreadSnapshot")(
+  (raw: string, environmentId: EnvironmentId, threadId: ThreadId) =>
+    decodeStoredThreadSnapshot(raw).pipe(
+      Effect.map((stored) =>
+        stored.environmentId === environmentId && stored.threadId === threadId
+          ? Option.some(stored.snapshot)
+          : Option.none(),
+      ),
+      Effect.catch(() => Effect.succeed(Option.none())),
+    ),
+);
+
+export const encodeThreadSnapshotCache = Effect.fn("web.connectionStorage.encodeThreadSnapshot")(
+  (environmentId: EnvironmentId, snapshot: OrchestrationThreadDetailSnapshot) =>
+    encodeStoredThreadSnapshot({
+      schemaVersion: 3,
+      environmentId,
+      threadId: snapshot.thread.id,
+      snapshot,
+    }),
+);
+
 function catalogError(operation: string, cause: unknown) {
   return new ConnectionTransientError({
     reason: "remote-unavailable",
@@ -539,14 +561,7 @@ export const connectionStorageLayer = Layer.effectContext(
             if (typeof raw !== "string") {
               return Effect.succeed(Option.none());
             }
-            return decodeStoredThreadSnapshot(raw).pipe(
-              Effect.map((stored) =>
-                stored.environmentId === environmentId && stored.threadId === threadId
-                  ? Option.some(stored.snapshot)
-                  : Option.none(),
-              ),
-              Effect.catch(() => Effect.succeed(Option.none())),
-            );
+            return decodeThreadSnapshotCache(raw, environmentId, threadId);
           }),
           Effect.mapError((cause) =>
             cause._tag === "ConnectionPersistenceError"
@@ -556,12 +571,9 @@ export const connectionStorageLayer = Layer.effectContext(
         ),
       saveThread: (environmentId, snapshot) =>
         Effect.gen(function* () {
-          const encoded = yield* encodeStoredThreadSnapshot({
-            schemaVersion: 3,
-            environmentId,
-            threadId: snapshot.thread.id,
-            snapshot,
-          }).pipe(Effect.mapError((cause) => persistenceError("save-thread", cause)));
+          const encoded = yield* encodeThreadSnapshotCache(environmentId, snapshot).pipe(
+            Effect.mapError((cause) => persistenceError("save-thread", cause)),
+          );
           yield* writeDatabaseValue(
             database,
             THREAD_STORE_NAME,
