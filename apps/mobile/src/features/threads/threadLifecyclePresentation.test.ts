@@ -1,6 +1,7 @@
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
+import { refreshLifecycleClockSelection } from "./threadLifecycleClock";
 import { resolveOpenThreadLifecycleState } from "./threadLifecyclePresentation";
 
 function thread(input: Partial<EnvironmentThreadShell> = {}): EnvironmentThreadShell {
@@ -69,6 +70,37 @@ describe("resolveOpenThreadLifecycleState", () => {
       resolveOpenThreadLifecycleState(snoozed, {
         ...options,
         now: "2026-06-02T03:00:00.100Z",
+        changeRequestState: null,
+      }),
+    ).toBeNull();
+  });
+
+  it("classifies an already-elapsed deadline with fresh time after retained selection changes", () => {
+    const snoozed = thread({
+      snoozedAt: "2026-06-02T09:59:00.000Z",
+      snoozedUntil: "2026-06-02T10:00:15.000Z",
+    });
+    const retained = {
+      identity: "env:old",
+      deadline: null,
+      now: "2026-06-02T10:00:00.000Z",
+    };
+    expect(
+      resolveOpenThreadLifecycleState(snoozed, {
+        ...options,
+        now: retained.now,
+        changeRequestState: null,
+      }),
+    ).toBe("snoozed");
+    const refreshed = refreshLifecycleClockSelection(
+      retained,
+      { identity: "env:thread", deadline: snoozed.snoozedUntil },
+      "2026-06-02T10:00:30.000Z",
+    );
+    expect(
+      resolveOpenThreadLifecycleState(snoozed, {
+        ...options,
+        now: refreshed.now,
         changeRequestState: null,
       }),
     ).toBeNull();

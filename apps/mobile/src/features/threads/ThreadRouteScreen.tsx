@@ -200,7 +200,14 @@ function ThreadRouteContent(
     selectedThread,
     selectedThreadCwd ?? selectedThreadProject?.workspaceRoot ?? null,
   );
-  const lifecycleNow = useThreadLifecycleClock(selectedThread?.snoozedUntil ?? null);
+  const lifecycleIdentity =
+    selectedThread === null
+      ? null
+      : scopedThreadKey(selectedThread.environmentId, selectedThread.id);
+  const lifecycleNow = useThreadLifecycleClock(
+    lifecycleIdentity,
+    selectedThread?.snoozedUntil ?? null,
+  );
   const composer = useThreadComposerState();
   const gitState = useSelectedThreadGitState();
   const gitActions = useSelectedThreadGitActions();
