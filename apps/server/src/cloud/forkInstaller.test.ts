@@ -61,8 +61,9 @@ describe("fork service bootstrap installer", () => {
       false,
     );
     expect(installer.indexOf('rm -f "$old_dropin_path"')).toBeGreaterThan(-1);
-    expect(installer.indexOf("systemctl show t3code.service -p ExecStart")).toBeLessThan(
-      installer.indexOf("systemctl disable --now t3code-nightly-update.timer"),
+    const execStartIndex = installer.indexOf("systemctl show t3code.service -p ExecStart");
+    expect(execStartIndex).toBeLessThan(
+      installer.indexOf('systemctl stop "$nightly_timer_unit"', execStartIndex),
     );
   });
 
@@ -74,7 +75,8 @@ describe("fork service bootstrap installer", () => {
       installer.indexOf('install -m 0644 "$script_dir/t3code.service'),
     );
     expect(installer).toContain("backup_file current");
-    expect(installer).toContain("nightly_enabled=");
+    expect(installer).toContain('nightly_timer_enabled="$(read_unit_state is-enabled');
+    expect(installer).toContain('nightly_service_enabled="$(read_unit_state is-enabled');
     expect(installer).toContain("health_enabled=");
     expect(installer).toContain("restore_file dropin");
     expect(installer).toContain("trap signal_handler HUP INT TERM");
@@ -191,6 +193,238 @@ describe("fork service bootstrap installer", () => {
     expect(installer).not.toContain(" add --prod ");
     expect(installer).not.toContain("tarball=");
     expect(installer).not.toContain("package.json");
+  });
+
+  it("strictly preflights the fixed nightly units and exact wants link read-only", () => {
+    const preflightIndex = installer.indexOf("validate_nightly_preflight ||");
+    const transactionIndex = installer.indexOf(
+      "# Everything below is one reversible activation transaction.",
+    );
+    expect(installer).toContain('nightly_unit_dir="/etc/systemd/system"');
+    expect(installer).toContain('nightly_timer_unit="t3code-nightly-update.timer"');
+    expect(installer).toContain('nightly_service_unit="t3code-nightly-update.service"');
+    expect(installer).toContain('nightly_wants_dir="${nightly_unit_dir}/timers.target.wants"');
+    expect(installer).toContain('nightly_wants_link="${nightly_wants_dir}/${nightly_timer_unit}"');
+    expect(installer).toContain('[ -d "$nightly_unit_dir" ] && [ ! -L "$nightly_unit_dir" ]');
+    expect(installer).toContain('[ -d "$nightly_wants_dir" ] && [ ! -L "$nightly_wants_dir" ]');
+    expect(installer).toContain('[ "$(/usr/bin/readlink "$source")" = /dev/null ]');
+    expect(installer).toContain('[ "$(/usr/bin/stat -c \'%u\' "$source")" -eq 0 ]');
+    expect(installer).toContain('[ "$(/usr/bin/stat -c \'%a\' "$source")" = 644 ]');
+    expect(installer).toContain('case "$nightly_timer_enabled" in enabled|disabled|masked)');
+    expect(installer).toContain('case "$nightly_service_enabled" in static|masked)');
+    expect(installer).toContain('case "$nightly_timer_active" in active|inactive)');
+    expect(installer).toContain('case "$nightly_service_active" in active|inactive)');
+    expect(installer).toContain(
+      '[ "$(/usr/bin/readlink "$nightly_wants_link")" = "$nightly_timer_path" ]',
+    );
+    expect(preflightIndex).toBeGreaterThan(installer.indexOf('"$node_path" "$entry" --version'));
+    expect(preflightIndex).toBeLessThan(transactionIndex);
+  });
+
+  it("retires both nightly units inside the existing reversible transaction", () => {
+    const timerBackupIndex = installer.indexOf(
+      'backup_nightly_path nightly_timer "$nightly_timer_path"',
+    );
+    const serviceBackupIndex = installer.indexOf(
+      'backup_nightly_path nightly_service "$nightly_service_path"',
+    );
+    const wantsBackupIndex = installer.indexOf(
+      'backup_nightly_path nightly_wants "$nightly_wants_link"',
+    );
+    const trapIndex = installer.indexOf("trap exit_handler EXIT");
+    const forwardIndex = installer.indexOf('systemctl stop "$nightly_timer_unit"', trapIndex);
+    const forward = installer.slice(forwardIndex);
+    expect(timerBackupIndex).toBeGreaterThan(-1);
+    expect(serviceBackupIndex).toBeGreaterThan(timerBackupIndex);
+    expect(wantsBackupIndex).toBeGreaterThan(serviceBackupIndex);
+    expect(trapIndex).toBeGreaterThan(wantsBackupIndex);
+    expect(forwardIndex).toBeGreaterThan(trapIndex);
+    expect(forward).toContain('systemctl stop "$nightly_service_unit"');
+    expect(forward).toContain('systemctl disable "$nightly_timer_unit"');
+    expect(forward).toContain('[ ! -e "$nightly_wants_link" ] && [ ! -L "$nightly_wants_link" ]');
+    expect(forward).toContain('rm -f "$nightly_timer_path"');
+    expect(forward).toContain('rm -f "$nightly_service_path"');
+    expect(forward).toContain('systemctl mask "$nightly_timer_unit"');
+    expect(forward).toContain('systemctl mask "$nightly_service_unit"');
+    expect(forward).toContain('[ "$(/usr/bin/readlink "$nightly_timer_path")" = /dev/null ]');
+    expect(forward).toContain('[ "$(/usr/bin/readlink "$nightly_service_path")" = /dev/null ]');
+    expect(forward).toContain('[ "$(read_unit_state is-enabled "$nightly_timer_unit")" = masked ]');
+    expect(forward).toContain(
+      '[ "$(read_unit_state is-enabled "$nightly_service_unit")" = masked ]',
+    );
+    expect(forward).toContain(
+      '[ "$(read_unit_state is-active "$nightly_timer_unit")" = inactive ]',
+    );
+    expect(forward).toContain(
+      '[ "$(read_unit_state is-active "$nightly_service_unit")" = inactive ]',
+    );
+    expect(forward).not.toMatch(/nightly_[^\n]*\|\| true/);
+  });
+
+  it("restores exact nightly artifacts and states without recursive deletion", () => {
+    const restoreStart = installer.indexOf("restore_nightly_units() {");
+    const restoreEnd = installer.indexOf("\n}\nrollback() {", restoreStart);
+    const restore = installer.slice(restoreStart, restoreEnd);
+    expect(restore).toContain('systemctl stop "$nightly_timer_unit"');
+    expect(restore).toContain('systemctl stop "$nightly_service_unit"');
+    expect(restore).toContain('systemctl unmask "$nightly_timer_unit"');
+    expect(restore).toContain('systemctl unmask "$nightly_service_unit"');
+    expect(restore).toContain('restore_nightly_path nightly_timer "$nightly_timer_path"');
+    expect(restore).toContain('restore_nightly_path nightly_service "$nightly_service_path"');
+    expect(restore).toContain('restore_nightly_path nightly_wants "$nightly_wants_link"');
+    expect(restore.indexOf("systemctl daemon-reload")).toBeGreaterThan(
+      restore.indexOf('restore_nightly_path nightly_wants "$nightly_wants_link"'),
+    );
+    expect(restore).toContain('enabled) systemctl enable "$nightly_timer_unit"');
+    expect(restore).toContain('disabled) systemctl disable "$nightly_timer_unit"');
+    expect(restore).toContain('active) systemctl start "$nightly_timer_unit"');
+    expect(restore).toContain('active) systemctl start "$nightly_service_unit"');
+    expect(restore).toContain("verify_nightly_original_state");
+    expect(installer).toContain('rm -f "$target"');
+    expect(installer).not.toMatch(/rm -rf ["']?\$nightly_/);
+    expect(installer).not.toMatch(/rm -rf [^\n]*(?:nightly-update|timers\\.target\\.wants)/);
+    expect(installer).toContain('case "$nightly_timer_enabled" in\n  enabled|disabled)');
+    expect(installer).toContain("masked) : ;;");
+  });
+
+  it("preserves the root-only recovery bundle when mocked systemctl breaks rollback", () => {
+    withStateDir((stateDir) => {
+      const backupDir = NodePath.join(stateDir, "backup");
+      const mockBin = NodePath.join(stateDir, "bin");
+      const systemctlLog = NodePath.join(stateDir, "systemctl.log");
+      const lockRelease = NodePath.join(stateDir, "lock-released");
+      const rollbackStatus = NodePath.join(stateDir, "rollback-status");
+      const harnessPath = NodePath.join(stateDir, "rollback-harness");
+      NodeFS.mkdirSync(backupDir, { mode: 0o700 });
+      NodeFS.mkdirSync(mockBin);
+
+      const mockSystemctl = NodePath.join(mockBin, "systemctl");
+      NodeFS.writeFileSync(
+        mockSystemctl,
+        [
+          "#!/bin/sh",
+          'printf "%s\\n" "$*" >>"$SYSTEMCTL_LOG"',
+          'if [ "$1" = unmask ] && [ "${2-}" = t3code-nightly-update.service ]; then',
+          "  exit 1",
+          "fi",
+          "exit 0",
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+
+      NodeFS.writeFileSync(NodePath.join(backupDir, "nightly_timer"), "timer-backup\n", {
+        mode: 0o644,
+      });
+      NodeFS.writeFileSync(NodePath.join(backupDir, "nightly_service"), "service-backup\n", {
+        mode: 0o644,
+      });
+      NodeFS.symlinkSync(
+        "/etc/systemd/system/t3code-nightly-update.timer",
+        NodePath.join(backupDir, "nightly_wants"),
+      );
+      NodeFS.writeFileSync(NodePath.join(backupDir, "current"), "previous-current\n");
+      NodeFS.writeFileSync(NodePath.join(backupDir, "dropin"), "previous-dropin\n");
+      for (const label of [
+        "old_dropin",
+        "health_script",
+        "health_lock_helper",
+        "health_service",
+        "health_timer",
+      ]) {
+        NodeFS.writeFileSync(NodePath.join(backupDir, `${label}.absent`), "");
+      }
+      NodeFS.writeFileSync(NodePath.join(stateDir, "current"), "mutated-current\n");
+      NodeFS.writeFileSync(NodePath.join(stateDir, "dropin"), "mutated-dropin\n");
+
+      const backupHelpers = installer.slice(
+        installer.indexOf("backup_file() {"),
+        installer.indexOf('backup_file current "$current_link"'),
+      );
+      const nightlyRestoreHelpers = installer.slice(
+        installer.indexOf("verify_nightly_original_state() {"),
+        installer.indexOf("rollback() {"),
+      );
+      const rollbackFunction = installer.slice(
+        installer.indexOf("rollback() {"),
+        installer.indexOf("\nexit_handler() {", installer.indexOf("rollback() {")),
+      );
+      NodeFS.writeFileSync(
+        harnessPath,
+        [
+          "#!/bin/sh",
+          "set -u",
+          backupHelpers,
+          nightlyRestoreHelpers,
+          rollbackFunction,
+          'backup_dir="$HARNESS_ROOT/backup"',
+          "nightly_backup_complete=true",
+          "install_complete=false",
+          "rollback_complete=false",
+          'nightly_timer_unit="t3code-nightly-update.timer"',
+          'nightly_service_unit="t3code-nightly-update.service"',
+          'nightly_timer_path="$HARNESS_ROOT/nightly.timer"',
+          'nightly_service_path="$HARNESS_ROOT/nightly.service"',
+          'nightly_wants_link="$HARNESS_ROOT/nightly.wants"',
+          "nightly_timer_enabled=enabled",
+          "nightly_service_enabled=static",
+          "nightly_timer_active=inactive",
+          "nightly_service_active=inactive",
+          'current_link="$HARNESS_ROOT/current"',
+          'old_dropin_path="$HARNESS_ROOT/old-dropin"',
+          'dropin_path="$HARNESS_ROOT/dropin"',
+          'health_script="$HARNESS_ROOT/health-script"',
+          'health_lock_helper="$HARNESS_ROOT/health-lock-helper"',
+          'health_service="$HARNESS_ROOT/health.service"',
+          'health_timer="$HARNESS_ROOT/health.timer"',
+          "health_enabled=disabled",
+          "health_active=inactive",
+          "service_active=inactive",
+          'release_update_lock() { printf "%s\\n" released >"$LOCK_RELEASE"; }',
+          'if rollback; then printf "%s\\n" 0 >"$ROLLBACK_STATUS";',
+          'else printf "%s\\n" "$?" >"$ROLLBACK_STATUS"; fi',
+          "",
+        ].join("\n"),
+        { mode: 0o700 },
+      );
+
+      const result = NodeChildProcess.spawnSync("/bin/sh", [harnessPath], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HARNESS_ROOT: stateDir,
+          LOCK_RELEASE: lockRelease,
+          PATH: `${mockBin}:/usr/bin:/bin`,
+          ROLLBACK_STATUS: rollbackStatus,
+          SYSTEMCTL_LOG: systemctlLog,
+        },
+      });
+      expect(result.status).toBe(0);
+      expect(NodeFS.readFileSync(rollbackStatus, "utf8").trim()).toBe("1");
+      expect(result.stderr).toContain(
+        `Nightly updater rollback backup preserved at ${backupDir} for recovery.`,
+      );
+      expect(NodeFS.statSync(backupDir).mode & 0o777).toBe(0o700);
+      expect(NodeFS.readFileSync(NodePath.join(backupDir, "nightly_timer"), "utf8")).toBe(
+        "timer-backup\n",
+      );
+      expect(NodeFS.readFileSync(NodePath.join(backupDir, "nightly_service"), "utf8")).toBe(
+        "service-backup\n",
+      );
+      expect(NodeFS.readlinkSync(NodePath.join(backupDir, "nightly_wants"))).toBe(
+        "/etc/systemd/system/t3code-nightly-update.timer",
+      );
+      expect(NodeFS.readFileSync(NodePath.join(stateDir, "current"), "utf8")).toBe(
+        "previous-current\n",
+      );
+      expect(NodeFS.readFileSync(NodePath.join(stateDir, "dropin"), "utf8")).toBe(
+        "previous-dropin\n",
+      );
+      expect(NodeFS.readFileSync(lockRelease, "utf8")).toBe("released\n");
+      expect(NodeFS.readFileSync(systemctlLog, "utf8")).toContain(
+        "unmask t3code-nightly-update.service",
+      );
+    });
   });
 
   it("commits and disables signal rollback before releasing the verified activation", () => {
