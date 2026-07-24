@@ -52,6 +52,126 @@ function ownerBytes(stateDir: string): { readonly pid: string; readonly token: s
   };
 }
 
+interface HealthHarnessInput {
+  readonly mode: "ready" | "watch" | "both";
+  readonly curlResponses: ReadonlyArray<{
+    readonly status: number;
+    readonly body: string;
+  }>;
+  readonly dates: ReadonlyArray<number>;
+}
+
+function runHealthHarness(
+  stateDir: string,
+  input: HealthHarnessInput,
+): {
+  readonly status: number | null;
+  readonly stderr: string;
+  readonly curlLog: ReadonlyArray<string>;
+  readonly sleepLog: ReadonlyArray<string>;
+} {
+  const mockBin = NodePath.join(stateDir, "bin");
+  const curlSequence = NodePath.join(stateDir, "curl-sequence");
+  const curlCount = NodePath.join(stateDir, "curl-count");
+  const curlLog = NodePath.join(stateDir, "curl.log");
+  const dateSequence = NodePath.join(stateDir, "date-sequence");
+  const dateCount = NodePath.join(stateDir, "date-count");
+  const sleepLog = NodePath.join(stateDir, "sleep.log");
+  const harnessPath = NodePath.join(stateDir, "health-harness");
+  NodeFS.mkdirSync(mockBin);
+  NodeFS.writeFileSync(
+    curlSequence,
+    `${input.curlResponses
+      .map((response) => `${String(response.status)}|${response.body}`)
+      .join("\n")}\n`,
+  );
+  NodeFS.writeFileSync(dateSequence, `${input.dates.map(String).join("\n")}\n`);
+  NodeFS.writeFileSync(
+    NodePath.join(mockBin, "curl"),
+    [
+      "#!/bin/sh",
+      'printf "%s\\n" "$*" >>"$CURL_LOG"',
+      "count=0",
+      '[ ! -f "$CURL_COUNT" ] || count="$(cat "$CURL_COUNT")"',
+      "count=$((count + 1))",
+      'printf "%s\\n" "$count" >"$CURL_COUNT"',
+      'line="$(sed -n "${count}p" "$CURL_SEQUENCE")"',
+      '[ -n "$line" ] || exit 99',
+      'status="${line%%|*}"',
+      'body="${line#*|}"',
+      'printf "%s" "$body"',
+      'exit "$status"',
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  NodeFS.writeFileSync(
+    NodePath.join(mockBin, "date"),
+    [
+      "#!/bin/sh",
+      "count=0",
+      '[ ! -f "$DATE_COUNT" ] || count="$(cat "$DATE_COUNT")"',
+      "count=$((count + 1))",
+      'printf "%s\\n" "$count" >"$DATE_COUNT"',
+      'value="$(sed -n "${count}p" "$DATE_SEQUENCE")"',
+      '[ -n "$value" ] || exit 98',
+      'printf "%s\\n" "$value"',
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  NodeFS.writeFileSync(
+    NodePath.join(mockBin, "sleep"),
+    ["#!/bin/sh", 'printf "%s\\n" "$1" >>"$SLEEP_LOG"', ""].join("\n"),
+    { mode: 0o755 },
+  );
+  const healthFunctions = installer.slice(
+    installer.indexOf("health_body_matches_commit() {"),
+    installer.indexOf("read_unit_state() {"),
+  );
+  NodeFS.writeFileSync(
+    harnessPath,
+    [
+      "#!/bin/sh",
+      "set -u",
+      healthFunctions,
+      'commit="target-commit"',
+      'health_url="http://health.test/environment"',
+      'case "$HARNESS_MODE" in',
+      "  ready) wait_for_release_ready ;;",
+      "  watch) watch_release_health ;;",
+      "  both) wait_for_release_ready && watch_release_health ;;",
+      "esac",
+      "",
+    ].join("\n"),
+    { mode: 0o700 },
+  );
+  const result = NodeChildProcess.spawnSync("/bin/sh", [harnessPath], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CURL_COUNT: curlCount,
+      CURL_LOG: curlLog,
+      CURL_SEQUENCE: curlSequence,
+      DATE_COUNT: dateCount,
+      DATE_SEQUENCE: dateSequence,
+      HARNESS_MODE: input.mode,
+      PATH: `${mockBin}:/usr/bin:/bin`,
+      SLEEP_LOG: sleepLog,
+    },
+  });
+  const readLog = (path: string): ReadonlyArray<string> =>
+    NodeFS.existsSync(path)
+      ? NodeFS.readFileSync(path, "utf8").trim().split("\n").filter(Boolean)
+      : [];
+  return {
+    status: result.status,
+    stderr: result.stderr,
+    curlLog: readLog(curlLog),
+    sleepLog: readLog(sleepLog),
+  };
+}
+
 describe("fork service bootstrap installer", () => {
   it("uses the last-sorting override and validates effective ExecStart before nightly shutdown", () => {
     expect(NodeFS.existsSync(NodePath.join(opsDir, "t3code.service.d/zz-fork-update.conf"))).toBe(
@@ -193,6 +313,131 @@ describe("fork service bootstrap installer", () => {
     expect(installer).not.toContain(" add --prod ");
     expect(installer).not.toContain("tarball=");
     expect(installer).not.toContain("package.json");
+  });
+
+  it("retries unreachable readiness probes and accepts a delayed exact commit", () => {
+    withStateDir((stateDir) => {
+      const result = runHealthHarness(stateDir, {
+        mode: "ready",
+        curlResponses: [
+          { status: 7, body: "" },
+          { status: 22, body: "" },
+          { status: 0, body: '{"currentCommit":"target-commit"}' },
+        ],
+        dates: [0, 1, 2],
+      });
+      expect(result.status).toBe(0);
+      expect(result.curlLog).toHaveLength(3);
+      expect(result.curlLog.every((args) => args.includes("--max-time 2"))).toBe(true);
+      expect(result.sleepLog).toEqual(["1", "1"]);
+    });
+  });
+
+  it("fails readiness immediately on a reachable wrong or missing commit", () => {
+    for (const body of ['{"currentCommit":"wrong"}', '{"status":"ok"}']) {
+      withStateDir((stateDir) => {
+        const result = runHealthHarness(stateDir, {
+          mode: "ready",
+          curlResponses: [
+            { status: 0, body },
+            { status: 0, body: '{"currentCommit":"target-commit"}' },
+          ],
+          dates: [0],
+        });
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toContain("reachable with an unexpected commit");
+        expect(result.curlLog).toHaveLength(1);
+        expect(result.sleepLog).toEqual([]);
+      });
+    }
+  });
+
+  it("times out readiness after 60 seconds without a real sleep", () => {
+    withStateDir((stateDir) => {
+      const result = runHealthHarness(stateDir, {
+        mode: "ready",
+        curlResponses: [
+          { status: 7, body: "" },
+          { status: 7, body: "" },
+        ],
+        dates: [0, 30, 60],
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("within 60 seconds");
+      expect(result.curlLog).toHaveLength(2);
+      expect(result.sleepLog).toEqual(["1"]);
+    });
+  });
+
+  it("watches the exact commit every five seconds for a full post-ready 120 seconds", () => {
+    withStateDir((stateDir) => {
+      const healthy = { status: 0, body: '{"currentCommit":"target-commit"}' };
+      const result = runHealthHarness(stateDir, {
+        mode: "both",
+        curlResponses: Array.from({ length: 25 }, () => healthy),
+        dates: [0],
+      });
+      expect(result.status).toBe(0);
+      expect(result.curlLog).toHaveLength(25);
+      expect(result.sleepLog).toHaveLength(24);
+      expect(result.sleepLog.every((seconds) => seconds === "5")).toBe(true);
+      expect(result.sleepLog.reduce((sum, seconds) => sum + Number(seconds), 0)).toBe(120);
+    });
+  });
+
+  it("stops the continuous watch on the first HTTP failure or commit mismatch", () => {
+    for (const failure of [
+      { status: 7, body: "", message: "became unreachable" },
+      {
+        status: 0,
+        body: '{"currentCommit":"wrong"}',
+        message: "unexpected commit during release verification",
+      },
+    ]) {
+      withStateDir((stateDir) => {
+        const result = runHealthHarness(stateDir, {
+          mode: "watch",
+          curlResponses: [
+            { status: 0, body: '{"currentCommit":"target-commit"}' },
+            failure,
+            { status: 0, body: '{"currentCommit":"target-commit"}' },
+          ],
+          dates: [],
+        });
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toContain(failure.message);
+        expect(result.curlLog).toHaveLength(2);
+        expect(result.sleepLog).toEqual(["5", "5"]);
+      });
+    }
+  });
+
+  it("restarts, waits, watches, then enables health checks with scoped reset-failed", () => {
+    const installReloadIndex = installer.lastIndexOf(
+      "systemctl daemon-reload",
+      installer.indexOf("systemctl show t3code.service"),
+    );
+    const forwardResetIndex = installer.indexOf(
+      "systemctl reset-failed t3code-fork-healthcheck.timer t3code-fork-healthcheck.service",
+      installReloadIndex,
+    );
+    const restartIndex = installer.indexOf("systemctl restart t3code.service", forwardResetIndex);
+    const readinessIndex = installer.indexOf("wait_for_release_ready", restartIndex);
+    const watchIndex = installer.indexOf("watch_release_health", readinessIndex);
+    const timerIndex = installer.indexOf(
+      "systemctl enable --now t3code-fork-healthcheck.timer",
+      watchIndex,
+    );
+    expect(forwardResetIndex).toBeGreaterThan(installReloadIndex);
+    expect(restartIndex).toBeGreaterThan(forwardResetIndex);
+    expect(readinessIndex).toBeGreaterThan(restartIndex);
+    expect(watchIndex).toBeGreaterThan(readinessIndex);
+    expect(timerIndex).toBeGreaterThan(watchIndex);
+    expect(installer).toContain(
+      "systemctl daemon-reload || true\n  systemctl reset-failed t3code-fork-healthcheck.timer t3code-fork-healthcheck.service || true",
+    );
+    expect(installer.match(/systemctl reset-failed/g)).toHaveLength(2);
+    expect(installer).not.toMatch(/reset-failed[^\n]*nightly/);
   });
 
   it("strictly preflights the fixed nightly units and exact wants link read-only", () => {
