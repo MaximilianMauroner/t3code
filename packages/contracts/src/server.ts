@@ -601,3 +601,48 @@ export class ServerSelfUpdateError extends Schema.TaggedErrorClass<ServerSelfUpd
     return `Server update failed: ${this.reason}`;
   }
 }
+
+export const ServerForkUpdateStage = Schema.Literals([
+  "idle",
+  "checking",
+  "fetching",
+  "merging",
+  "validating",
+  "building",
+  "packaging",
+  "pushing",
+  "deploying",
+  "restarting",
+  "verifying",
+  "succeeded",
+  "no-change",
+  "failed",
+]);
+export type ServerForkUpdateStage = typeof ServerForkUpdateStage.Type;
+
+export const ServerForkUpdateStatus = Schema.Struct({
+  stage: ServerForkUpdateStage,
+  message: TrimmedNonEmptyString,
+  startedAt: Schema.NullOr(TrimmedNonEmptyString),
+  completedAt: Schema.NullOr(TrimmedNonEmptyString),
+  currentCommit: Schema.NullOr(TrimmedNonEmptyString),
+  targetCommit: Schema.NullOr(TrimmedNonEmptyString),
+  error: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type ServerForkUpdateStatus = typeof ServerForkUpdateStatus.Type;
+
+export const ServerForkUpdateResult = Schema.Struct({
+  status: ServerForkUpdateStatus,
+});
+export type ServerForkUpdateResult = typeof ServerForkUpdateResult.Type;
+
+export class ServerForkUpdateError extends Schema.TaggedErrorClass<ServerForkUpdateError>()(
+  "ServerForkUpdateError",
+  {
+    reason: TrimmedNonEmptyString,
+  },
+) {
+  override get message(): string {
+    return `Fork update failed: ${this.reason}`;
+  }
+}

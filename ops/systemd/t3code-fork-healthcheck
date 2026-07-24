@@ -1,0 +1,111 @@
+#!/bin/sh
+set -eu
+
+state_dir="${T3CODE_STATE_DIR:-/home/codex/.t3code/userdata}"
+current_link="${T3CODE_CURRENT_LINK:-${state_dir}/fork-current}"
+service_name="${T3CODE_SERVICE_NAME:-t3code.service}"
+health_url="${T3CODE_HEALTH_URL:-http://127.0.0.1:41731/.well-known/t3/environment}"
+run_user="${T3CODE_RUN_USER:-codex}"
+verification_file="${state_dir}/fork-update-verification.json"
+status_file="${state_dir}/fork-update.json"
+failure_file="/run/t3code-healthcheck.failures"
+
+atomic_user_write() {
+  target="$1"
+  contents="$2"
+  temporary="${target}.tmp.$$"
+  umask 077
+  printf '%s\n' "$contents" >"$temporary"
+  chown "$run_user":"$run_user" "$temporary"
+  mv -f "$temporary" "$target"
+}
+
+healthy=false
+health_body=""
+if health_body="$(curl --fail --silent --show-error --max-time 10 "$health_url")"; then
+  healthy=true
+  if [ -f "$verification_file" ]; then
+    expected_commit="$(sed -n 's/.*"targetCommit":[[:space:]]*"\([^"]*\)".*/\1/p' "$verification_file" | head -n 1)"
+    if [ -z "$expected_commit" ] || ! printf '%s' "$health_body" | grep -Eq "\"currentCommit\"[[:space:]]*:[[:space:]]*\"${expected_commit}\""; then
+      healthy=false
+    fi
+  fi
+fi
+
+if [ "$healthy" = true ]; then
+  rm -f "$failure_file"
+  if [ -f "$verification_file" ]; then
+    not_before="$(sed -n 's/.*"notBeforeEpochSeconds":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$verification_file" | head -n 1)"
+    now_epoch="$(date +%s)"
+    if [ -n "$not_before" ] && [ "$now_epoch" -lt "$not_before" ]; then
+      exit 0
+    fi
+    target_commit="$(sed -n 's/.*"targetCommit":[[:space:]]*"\([^"]*\)".*/\1/p' "$verification_file" | head -n 1)"
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    atomic_user_write "$status_file" \
+"{
+  \"stage\": \"succeeded\",
+  \"message\": \"The updated server passed its health check.\",
+  \"startedAt\": null,
+  \"completedAt\": \"$now\",
+  \"currentCommit\": \"$target_commit\",
+  \"targetCommit\": \"$target_commit\",
+  \"error\": null
+}"
+    rm -f "$verification_file"
+  fi
+  exit 0
+fi
+
+failures=0
+if [ -f "$failure_file" ]; then
+  failures="$(cat "$failure_file" 2>/dev/null || printf '0')"
+fi
+failures=$((failures + 1))
+printf '%s\n' "$failures" >"$failure_file"
+
+if [ -f "$verification_file" ]; then
+  deadline="$(sed -n 's/.*"deadlineEpochSeconds":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$verification_file" | head -n 1)"
+  previous_target="$(sed -n 's/.*"previousTarget":[[:space:]]*"\([^"]*\)".*/\1/p' "$verification_file" | head -n 1)"
+  now_epoch="$(date +%s)"
+  if [ -n "$deadline" ] && [ "$now_epoch" -ge "$deadline" ]; then
+    if [ -n "$previous_target" ]; then
+      next_link="${current_link}.rollback.$$"
+      ln -s "$previous_target" "$next_link"
+      mv -Tf "$next_link" "$current_link"
+      now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      atomic_user_write "$status_file" \
+"{
+  \"stage\": \"failed\",
+  \"message\": \"The updated server stayed unhealthy for two minutes and was rolled back.\",
+  \"startedAt\": null,
+  \"completedAt\": \"$now\",
+  \"currentCommit\": null,
+  \"targetCommit\": null,
+  \"error\": \"Automatic health verification failed; the previous release was restored.\"
+}"
+    else
+      atomic_user_write "$status_file" \
+'{
+  "stage": "failed",
+  "message": "The first managed release stayed unhealthy for two minutes.",
+  "startedAt": null,
+  "completedAt": null,
+  "currentCommit": null,
+  "targetCommit": null,
+  "error": "Automatic health verification failed and no previous release was available."
+}'
+    fi
+    rm -f "$verification_file"
+    systemctl restart "$service_name"
+  fi
+  exit 1
+fi
+
+# Preserve the existing non-update behavior: restart after three consecutive
+# misses, without changing release links.
+if [ "$failures" -ge 3 ]; then
+  printf '0\n' >"$failure_file"
+  systemctl restart "$service_name"
+fi
+exit 1

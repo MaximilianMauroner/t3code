@@ -1,5 +1,9 @@
 import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@t3tools/contracts";
-import { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import {
+  HostProcessArchitecture,
+  HostProcessEnvironment,
+  HostProcessPlatform,
+} from "@t3tools/shared/hostProcess";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -9,6 +13,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import packageJson from "../../package.json" with { type: "json" };
+import { resolveForkUpdateConfiguration } from "../cloud/forkUpdate.ts";
 import { resolveServerSelfUpdateCapability } from "../cloud/selfUpdate.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
@@ -68,6 +73,7 @@ export const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const hostPlatform = yield* HostProcessPlatform;
   const hostArchitecture = yield* HostProcessArchitecture;
+  const hostEnvironment = yield* HostProcessEnvironment;
 
   const readPersistedEnvironmentId = Effect.gen(function* () {
     const exists = yield* fileSystem.exists(serverConfig.environmentIdPath).pipe(
@@ -128,6 +134,18 @@ export const make = Effect.gen(function* () {
   const serverSelfUpdate = yield* resolveServerSelfUpdateCapability({
     desktopManaged: serverConfig.mode === "desktop",
   });
+  const forkUpdate = resolveForkUpdateConfiguration(
+    hostEnvironment,
+    serverConfig.stateDir,
+    (...parts) => path.join(...parts),
+  );
+  const forkCurrentCommit =
+    forkUpdate === null
+      ? null
+      : yield* fileSystem.readLink(forkUpdate.currentLink).pipe(
+          Effect.map((target) => path.basename(target).trim() || null),
+          Effect.orElseSucceed(() => null),
+        );
 
   const descriptor: ExecutionEnvironmentDescriptor = {
     environmentId,
@@ -144,6 +162,15 @@ export const make = Effect.gen(function* () {
       threadSnooze: true,
       ...(serverSelfUpdate === null ? {} : { serverSelfUpdate }),
     },
+    ...(forkUpdate === null
+      ? {}
+      : {
+          forkUpdate: {
+            repository: forkUpdate.repository,
+            branch: forkUpdate.branch,
+            ...(forkCurrentCommit === null ? {} : { currentCommit: forkCurrentCommit }),
+          },
+        }),
   };
 
   return ServerEnvironment.of({

@@ -125,6 +125,8 @@ import {
   ServerSelfUpdateError,
   ServerSelfUpdateInput,
   ServerSelfUpdateResult,
+  ServerForkUpdateError,
+  ServerForkUpdateResult,
   ServerTraceDiagnosticsResult,
   ServerProcessDiagnosticsResult,
   ServerProcessResourceHistoryInput,
@@ -209,6 +211,8 @@ export const WS_METHODS = {
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
   serverUpdateServer: "server.updateServer",
+  serverGetForkUpdate: "server.getForkUpdate",
+  serverStartForkUpdate: "server.startForkUpdate",
   serverUpsertKeybinding: "server.upsertKeybinding",
   serverRemoveKeybinding: "server.removeKeybinding",
   serverGetSettings: "server.getSettings",
@@ -287,6 +291,18 @@ export const WsServerUpdateServerRpc = Rpc.make(WS_METHODS.serverUpdateServer, {
   payload: ServerSelfUpdateInput,
   success: ServerSelfUpdateResult,
   error: Schema.Union([ServerSelfUpdateError, EnvironmentAuthorizationError]),
+});
+
+export const WsServerGetForkUpdateRpc = Rpc.make(WS_METHODS.serverGetForkUpdate, {
+  payload: Schema.Struct({}),
+  success: ServerForkUpdateResult,
+  error: Schema.Union([ServerForkUpdateError, EnvironmentAuthorizationError]),
+});
+
+export const WsServerStartForkUpdateRpc = Rpc.make(WS_METHODS.serverStartForkUpdate, {
+  payload: Schema.Struct({}),
+  success: ServerForkUpdateResult,
+  error: Schema.Union([ServerForkUpdateError, EnvironmentAuthorizationError]),
 });
 
 export const WsServerGetSettingsRpc = Rpc.make(WS_METHODS.serverGetSettings, {
@@ -704,6 +720,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsServerUpdateServerRpc,
+  WsServerGetForkUpdateRpc,
+  WsServerStartForkUpdateRpc,
   WsServerUpsertKeybindingRpc,
   WsServerRemoveKeybindingRpc,
   WsServerGetSettingsRpc,
