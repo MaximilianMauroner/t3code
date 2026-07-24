@@ -500,6 +500,9 @@ function AdaptiveWorkspaceLayoutContent(
     },
     [layout.usesSplitView, pathname, navigation, selectedThreadKey],
   );
+  const handleClearThreadSelection = useCallback(() => {
+    navigation.navigate("Home");
+  }, [navigation]);
 
   return (
     <HomeListOptionsProvider projectGroupingMode={projectGroupingMode}>
@@ -525,6 +528,7 @@ function AdaptiveWorkspaceLayoutContent(
                 onOpenEnvironmentSettings={handleOpenEnvironmentSettings}
                 onNewThreadInProject={handleNewThreadInProject}
                 onSelectThread={handleSelectThread}
+                onClearSelection={handleClearThreadSelection}
                 onSearchQueryChange={setPrimarySidebarSearchQuery}
                 searchQuery={primarySidebarSearchQuery}
               />

@@ -1,4 +1,5 @@
 import * as Effect from "effect/Effect";
+import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 
 import { MobilePreferencesStore, type Preferences } from "../persistence/mobile-preferences";
@@ -122,3 +123,15 @@ export const mobilePreferencesState = createMobilePreferencesState(mobilePrefere
 
 export const mobilePreferencesAtom = mobilePreferencesState.preferencesAtom;
 export const updateMobilePreferencesAtom = mobilePreferencesState.updatePreferencesAtom;
+
+/** v2 is the normal mobile list. Explicit false remains a hidden, temporary rollback. */
+export function resolveThreadListV2Enabled(
+  preferences: Pick<Preferences, "threadListV2Enabled"> | null | undefined,
+): boolean {
+  return preferences?.threadListV2Enabled !== false;
+}
+
+export function useThreadListV2Enabled(): boolean {
+  const result = useAtomValue(mobilePreferencesAtom);
+  return resolveThreadListV2Enabled(AsyncResult.isSuccess(result) ? result.value : undefined);
+}

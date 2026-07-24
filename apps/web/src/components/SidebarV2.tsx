@@ -126,7 +126,7 @@ import {
   snoozeWakeDescription,
   snoozeWakeLabel,
   type SnoozePreset,
-} from "./Sidebar.snooze";
+} from "@t3tools/client-runtime/thread-snooze";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { ProviderInstanceIcon } from "./chat/ProviderInstanceIcon";
 import { getTriggerDisplayModelLabel } from "./chat/providerIconUtils";

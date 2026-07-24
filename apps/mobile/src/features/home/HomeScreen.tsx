@@ -15,7 +15,7 @@ import type {
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, FlatList, Platform, Pressable, View } from "react-native";
+import { ActivityIndicator, AppState, FlatList, Platform, Pressable, View } from "react-native";
 import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useThemeColor } from "../../lib/useThemeColor";
@@ -26,7 +26,11 @@ import type { WorkspaceState } from "../../state/workspaceModel";
 import type { SavedRemoteConnection } from "../../lib/connection";
 import { scopedProjectKey } from "../../lib/scopedEntities";
 import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
-import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
+import {
+  mobilePreferencesAtom,
+  updateMobilePreferencesAtom,
+  useThreadListV2Enabled,
+} from "../../state/preferences";
 import { environmentServerConfigsAtom } from "../../state/server";
 import type { PendingNewTask } from "../../state/use-pending-new-tasks";
 import {
@@ -35,7 +39,7 @@ import {
   ThreadListRow,
   ThreadListShowMoreRow,
 } from "../threads/thread-list-items";
-import { ThreadListV2Row } from "../threads/thread-list-v2-items";
+import { ThreadListV2Row, ThreadListV2SectionHeader } from "../threads/thread-list-v2-items";
 import {
   buildThreadListV2Items,
   THREAD_LIST_V2_SETTLED_INITIAL_COUNT,
@@ -92,6 +96,8 @@ interface HomeScreenProps {
   /** Resolves true iff the settle was dispatched and succeeded. */
   readonly onSettleThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
   readonly onUnsettleThread: (thread: EnvironmentThreadShell) => void;
+  readonly onSnoozeThread: (thread: EnvironmentThreadShell, until: string) => void;
+  readonly onWakeThread: (thread: EnvironmentThreadShell) => void;
   readonly onSelectPendingTask: (pendingTask: PendingNewTask) => void;
   readonly onDeletePendingTask: (pendingTask: PendingNewTask) => void;
   readonly onNewThreadInProject: (project: EnvironmentProject) => void;
@@ -181,9 +187,7 @@ export function HomeScreen(props: HomeScreenProps) {
     ReadonlyMap<string, HomeGroupDisplayState>
   >(() => new Map());
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
-  const threadListV2Enabled =
-    AsyncResult.isSuccess(preferencesResult) &&
-    preferencesResult.value.threadListV2Enabled === true;
+  const threadListV2Enabled = useThreadListV2Enabled();
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const openSwipeableRef = useRef<SwipeableMethods | null>(null);
   const listRef = useRef<LegendListRef | null>(null);
@@ -420,7 +424,7 @@ export function HomeScreen(props: HomeScreenProps) {
           ),
     [v2ScopedProjectGroup],
   );
-  // Thread List v2 (beta): one flat list in creation order, no grouping.
+  // Thread List v2: one flat list in creation order, no grouping.
   // Settled threads collapse into a recency tail below the card block.
   // Settled threads stay in the live shell stream (settled ≠ archived), so
   // the partition works directly off live shells — no snapshot merging or
@@ -458,6 +462,8 @@ export function HomeScreen(props: HomeScreenProps) {
   const [settledVisibleCount, setSettledVisibleCount] = useState(
     THREAD_LIST_V2_SETTLED_INITIAL_COUNT,
   );
+  const [snoozedExpanded, setSnoozedExpanded] = useState(false);
+  const [settledExpanded, setSettledExpanded] = useState(true);
   const settledResetKey = `${props.selectedEnvironmentId ?? "all"}:${v2ProjectScopeKey ?? "all"}:${props.searchQuery.trim()}`;
   const lastSettledResetKeyRef = useRef(settledResetKey);
   if (lastSettledResetKeyRef.current !== settledResetKey) {
@@ -479,11 +485,20 @@ export function HomeScreen(props: HomeScreenProps) {
   useEffect(() => {
     if (!threadListV2Enabled) return;
     // Refresh immediately on enable: the mount-time value can be hours old
-    // by the time the beta is switched on, which would misclassify the
+    // by the time the list is enabled, which would misclassify the
     // inactivity auto-settle boundary until the first tick.
     setNowMinute(new Date().toISOString().slice(0, 16));
     const id = setInterval(() => setNowMinute(new Date().toISOString().slice(0, 16)), 60_000);
     return () => clearInterval(id);
+  }, [threadListV2Enabled]);
+  useEffect(() => {
+    if (!threadListV2Enabled) return;
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state !== "active") return;
+      setNowMinute(new Date().toISOString().slice(0, 16));
+      bumpSnoozeWakeTick((tick) => tick + 1);
+    });
+    return () => subscription.remove();
   }, [threadListV2Enabled]);
   // Threads on servers without the settlement capability never classify as
   // settled (the user could neither un-settle nor pin them).
@@ -508,7 +523,14 @@ export function HomeScreen(props: HomeScreenProps) {
   }, [serverConfigs]);
   const threadListV2Layout = useMemo(() => {
     if (!threadListV2Enabled)
-      return { items: [], hiddenSettledCount: 0, snoozedCount: 0, nextSnoozeWakeAt: null };
+      return {
+        items: [],
+        activeCount: 0,
+        snoozedCount: 0,
+        settledCount: 0,
+        hiddenSettledCount: 0,
+        nextSnoozeWakeAt: null,
+      };
     // Settled threads are live shells; archived threads keep their original
     // "hidden from lists" meaning.
     return buildThreadListV2Items({
@@ -550,50 +572,73 @@ export function HomeScreen(props: HomeScreenProps) {
     // unchanged: after a clamped fire (wake beyond the 32-bit setTimeout
     // range) the boundary string is identical and the chain would die.
   }, [nextSnoozeWakeAt, snoozeWakeTick]);
-  const threadListV2Items = threadListV2Layout.items;
+  const threadListV2Items = threadListV2Layout.items.filter(
+    (item) =>
+      item.type === "section" ||
+      ((item.lifecycle !== "snoozed" || snoozedExpanded) &&
+        (item.lifecycle !== "settled" || settledExpanded)),
+  );
 
   const renderV2Item = useCallback(
-    ({ item }: { readonly item: ThreadListV2Item }) => (
-      <ThreadListV2Row
-        thread={item.thread}
-        variant={item.variant}
-        showSettledDivider={item.showSettledDivider}
-        project={
-          projectByKey.get(scopedProjectKey(item.thread.environmentId, item.thread.projectId)) ??
-          null
-        }
-        projectTitle={v2ProjectTitleByProjectKey.get(
-          scopedProjectKey(item.thread.environmentId, item.thread.projectId),
-        )}
-        providerDriver={
-          serverConfigs
-            .get(item.thread.environmentId)
-            ?.providers.find(
-              (provider) =>
-                provider.instanceId ===
-                (item.thread.session?.providerInstanceId ?? item.thread.modelSelection.instanceId),
-            )?.driver ?? null
-        }
-        environmentLabel={
-          Object.keys(props.savedConnectionsById).length > 1
-            ? (props.savedConnectionsById[item.thread.environmentId]?.environmentLabel ?? null)
-            : null
-        }
-        onSelectThread={props.onSelectThread}
-        onDeleteThread={handleDeleteThread}
-        onArchiveThread={props.onArchiveThread}
-        settlementSupported={settlementEnvironmentIds.has(item.thread.environmentId)}
-        onSettleThread={handleSettleThread}
-        onUnsettleThread={handleUnsettleThread}
-        onChangeRequestState={handleChangeRequestState}
-        projectCwd={
-          projectCwdByKey.get(scopedProjectKey(item.thread.environmentId, item.thread.projectId)) ??
-          null
-        }
-        onSwipeableClose={handleSwipeableClose}
-        onSwipeableWillOpen={handleSwipeableWillOpen}
-      />
-    ),
+    ({ item }: { readonly item: ThreadListV2Item }) =>
+      item.type === "section" ? (
+        <ThreadListV2SectionHeader
+          lifecycle={item.lifecycle}
+          count={item.count}
+          expanded={item.lifecycle === "snoozed" ? snoozedExpanded : settledExpanded}
+          onToggle={
+            item.lifecycle === "snoozed"
+              ? () => setSnoozedExpanded((expanded) => !expanded)
+              : () => setSettledExpanded((expanded) => !expanded)
+          }
+        />
+      ) : (
+        <ThreadListV2Row
+          thread={item.thread}
+          lifecycle={item.lifecycle}
+          variant={item.variant}
+          showSettledDivider={item.showSettledDivider}
+          project={
+            projectByKey.get(scopedProjectKey(item.thread.environmentId, item.thread.projectId)) ??
+            null
+          }
+          projectTitle={v2ProjectTitleByProjectKey.get(
+            scopedProjectKey(item.thread.environmentId, item.thread.projectId),
+          )}
+          providerDriver={
+            serverConfigs
+              .get(item.thread.environmentId)
+              ?.providers.find(
+                (provider) =>
+                  provider.instanceId ===
+                  (item.thread.session?.providerInstanceId ??
+                    item.thread.modelSelection.instanceId),
+              )?.driver ?? null
+          }
+          environmentLabel={
+            Object.keys(props.savedConnectionsById).length > 1
+              ? (props.savedConnectionsById[item.thread.environmentId]?.environmentLabel ?? null)
+              : null
+          }
+          onSelectThread={props.onSelectThread}
+          onDeleteThread={handleDeleteThread}
+          onArchiveThread={props.onArchiveThread}
+          settlementSupported={settlementEnvironmentIds.has(item.thread.environmentId)}
+          snoozeSupported={snoozeEnvironmentIds.has(item.thread.environmentId)}
+          onSettleThread={handleSettleThread}
+          onUnsettleThread={handleUnsettleThread}
+          onSnoozeThread={props.onSnoozeThread}
+          onWakeThread={props.onWakeThread}
+          onChangeRequestState={handleChangeRequestState}
+          projectCwd={
+            projectCwdByKey.get(
+              scopedProjectKey(item.thread.environmentId, item.thread.projectId),
+            ) ?? null
+          }
+          onSwipeableClose={handleSwipeableClose}
+          onSwipeableWillOpen={handleSwipeableWillOpen}
+        />
+      ),
     [
       handleChangeRequestState,
       handleDeleteThread,
@@ -604,15 +649,23 @@ export function HomeScreen(props: HomeScreenProps) {
       projectByKey,
       projectCwdByKey,
       props.onArchiveThread,
+      props.onSnoozeThread,
       props.onSelectThread,
+      props.onWakeThread,
       props.savedConnectionsById,
       serverConfigs,
       settlementEnvironmentIds,
+      snoozeEnvironmentIds,
+      snoozedExpanded,
+      settledExpanded,
       v2ProjectTitleByProjectKey,
     ],
   );
   const v2KeyExtractor = useCallback(
-    (item: ThreadListV2Item) => `${item.thread.environmentId}:${item.thread.id}`,
+    (item: ThreadListV2Item) =>
+      item.type === "section"
+        ? `section:${item.lifecycle}`
+        : `${item.thread.environmentId}:${item.thread.id}`,
     [],
   );
 
@@ -894,7 +947,7 @@ export function HomeScreen(props: HomeScreenProps) {
             }}
             ListHeaderComponent={v2ListHeader}
             ListFooterComponent={
-              threadListV2Layout.hiddenSettledCount > 0 ? (
+              settledExpanded && threadListV2Layout.hiddenSettledCount > 0 ? (
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={`Show ${Math.min(threadListV2Layout.hiddenSettledCount, THREAD_LIST_V2_SETTLED_PAGE_COUNT)} more settled threads`}

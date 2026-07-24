@@ -46,6 +46,9 @@ import {
 } from "../terminal/terminalLaunchContext";
 import { terminalDebugLog } from "../terminal/terminalDebugLog";
 import { ThreadDetailScreen } from "./ThreadDetailScreen";
+import { ThreadLifecycleNotice } from "./ThreadLifecycleNotice";
+import { effectiveSettled, effectiveSnoozed } from "@t3tools/client-runtime/state/thread-settled";
+import { useThreadListActions } from "../home/useThreadListActions";
 import {
   ThreadGitControls,
   useThreadGitCenterHeaderItems,
@@ -195,6 +198,7 @@ function ThreadRouteContent(
   const gitState = useSelectedThreadGitState();
   const gitActions = useSelectedThreadGitActions();
   const requests = useSelectedThreadRequests();
+  const { unsettleThread, wakeThread } = useThreadListActions();
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, "thread interrupt");
   const navigation = useNavigation();
   const params = props.route.params;
@@ -741,6 +745,23 @@ function ThreadRouteContent(
     connectionState: routeConnectionState,
   });
   const serverConfig = routeEnvironmentRuntime?.serverConfig ?? null;
+  const supportsSnooze = serverConfig?.environment.capabilities.threadSnooze === true;
+  const supportsSettlement = serverConfig?.environment.capabilities.threadSettlement === true;
+  const lifecycleNow = new Date().toISOString();
+  const selectedThreadWorking =
+    selectedThread.session?.status === "starting" || selectedThread.session?.status === "running";
+  const parkedState =
+    supportsSnooze &&
+    !selectedThreadWorking &&
+    effectiveSnoozed(selectedThread, { now: lifecycleNow })
+      ? "snoozed"
+      : supportsSettlement &&
+          effectiveSettled(selectedThread, {
+            now: lifecycleNow,
+            autoSettleAfterDays: 3,
+          })
+        ? "settled"
+        : null;
   const renderThreadRouteBody = (showActionControls: boolean) => (
     <>
       <ThreadGitControls {...threadGitControlProps} showActionControls={showActionControls} />
@@ -748,6 +769,18 @@ function ThreadRouteContent(
       <GitActionProgressOverlay progress={gitActionProgress} onDismiss={dismissGitActionResult} />
 
       <View className="flex-1 bg-screen">
+        {parkedState !== null ? (
+          <ThreadLifecycleNotice
+            state={parkedState}
+            onRestore={() => {
+              if (parkedState === "snoozed") {
+                void wakeThread(selectedThread);
+              } else {
+                void unsettleThread(selectedThread);
+              }
+            }}
+          />
+        ) : null}
         <ThreadDetailScreen
           selectedThread={selectedThreadWithDraftSettings ?? selectedThread}
           contentPresentation={contentPresentation}

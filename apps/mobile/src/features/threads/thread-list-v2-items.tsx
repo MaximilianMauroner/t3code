@@ -3,6 +3,7 @@ import type {
   EnvironmentThreadShell,
 } from "@t3tools/client-runtime/state/shell";
 import type { MenuAction } from "@react-native-menu/menu";
+import { resolveSnoozePresets, snoozeWakeLabel } from "@t3tools/client-runtime/thread-snooze";
 import { memo, useCallback, useEffect, useMemo, type ComponentProps } from "react";
 import { Platform, Pressable, useWindowDimensions, View } from "react-native";
 import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
@@ -85,8 +86,36 @@ export const ThreadListV2SettledDivider = memo(function ThreadListV2SettledDivid
   );
 });
 
+export const ThreadListV2SectionHeader = memo(function ThreadListV2SectionHeader(props: {
+  readonly lifecycle: "snoozed" | "settled";
+  readonly count: number;
+  readonly expanded: boolean;
+  readonly pane?: "screen" | "sidebar";
+  readonly onToggle: () => void;
+}) {
+  const title = props.lifecycle === "snoozed" ? "Snoozed" : "Settled";
+  return (
+    <Pressable
+      accessibilityLabel={`${title}, ${props.count} ${props.count === 1 ? "thread" : "threads"}`}
+      accessibilityRole="button"
+      accessibilityState={{ expanded: props.expanded }}
+      onPress={props.onToggle}
+      className={cn(
+        "mt-3 min-h-11 flex-row items-center gap-2",
+        props.pane === "sidebar" ? "px-3" : "px-5",
+      )}
+    >
+      <Text className="flex-1 text-xs font-t3-medium text-foreground-tertiary">
+        {title} · {props.count}
+      </Text>
+      <Text className="text-xs text-foreground-tertiary">{props.expanded ? "⌃" : "⌄"}</Text>
+    </Pressable>
+  );
+});
+
 export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly thread: EnvironmentThreadShell;
+  readonly lifecycle: "active" | "snoozed" | "settled";
   readonly variant: "card" | "slim";
   readonly showSettledDivider: boolean;
   readonly project: EnvironmentProject | null;
@@ -112,10 +141,13 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly onDeleteThread: (thread: EnvironmentThreadShell) => void;
   readonly onSettleThread: (thread: EnvironmentThreadShell) => void;
   readonly onUnsettleThread: (thread: EnvironmentThreadShell) => void;
+  readonly onSnoozeThread: (thread: EnvironmentThreadShell, until: string) => void;
+  readonly onWakeThread: (thread: EnvironmentThreadShell) => void;
   readonly onArchiveThread: (thread: EnvironmentThreadShell) => void;
   /** False on environments whose server predates thread.settle/unsettle:
       swipe + menu fall back to Archive instead of failing on use. */
   readonly settlementSupported: boolean;
+  readonly snoozeSupported: boolean;
   readonly onSwipeableWillOpen: (methods: SwipeableMethods) => void;
   readonly onSwipeableClose: (methods: SwipeableMethods) => void;
   /** Reports this row's live PR state up so the partition can auto-settle
@@ -137,6 +169,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     onDeleteThread,
     onSettleThread,
     onUnsettleThread,
+    onSnoozeThread,
+    onWakeThread,
     onArchiveThread,
     onChangeRequestState,
   } = props;
@@ -163,24 +197,36 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   const handleSettle = useCallback(() => onSettleThread(thread), [onSettleThread, thread]);
   const handleUnsettle = useCallback(() => onUnsettleThread(thread), [onUnsettleThread, thread]);
   const handleArchive = useCallback(() => onArchiveThread(thread), [onArchiveThread, thread]);
+  const handleWake = useCallback(() => onWakeThread(thread), [onWakeThread, thread]);
   const handleMenuAction = useCallback(
     ({ nativeEvent }: { readonly nativeEvent: { readonly event: string } }) => {
       if (nativeEvent.event === "settle") handleSettle();
       if (nativeEvent.event === "unsettle") handleUnsettle();
       if (nativeEvent.event === "archive") handleArchive();
       if (nativeEvent.event === "delete") handleDelete();
+      if (nativeEvent.event === "wake") handleWake();
+      if (nativeEvent.event.startsWith("snooze:")) {
+        onSnoozeThread(thread, nativeEvent.event.slice("snooze:".length));
+      }
     },
-    [handleArchive, handleDelete, handleSettle, handleUnsettle],
+    [handleArchive, handleDelete, handleSettle, handleUnsettle, handleWake, onSnoozeThread, thread],
   );
 
   // Swipe: the v2 primary action is the lifecycle transition. Every settled
   // row can un-settle — explicit settles clear the override, auto-settled
   // rows get pinned active until real activity clears the pin.
-  const canUnsettle = variant === "slim";
+  const canUnsettle = props.lifecycle === "settled";
+  const canWake = props.lifecycle === "snoozed";
   const primaryAction = useMemo(() => {
-    // Pre-settlement server: archive is the swipe action, as in v1. (Slim
-    // rows cannot occur here — unsupported environments never classify as
-    // settled.)
+    if (canWake && props.snoozeSupported) {
+      return {
+        accessibilityLabel: `Wake ${thread.title}`,
+        icon: "sun.max" as const,
+        label: "Wake",
+        onPress: handleWake,
+      };
+    }
+    // Pre-settlement server: archive remains the active-row swipe action.
     if (!props.settlementSupported) {
       return {
         accessibilityLabel: `Archive ${thread.title}`,
@@ -204,12 +250,42 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         };
   }, [
     canUnsettle,
+    canWake,
     handleArchive,
     handleSettle,
     handleUnsettle,
+    handleWake,
     props.settlementSupported,
+    props.snoozeSupported,
     thread.title,
   ]);
+  const lifecycleMenuActions = useMemo<MenuAction[]>(() => {
+    if (canWake && props.snoozeSupported) {
+      return [
+        { id: "wake", title: "Wake", image: "sun.max" },
+        { id: "delete", title: "Delete", image: "trash", attributes: { destructive: true } },
+      ];
+    }
+    if (canUnsettle && props.settlementSupported) return SLIM_MENU_ACTIONS;
+    const snoozeAction: MenuAction[] = props.snoozeSupported
+      ? [
+          {
+            id: "snooze",
+            title: "Snooze",
+            image: "moon.zzz",
+            subactions: resolveSnoozePresets(new Date()).map((preset) => ({
+              id: `snooze:${preset.snoozedUntil}`,
+              title: preset.label,
+              subtitle: preset.whenLabel,
+            })),
+          },
+        ]
+      : [];
+    return [
+      ...snoozeAction,
+      ...(props.settlementSupported ? CARD_MENU_ACTIONS : LEGACY_MENU_ACTIONS),
+    ];
+  }, [canUnsettle, canWake, props.settlementSupported, props.snoozeSupported]);
 
   // The sidebar pane fills selected rows with the accent color (matching the
   // v1 sidebar), so every piece of row text needs a white-on-accent variant.
@@ -415,7 +491,9 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
             )}
             style={{ fontFamily: MONO_FONT }}
           >
-            {relativeTime(thread.latestUserMessageAt ?? thread.updatedAt ?? thread.createdAt)}
+            {props.lifecycle === "snoozed" && thread.snoozedUntil != null
+              ? snoozeWakeLabel(thread.snoozedUntil, new Date())
+              : relativeTime(thread.latestUserMessageAt ?? thread.updatedAt ?? thread.createdAt)}
           </Text>
         </View>
       </Pressable>
@@ -423,7 +501,6 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
 
   return (
     <>
-      {props.showSettledDivider ? <ThreadListV2SettledDivider pane={props.pane} /> : null}
       <ThreadSwipeable
         backgroundColor={sidebarPane ? drawerColor : screenColor}
         compactActions={variant === "slim"}
@@ -445,13 +522,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
       >
         {(close) => (
           <ControlPillMenu
-            actions={
-              !props.settlementSupported
-                ? LEGACY_MENU_ACTIONS
-                : canUnsettle
-                  ? SLIM_MENU_ACTIONS
-                  : CARD_MENU_ACTIONS
-            }
+            actions={lifecycleMenuActions}
             onPressAction={handleMenuAction}
             shouldOpenOnLongPress
           >
