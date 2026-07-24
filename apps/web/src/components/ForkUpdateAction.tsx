@@ -65,7 +65,7 @@ export function presentForkUpdateStatus(
   queryError: string | null,
 ): ForkUpdateStatusPresentation {
   return {
-    source: `${descriptor.branch} · ${shortCommit(status?.currentCommit ?? descriptor.currentCommit)}`,
+    source: `${descriptor.branch} · ${shortCommit(descriptor.currentCommit)}`,
     stage: status === null ? null : stageLabel(status.stage),
     message: status?.message ?? null,
     detail: status?.error ?? queryError,
