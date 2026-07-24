@@ -90,7 +90,7 @@ export const decodeThreadSnapshotCache = Effect.fn("web.connectionStorage.decode
           ? Option.some(stored.snapshot)
           : Option.none(),
       ),
-      Effect.catch(() => Effect.succeed(Option.none())),
+      Effect.orElseSucceed(() => Option.none()),
     ),
 );
 
@@ -563,11 +563,7 @@ export const connectionStorageLayer = Layer.effectContext(
             }
             return decodeThreadSnapshotCache(raw, environmentId, threadId);
           }),
-          Effect.mapError((cause) =>
-            cause._tag === "ConnectionPersistenceError"
-              ? cause
-              : persistenceError("load-thread", cause),
-          ),
+          Effect.mapError((cause) => persistenceError("load-thread", cause)),
         ),
       saveThread: (environmentId, snapshot) =>
         Effect.gen(function* () {
