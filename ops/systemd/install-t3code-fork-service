@@ -10,8 +10,10 @@ releases_dir="${state_dir}/fork-releases"
 current_link="${state_dir}/fork-current"
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 lock_helper="${script_dir}/t3code-fork-lock"
-node_path="${T3CODE_NODE_PATH:-/home/codex/.local/share/pnpm/bin/node}"
-pnpm_path="${T3CODE_PNPM_PATH:-/home/codex/.local/bin/pnpm}"
+node_path="/home/codex/.local/share/pnpm/bin/node"
+node_dir="/home/codex/.local/share/pnpm/bin"
+corepack_path="/usr/bin/corepack"
+expected_pnpm_version="11.10.0"
 dropin_dir="/etc/systemd/system/t3code.service.d"
 dropin_path="${dropin_dir}/zz-fork-update.conf"
 old_dropin_path="${dropin_dir}/fork-update.conf"
@@ -22,13 +24,46 @@ health_timer="/etc/systemd/system/t3code-fork-healthcheck.timer"
 health_url="${T3CODE_HEALTH_URL:-http://127.0.0.1:41731/.well-known/t3/environment}"
 
 [ -x "$node_path" ] || { printf '%s\n' "Configured Node executable is unavailable." >&2; exit 1; }
-[ -x "$pnpm_path" ] || { printf '%s\n' "Configured pnpm executable is unavailable." >&2; exit 1; }
+[ -x "$corepack_path" ] || { printf '%s\n' "Fixed Corepack executable is unavailable." >&2; exit 1; }
 [ -x "$lock_helper" ] || { printf '%s\n' "Update lock helper is unavailable." >&2; exit 1; }
 command -v flock >/dev/null 2>&1 || { printf '%s\n' "flock is unavailable." >&2; exit 1; }
 
-run_as_user() { runuser -u "$run_user" -- env "PATH=$(dirname "$node_path"):$(dirname "$pnpm_path"):/usr/bin:/bin" "$@"; }
-install -d -o "$run_user" -g "$run_user" "$state_dir"
-lock_token="$(cat /proc/sys/kernel/random/uuid)"
+passwd_entry="$(/usr/bin/getent passwd "$run_user")"
+[ -n "$passwd_entry" ] || { printf '%s\n' "Configured run user does not exist." >&2; exit 1; }
+[ "$(printf '%s\n' "$passwd_entry" | /usr/bin/wc -l)" -eq 1 ] ||
+  { printf '%s\n' "Configured run user lookup was ambiguous." >&2; exit 1; }
+[ "$(printf '%s\n' "$passwd_entry" | /usr/bin/cut -d: -f1)" = "$run_user" ] ||
+  { printf '%s\n' "Configured run user lookup did not match." >&2; exit 1; }
+run_home="$(printf '%s\n' "$passwd_entry" | /usr/bin/cut -d: -f6)"
+case "$run_home" in /*) ;; *) printf '%s\n' "Configured run user home is invalid." >&2; exit 1 ;; esac
+[ -d "$run_home" ] && [ ! -L "$run_home" ] ||
+  { printf '%s\n' "Configured run user home is unavailable." >&2; exit 1; }
+[ "$(/usr/bin/stat -c '%U' "$run_home")" = "$run_user" ] ||
+  { printf '%s\n' "Configured run user does not own its home." >&2; exit 1; }
+corepack_home="${run_home}/.cache/node/corepack"
+[ -d "$corepack_home" ] && [ ! -L "$corepack_home" ] ||
+  { printf '%s\n' "Pinned Corepack cache is unavailable." >&2; exit 1; }
+[ "$(/usr/bin/stat -c '%U' "$corepack_home")" = "$run_user" ] ||
+  { printf '%s\n' "Configured run user does not own its Corepack cache." >&2; exit 1; }
+cached_pnpm_dir="${corepack_home}/v1/pnpm/${expected_pnpm_version}"
+[ -d "$cached_pnpm_dir" ] && [ ! -L "$cached_pnpm_dir" ] ||
+  { printf '%s\n' "Pinned pnpm is not cached for offline use." >&2; exit 1; }
+[ "$(/usr/bin/stat -c '%U' "$cached_pnpm_dir")" = "$run_user" ] ||
+  { printf '%s\n' "Configured run user does not own cached pnpm." >&2; exit 1; }
+
+run_as_user() {
+  /usr/sbin/runuser -u "$run_user" -- /usr/bin/env \
+    "HOME=$run_home" \
+    "COREPACK_HOME=$corepack_home" \
+    "COREPACK_ENABLE_NETWORK=0" \
+    "COREPACK_ENABLE_PROJECT_SPEC=0" \
+    "COREPACK_ENV_FILE=0" \
+    "PATH=$node_dir:/usr/bin:/bin" \
+    "$@"
+}
+run_pnpm() {
+  run_as_user "$corepack_path" "pnpm@${expected_pnpm_version}" "$@"
+}
 lock_acquired=false
 release_update_lock() {
   [ "$lock_acquired" = true ] || return
@@ -51,14 +86,16 @@ early_signal_handler() {
 }
 trap early_exit_handler EXIT
 trap early_signal_handler HUP INT TERM
+
+pnpm_version="$(run_pnpm --version)"
+[ "$pnpm_version" = "$expected_pnpm_version" ] ||
+  { printf '%s\n' "Pinned pnpm version check failed." >&2; exit 1; }
+
+install -d -o "$run_user" -g "$run_user" "$state_dir"
+lock_token="$(/usr/bin/cat /proc/sys/kernel/random/uuid)"
 "$lock_helper" acquire "$state_dir" "$$" "$lock_token"
 lock_acquired=true
 
-pnpm_version="$(run_as_user "$pnpm_path" --version)"
-case "$pnpm_version" in
-  [0-9]*.[0-9]*.[0-9]*) ;;
-  *) printf '%s\n' "Configured pnpm executable did not return a version." >&2; exit 1 ;;
-esac
 remote_matches() {
   case "$1" in
     "https://github.com/$2"|"https://github.com/$2.git"|"git@github.com:$2"|"git@github.com:$2.git"|"ssh://git@github.com/$2"|"ssh://git@github.com/$2.git") return 0 ;;
@@ -86,22 +123,22 @@ if [ ! -f "$sentinel" ] || [ "$(cat "$sentinel")" != "$commit" ] || [ ! -f "$ent
   pack_dir="${releases_dir}/.pack-${commit}"
   rm -rf "$staged_release" "$pack_dir"
   install -d -o "$run_user" -g "$run_user" "$staged_release" "$pack_dir"
-  run_as_user "$pnpm_path" -C "$repo" install --frozen-lockfile
-  run_as_user "$pnpm_path" -C "$repo" exec vp test run packages/contracts/src/server.test.ts \
+  run_pnpm -C "$repo" install --frozen-lockfile
+  run_pnpm -C "$repo" exec vp test run packages/contracts/src/server.test.ts \
     apps/server/src/cloud/forkUpdate.test.ts apps/server/src/cloud/forkHealthcheck.test.ts \
     apps/server/src/cloud/forkInstaller.test.ts \
     apps/server/src/orchestration/UpdateMaintenanceGate.test.ts \
     apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts \
     apps/web/src/components/ForkUpdateAction.test.tsx \
     apps/web/src/components/settings/ConnectionsSettings.logic.test.ts
-  run_as_user "$pnpm_path" -C "$repo" exec vp run --filter @t3tools/contracts --filter @t3tools/web --filter t3 typecheck
-  run_as_user "$pnpm_path" -C "$repo" exec vp run --filter @t3tools/web build
-  run_as_user "$pnpm_path" -C "$repo" exec vp run --filter t3 build
-  run_as_user "$pnpm_path" -C "$repo" --filter t3 pack --pack-destination "$pack_dir"
+  run_pnpm -C "$repo" exec vp run --filter @t3tools/contracts --filter @t3tools/web --filter t3 typecheck
+  run_pnpm -C "$repo" exec vp run --filter @t3tools/web build
+  run_pnpm -C "$repo" exec vp run --filter t3 build
+  run_pnpm -C "$repo" --filter t3 pack --pack-destination "$pack_dir"
   tarball="$(find "$pack_dir" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
   [ -n "$tarball" ] || { printf '%s\n' "Package missing." >&2; exit 1; }
   run_as_user sh -c 'printf "%s\n" "{ \"private\": true }" >"$1/package.json"' bootstrap "$staged_release"
-  run_as_user "$pnpm_path" --ignore-workspace --dir "$staged_release" add --prod "$tarball"
+  run_pnpm --ignore-workspace --dir "$staged_release" add --prod "$tarball"
   run_as_user "$node_path" "$staged_release/node_modules/t3/dist/bin.mjs" --version >/dev/null
   run_as_user sh -c 'printf "%s\n" "$1" >"$2"' bootstrap "$commit" "$staged_release/.t3-fork-release-complete"
   rm -rf "$release_dir"
