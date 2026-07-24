@@ -10,7 +10,7 @@ run_user="${T3CODE_RUN_USER:-codex}"
 verification_file="${state_dir}/fork-update-verification.json"
 healthy_since_file="${state_dir}/fork-update-healthy-since"
 status_file="${state_dir}/fork-update.json"
-lock_path="${state_dir}/fork-update.lock"
+lock_helper="${T3CODE_LOCK_HELPER:-/usr/local/sbin/t3code-fork-lock}"
 failure_file="${T3CODE_FAILURE_FILE:-/run/t3code-healthcheck.failures}"
 
 atomic_user_write() {
@@ -49,8 +49,8 @@ write_status() {
 }
 
 clear_update_guard() {
+  "$lock_helper" release "$state_dir" "$lock_owner_pid" "$lock_owner_token"
   rm -f "$verification_file" "$healthy_since_file" "$failure_file"
-  rm -rf "$lock_path"
 }
 
 prune_releases() {
@@ -100,6 +100,8 @@ if [ -f "$verification_file" ]; then
   target_commit="$(sed -n 's/.*"targetCommit":[[:space:]]*"\([^"]*\)".*/\1/p' "$verification_file" | head -n 1)"
   previous_target="$(sed -n 's/.*"previousTarget":[[:space:]]*"\([^"]*\)".*/\1/p' "$verification_file" | head -n 1)"
   startup_deadline="$(sed -n 's/.*"startupDeadlineEpochSeconds":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$verification_file" | head -n 1)"
+  lock_owner_pid="$(sed -n 's/.*"lockOwnerPid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$verification_file" | head -n 1)"
+  lock_owner_token="$(sed -n 's/.*"lockOwnerToken":[[:space:]]*"\([^"]*\)".*/\1/p' "$verification_file" | head -n 1)"
   now_epoch="$(date +%s)"
   healthy=false
   health_body=""

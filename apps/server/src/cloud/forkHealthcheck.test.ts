@@ -41,9 +41,17 @@ describe("t3code-fork-healthcheck", () => {
         previousTarget: oldRelease,
         targetCommit: "newcommit",
         startupDeadlineEpochSeconds: 220,
+        lockOwnerPid: process.pid,
+        lockOwnerToken: "123e4567-e89b-42d3-a456-426614174000",
       }),
     );
-    NodeFS.mkdirSync(NodePath.join(stateDir, "fork-update.lock"));
+    const lockPath = NodePath.join(stateDir, "fork-update.lock");
+    NodeFS.mkdirSync(lockPath);
+    NodeFS.writeFileSync(NodePath.join(lockPath, "pid"), `${String(process.pid)}\n`);
+    NodeFS.writeFileSync(
+      NodePath.join(lockPath, "token"),
+      "123e4567-e89b-42d3-a456-426614174000\n",
+    );
     NodeFS.writeFileSync(healthState, "healthy\n");
     NodeFS.writeFileSync(timeState, "100\n");
     executable(
@@ -83,6 +91,10 @@ printf '%s\\n' "$*" >>"$MOCK_SYSTEMCTL_LOG"
       T3CODE_CURRENT_LINK: currentLink,
       T3CODE_RELEASES_DIR: releasesDir,
       T3CODE_FAILURE_FILE: failureFile,
+      T3CODE_LOCK_HELPER: NodePath.resolve(
+        import.meta.dirname,
+        "../../../../ops/systemd/t3code-fork-lock",
+      ),
       T3CODE_RUN_USER: process.env.USER ?? "codex",
     };
 

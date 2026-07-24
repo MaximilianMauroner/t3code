@@ -247,6 +247,9 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       assert.equal(accepted.status.stage, "checking");
       const result = yield* awaitStatus(context.service, new Set(["restarting", "failed"]));
       assert.equal(result.stage, "restarting");
+      for (let attempt = 0; attempt < 1_000 && context.restartCount() === 0; attempt += 1) {
+        yield* Effect.yieldNow;
+      }
       assert.equal(context.restartCount(), 1);
       const pushIndex = commands.findIndex((command) =>
         command.includes("git push origin HEAD:refs/heads/main"),

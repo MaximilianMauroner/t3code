@@ -45,6 +45,8 @@ const ForkUpdateVerification = Schema.Struct({
   previousTarget: Schema.NullOr(Schema.String),
   targetCommit: Schema.String,
   startupDeadlineEpochSeconds: Schema.Number,
+  lockOwnerPid: Schema.Int,
+  lockOwnerToken: Schema.String,
 });
 const encodeVerification = Schema.encodeSync(Schema.fromJsonString(ForkUpdateVerification));
 const isForkUpdateError = Schema.is(ServerForkUpdateError);
@@ -304,7 +306,7 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
     if (alreadyRunning) {
       return yield* statusError("A fork update is already in progress.");
     }
-    yield* acquireLock.pipe(Effect.onError(() => Ref.set(inFlight, false)));
+    const lockOwner = yield* acquireLock.pipe(Effect.onError(() => Ref.set(inFlight, false)));
 
     const startedAt = yield* nowIso;
     let status: ServerForkUpdateStatus = {
@@ -475,6 +477,8 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
           "apps/server/src/cloud/forkUpdate.test.ts",
           "apps/server/src/cloud/forkHealthcheck.test.ts",
           "apps/server/src/cloud/forkInstaller.test.ts",
+          "apps/server/src/orchestration/UpdateMaintenanceGate.test.ts",
+          "apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts",
           "apps/web/src/components/ForkUpdateAction.test.tsx",
           "apps/web/src/components/settings/ConnectionsSettings.logic.test.ts",
         ],
@@ -630,6 +634,8 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
           previousTarget,
           targetCommit,
           startupDeadlineEpochSeconds: Math.floor(currentTimeMillis / 1_000) + 120,
+          lockOwnerPid: lockOwner.pid,
+          lockOwnerToken: lockOwner.token,
         })}\n`,
       }).pipe(
         Effect.provideService(FileSystem.FileSystem, fs),

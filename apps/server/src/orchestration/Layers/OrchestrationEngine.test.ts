@@ -10,7 +10,9 @@ import {
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Metric from "effect/Metric";
@@ -47,7 +49,10 @@ const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
 const asCheckpointRef = (value: string): CheckpointRef => CheckpointRef.make(value);
 
-async function createOrchestrationSystem(gateService: UpdateMaintenanceGateService | null = null) {
+async function createOrchestrationSystem(
+  gateService: UpdateMaintenanceGateService | null = null,
+  projectionPipelineService: OrchestrationProjectionPipelineShape | null = null,
+) {
   const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-orchestration-engine-test-",
   });
@@ -55,11 +60,15 @@ async function createOrchestrationSystem(gateService: UpdateMaintenanceGateServi
     gateService === null
       ? UpdateMaintenanceGate.layer
       : Layer.succeed(UpdateMaintenanceGate.UpdateMaintenanceGate, gateService);
+  const projectionPipelineLayer =
+    projectionPipelineService === null
+      ? OrchestrationProjectionPipelineLive
+      : Layer.succeed(OrchestrationProjectionPipeline, projectionPipelineService);
   const orchestrationLayer = Layer.mergeAll(
     maintenanceGateLayer,
     OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
-      Layer.provide(OrchestrationProjectionPipelineLive),
+      Layer.provide(projectionPipelineLayer),
       Layer.provide(maintenanceGateLayer),
     ),
     OrchestrationProjectionSnapshotQueryLive,
@@ -127,12 +136,102 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("holds update acquisition until a winning turn is durably projected", async () => {
+    const projectionEntered = Deferred.makeUnsafe<void>();
+    const allowProjection = Deferred.makeUnsafe<void>();
+    let projected = false;
+    const pipeline: OrchestrationProjectionPipelineShape = {
+      bootstrap: Effect.void,
+      projectEvent: (event) =>
+        event.type === "thread.turn-start-requested"
+          ? Deferred.succeed(projectionEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(allowProjection)),
+              Effect.andThen(
+                Effect.sync(() => {
+                  projected = true;
+                }),
+              ),
+            )
+          : Effect.void,
+    };
+    const system = await createOrchestrationSystem(null, pipeline);
+    const projectId = asProjectId("project-maintenance-turn-wins");
+    const threadId = ThreadId.make("thread-maintenance-turn-wins");
+    await system.run(
+      system.engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("cmd-maintenance-project-create"),
+        projectId,
+        title: "Maintenance race",
+        workspaceRoot: "/tmp/project-maintenance-turn-wins",
+        defaultModelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-maintenance-thread-create"),
+        threadId,
+        projectId,
+        title: "Maintenance race",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+
+    await system.run(
+      Effect.gen(function* () {
+        const turnFiber = yield* system.engine
+          .dispatch({
+            type: "thread.turn.start",
+            commandId: CommandId.make("cmd-maintenance-turn-wins"),
+            threadId,
+            message: {
+              messageId: asMessageId("msg-maintenance-turn-wins"),
+              role: "user",
+              text: "hello",
+              attachments: [],
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            createdAt: now(),
+          })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(projectionEntered);
+        const updateFiber = yield* system.maintenanceGate.acquire.pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        expect(updateFiber.pollUnsafe()).toBeUndefined();
+        yield* Deferred.succeed(allowProjection, undefined);
+        yield* Fiber.join(turnFiber);
+        expect(projected).toBe(true);
+        yield* Fiber.join(updateFiber);
+        yield* system.maintenanceGate.release;
+      }),
+    );
+    await system.dispose();
+  });
+
   it("rejects a queued turn when maintenance begins after the early dispatch check", async () => {
     let turnChecks = 0;
     let held = false;
     const gateService: UpdateMaintenanceGateService = {
       acquire: Effect.sync(() => {
         held = true;
+        return {
+          pid: process.pid,
+          token: "00000000-0000-4000-8000-000000000000",
+        };
       }),
       release: Effect.sync(() => {
         held = false;
@@ -140,11 +239,13 @@ describe("OrchestrationEngine", () => {
       isHeld: Effect.sync(() => held),
       ensureDispatchAllowed: (command) =>
         Effect.suspend(() => {
-          if (command.type !== "thread.turn.start") return Effect.void;
+          if (command.type !== "thread.turn.start") {
+            return Effect.succeed({ generation: 0 });
+          }
           turnChecks += 1;
           if (turnChecks === 1) {
             held = true;
-            return Effect.void;
+            return Effect.succeed({ generation: 0 });
           }
           return held
             ? Effect.fail(
@@ -153,8 +254,10 @@ describe("OrchestrationEngine", () => {
                   detail: "A server update is in progress; new turns are temporarily paused.",
                 }),
               )
-            : Effect.void;
+            : Effect.succeed({ generation: 0 });
         }),
+      withDispatchAllowed: (command, _acceptance, effect) =>
+        gateService.ensureDispatchAllowed(command).pipe(Effect.andThen(effect)),
     };
     const system = await createOrchestrationSystem(gateService);
     await expect(

@@ -1,0 +1,100 @@
+#!/bin/sh
+set -eu
+
+operation="${1:-}"
+state_dir="${2:-}"
+owner_pid="${3:-}"
+owner_token="${4:-}"
+requested_pid="$owner_pid"
+requested_token="$owner_token"
+lock_path="${state_dir}/fork-update.lock"
+verification_path="${state_dir}/fork-update-verification.json"
+guard_path="${state_dir}/fork-update.lock.guard"
+pid_path="${lock_path}/pid"
+token_path="${lock_path}/token"
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+valid_pid() {
+  case "$1" in ''|0|*[!0-9]*) return 1 ;; *) return 0 ;; esac
+}
+
+valid_token() {
+  printf '%s\n' "$1" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
+}
+
+read_exact_owner() {
+  [ -d "$lock_path" ] && [ ! -L "$lock_path" ] || return 1
+  [ -f "$pid_path" ] && [ ! -L "$pid_path" ] || return 1
+  [ -f "$token_path" ] && [ ! -L "$token_path" ] || return 1
+  entry_count="$(find "$lock_path" -mindepth 1 -maxdepth 1 -printf '.' | wc -c)"
+  [ "$entry_count" -eq 2 ] || return 1
+  stored_pid="$(sed -n '1p' "$pid_path")"
+  stored_token="$(sed -n '1p' "$token_path")"
+  [ "$(wc -l <"$pid_path")" -eq 1 ] || return 1
+  [ "$(wc -l <"$token_path")" -eq 1 ] || return 1
+  valid_pid "$stored_pid" || return 1
+  valid_token "$stored_token" || return 1
+}
+
+release_exact_owner() {
+  read_exact_owner || return 1
+  [ "$stored_pid" = "$owner_pid" ] && [ "$stored_token" = "$owner_token" ] || return 1
+  unlink "$pid_path" || return 1
+  unlink "$token_path" || return 1
+  rmdir "$lock_path"
+}
+
+acquire() {
+  valid_pid "$owner_pid" || fail "Invalid update lock PID."
+  valid_token "$owner_token" || fail "Invalid update lock token."
+  [ ! -e "$verification_path" ] && [ ! -L "$verification_path" ] ||
+    fail "The deployed release is still being verified."
+
+  exec 9>"$guard_path"
+  flock -x 9
+  [ ! -e "$verification_path" ] && [ ! -L "$verification_path" ] ||
+    fail "The deployed release is still being verified."
+
+  if ! mkdir -m 0700 "$lock_path" 2>/dev/null; then
+    read_exact_owner || fail "The update lock is malformed or has uncertain ownership."
+    if kill -0 "$stored_pid" 2>/dev/null || [ -d "/proc/$stored_pid" ]; then
+      fail "Another fork update is already in progress."
+    fi
+    [ ! -e "$verification_path" ] && [ ! -L "$verification_path" ] ||
+      fail "The deployed release is still being verified."
+    dead_pid="$stored_pid"
+    dead_token="$stored_token"
+    owner_pid="$dead_pid"
+    owner_token="$dead_token"
+    release_exact_owner || fail "Could not recover the stale update lock safely."
+    owner_pid="$requested_pid"
+    owner_token="$requested_token"
+    mkdir -m 0700 "$lock_path" 2>/dev/null ||
+      fail "Another fork update acquired the lock."
+  fi
+
+  umask 077
+  if ! printf '%s\n' "$owner_token" >"$token_path" ||
+    ! printf '%s\n' "$owner_pid" >"$pid_path"; then
+    [ -f "$pid_path" ] && [ ! -L "$pid_path" ] && unlink "$pid_path" || true
+    [ -f "$token_path" ] && [ ! -L "$token_path" ] && unlink "$token_path" || true
+    rmdir "$lock_path" 2>/dev/null || true
+    fail "Could not write update lock ownership."
+  fi
+}
+
+release() {
+  valid_pid "$owner_pid" || fail "Invalid update lock PID."
+  valid_token "$owner_token" || fail "Invalid update lock token."
+  release_exact_owner || fail "Update lock ownership changed; refusing to release it."
+}
+
+case "$operation" in
+  acquire) acquire ;;
+  release) release ;;
+  *) fail "Usage: t3code-fork-lock acquire|release STATE_DIR PID TOKEN" ;;
+esac
