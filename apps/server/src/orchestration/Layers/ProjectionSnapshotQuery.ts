@@ -1022,48 +1022,18 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           tone,
           kind,
           summary,
-          -- Required interaction fields use generous UI-safe ceilings: at most
-          -- 32 questions/options, 256 plan steps, and 8 KiB primary prompt text.
+          -- User-input payloads contain protocol identifiers and option values
+          -- that must round-trip exactly. Other oversized state is projected to
+          -- bounded UI-safe fields.
           CASE
-            WHEN length(CAST(payload_json AS BLOB)) <= 65536
+            WHEN
+              length(CAST(payload_json AS BLOB)) <= 65536
+              OR kind IN (
+                'user-input.requested',
+                'user-input.resolved',
+                'provider.user-input.respond.failed'
+              )
             THEN payload_json
-            WHEN kind = 'user-input.requested'
-            THEN json_object(
-              'requestId', json_extract(payload_json, '$.requestId'),
-              'status', json_extract(payload_json, '$.status'),
-              'questions', json(COALESCE((
-                SELECT json_group_array(json_object(
-                  'id', substr(json_extract(question.value, '$.id'), 1, 256),
-                  'header', substr(json_extract(question.value, '$.header'), 1, 512),
-                  'question', substr(json_extract(question.value, '$.question'), 1, 8192),
-                  'options', json(COALESCE((
-                    SELECT json_group_array(json_object(
-                      'label', substr(json_extract(option.value, '$.label'), 1, 512),
-                      'description', substr(
-                        json_extract(option.value, '$.description'),
-                        1,
-                        2048
-                      )
-                    ))
-                    FROM (
-                      SELECT value
-                      FROM json_each(question.value, '$.options')
-                      LIMIT 32
-                    ) option
-                  ), '[]')),
-                  'multiSelect', CASE
-                    WHEN json_extract(question.value, '$.multiSelect') = 1
-                    THEN json('true')
-                    ELSE json('false')
-                  END
-                ))
-                FROM (
-                  SELECT value
-                  FROM json_each(payload_json, '$.questions')
-                  LIMIT 32
-                ) question
-              ), '[]'))
-            )
             WHEN kind = 'turn.plan.updated'
             THEN json_object(
               'explanation', substr(json_extract(payload_json, '$.explanation'), 1, 4096),
@@ -1082,9 +1052,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             WHEN kind IN (
               'approval.requested',
               'approval.resolved',
-              'provider.approval.respond.failed',
-              'user-input.resolved',
-              'provider.user-input.respond.failed'
+              'provider.approval.respond.failed'
             )
             THEN json_object(
               'requestId', json_extract(payload_json, '$.requestId'),
@@ -1103,7 +1071,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             )
           END AS "payload",
           CASE
-            WHEN length(CAST(payload_json AS BLOB)) > 65536 THEN 1
+            WHEN
+              length(CAST(payload_json AS BLOB)) > 65536
+              AND kind NOT IN (
+                'user-input.requested',
+                'user-input.resolved',
+                'provider.user-input.respond.failed'
+              )
+            THEN 1
             ELSE 0
           END AS "payloadOmitted",
           sequence,

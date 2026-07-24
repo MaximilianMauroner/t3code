@@ -739,40 +739,41 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       }),
   );
 
-  it.effect(
-    "bounds oversized state payloads while preserving actionable fields and stored JSON",
-    () =>
-      Effect.gen(function* () {
-        const snapshotQuery = yield* ProjectionSnapshotQuery;
-        const sql = yield* SqlClient.SqlClient;
-        const threadId = ThreadId.make("thread-1");
-        const padding = "x".repeat(70_000);
-        const approvalPayload = JSON.stringify({
-          requestId: "approval-large",
-          requestKind: "file-change",
-          detail: "d".repeat(70_000),
-          padding,
-        });
-        const userInputPayload = JSON.stringify({
-          requestId: "input-large",
-          questions: [
-            {
-              id: "choice",
-              header: "Choice",
-              question: "Continue?",
-              options: [{ label: "Yes", description: "Continue" }],
-            },
-          ],
-          padding,
-        });
-        const planPayload = JSON.stringify({
-          explanation: "e".repeat(70_000),
-          plan: [{ step: "Keep every required field", status: "inProgress" }],
-          padding,
-        });
+  it.effect("bounds oversized state while preserving exact client input and stored JSON", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("thread-1");
+      const padding = "x".repeat(70_000);
+      const approvalPayload = JSON.stringify({
+        requestId: "approval-large",
+        requestKind: "file-change",
+        detail: "d".repeat(70_000),
+        padding,
+      });
+      const userInputQuestions = Array.from({ length: 33 }, (_, questionIndex) => ({
+        id: `question-${questionIndex}-${"i".repeat(300)}`,
+        header: `Question ${questionIndex}`,
+        question: `Continue with question ${questionIndex}?`,
+        options: Array.from({ length: 33 }, (_, optionIndex) => ({
+          label: `option-${optionIndex}-${"l".repeat(600)}`,
+          description: `Description ${optionIndex}`,
+        })),
+      }));
+      const userInputPayloadValue = {
+        requestId: "input-large",
+        questions: userInputQuestions,
+        padding,
+      };
+      const userInputPayload = JSON.stringify(userInputPayloadValue);
+      const planPayload = JSON.stringify({
+        explanation: "e".repeat(70_000),
+        plan: [{ step: "Keep every required field", status: "inProgress" }],
+        padding,
+      });
 
-        yield* sql`DELETE FROM projection_thread_activities WHERE thread_id = 'thread-1'`;
-        yield* sql`
+      yield* sql`DELETE FROM projection_thread_activities WHERE thread_id = 'thread-1'`;
+      yield* sql`
         INSERT INTO projection_thread_activities (
           activity_id, thread_id, turn_id, tone, kind, summary,
           payload_json, sequence, created_at
@@ -790,58 +791,47 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             'Plan updated', ${planPayload}, 3, '2026-06-03T00:00:03.000Z'
           )
       `;
-        const storedBefore = yield* sql<{ readonly activityId: string; readonly payload: string }>`
+      const storedBefore = yield* sql<{ readonly activityId: string; readonly payload: string }>`
         SELECT activity_id AS "activityId", payload_json AS "payload"
         FROM projection_thread_activities
         WHERE thread_id = 'thread-1'
         ORDER BY sequence ASC
       `;
 
-        const snapshot = yield* snapshotQuery.getThreadDetailSnapshot(threadId);
-        assert.equal(snapshot._tag, "Some");
-        if (snapshot._tag === "Some") {
-          const [approval, userInput, plan] = snapshot.value.thread.activities;
-          assert.isTrue(approval?.payloadOmitted);
-          assert.isTrue(userInput?.payloadOmitted);
-          assert.isTrue(plan?.payloadOmitted);
-          assert.deepEqual(approval?.payload, {
-            requestId: "approval-large",
-            requestKind: "file-change",
-            requestType: null,
-            status: null,
-            detail: "d".repeat(2_048),
-          });
-          assert.deepEqual(userInput?.payload, {
-            requestId: "input-large",
-            status: null,
-            questions: [
-              {
-                id: "choice",
-                header: "Choice",
-                question: "Continue?",
-                options: [{ label: "Yes", description: "Continue" }],
-                multiSelect: false,
-              },
-            ],
-          });
-          assert.deepEqual(plan?.payload, {
-            explanation: "e".repeat(4_096),
-            plan: [{ step: "Keep every required field", status: "inProgress" }],
-          });
-          for (const activity of snapshot.value.thread.activities) {
-            assert.isBelow(Buffer.byteLength(JSON.stringify(activity.payload), "utf8"), 16_384);
-            assert.notProperty(activity.payload, "padding");
-          }
+      const snapshot = yield* snapshotQuery.getThreadDetailSnapshot(threadId);
+      assert.equal(snapshot._tag, "Some");
+      if (snapshot._tag === "Some") {
+        const [approval, userInput, plan] = snapshot.value.thread.activities;
+        assert.isTrue(approval?.payloadOmitted);
+        assert.isUndefined(userInput?.payloadOmitted);
+        assert.isTrue(plan?.payloadOmitted);
+        assert.deepEqual(approval?.payload, {
+          requestId: "approval-large",
+          requestKind: "file-change",
+          requestType: null,
+          status: null,
+          detail: "d".repeat(2_048),
+        });
+        assert.deepEqual(userInput?.payload, userInputPayloadValue);
+        assert.deepEqual(plan?.payload, {
+          explanation: "e".repeat(4_096),
+          plan: [{ step: "Keep every required field", status: "inProgress" }],
+        });
+        for (const activity of [approval, plan]) {
+          assert.isDefined(activity);
+          assert.isBelow(Buffer.byteLength(JSON.stringify(activity.payload), "utf8"), 16_384);
+          assert.notProperty(activity.payload, "padding");
         }
+      }
 
-        const storedAfter = yield* sql<{ readonly activityId: string; readonly payload: string }>`
+      const storedAfter = yield* sql<{ readonly activityId: string; readonly payload: string }>`
         SELECT activity_id AS "activityId", payload_json AS "payload"
         FROM projection_thread_activities
         WHERE thread_id = 'thread-1'
         ORDER BY sequence ASC
       `;
-        assert.deepEqual(storedAfter, storedBefore);
-      }),
+      assert.deepEqual(storedAfter, storedBefore);
+    }),
   );
 
   it.effect("keeps archived threads out of the main shell snapshot", () =>
