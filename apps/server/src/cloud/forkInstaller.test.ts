@@ -287,6 +287,146 @@ describe("fork service bootstrap installer", () => {
     expect(installer).toContain("masked) : ;;");
   });
 
+  it("preserves the root-only recovery bundle when mocked systemctl breaks rollback", () => {
+    withStateDir((stateDir) => {
+      const backupDir = NodePath.join(stateDir, "backup");
+      const mockBin = NodePath.join(stateDir, "bin");
+      const systemctlLog = NodePath.join(stateDir, "systemctl.log");
+      const lockRelease = NodePath.join(stateDir, "lock-released");
+      const rollbackStatus = NodePath.join(stateDir, "rollback-status");
+      const harnessPath = NodePath.join(stateDir, "rollback-harness");
+      NodeFS.mkdirSync(backupDir, { mode: 0o700 });
+      NodeFS.mkdirSync(mockBin);
+
+      const mockSystemctl = NodePath.join(mockBin, "systemctl");
+      NodeFS.writeFileSync(
+        mockSystemctl,
+        [
+          "#!/bin/sh",
+          'printf "%s\\n" "$*" >>"$SYSTEMCTL_LOG"',
+          'if [ "$1" = unmask ] && [ "${2-}" = t3code-nightly-update.service ]; then',
+          "  exit 1",
+          "fi",
+          "exit 0",
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+
+      NodeFS.writeFileSync(NodePath.join(backupDir, "nightly_timer"), "timer-backup\n", {
+        mode: 0o644,
+      });
+      NodeFS.writeFileSync(NodePath.join(backupDir, "nightly_service"), "service-backup\n", {
+        mode: 0o644,
+      });
+      NodeFS.symlinkSync(
+        "/etc/systemd/system/t3code-nightly-update.timer",
+        NodePath.join(backupDir, "nightly_wants"),
+      );
+      NodeFS.writeFileSync(NodePath.join(backupDir, "current"), "previous-current\n");
+      NodeFS.writeFileSync(NodePath.join(backupDir, "dropin"), "previous-dropin\n");
+      for (const label of [
+        "old_dropin",
+        "health_script",
+        "health_lock_helper",
+        "health_service",
+        "health_timer",
+      ]) {
+        NodeFS.writeFileSync(NodePath.join(backupDir, `${label}.absent`), "");
+      }
+      NodeFS.writeFileSync(NodePath.join(stateDir, "current"), "mutated-current\n");
+      NodeFS.writeFileSync(NodePath.join(stateDir, "dropin"), "mutated-dropin\n");
+
+      const backupHelpers = installer.slice(
+        installer.indexOf("backup_file() {"),
+        installer.indexOf('backup_file current "$current_link"'),
+      );
+      const nightlyRestoreHelpers = installer.slice(
+        installer.indexOf("verify_nightly_original_state() {"),
+        installer.indexOf("rollback() {"),
+      );
+      const rollbackFunction = installer.slice(
+        installer.indexOf("rollback() {"),
+        installer.indexOf("\nexit_handler() {", installer.indexOf("rollback() {")),
+      );
+      NodeFS.writeFileSync(
+        harnessPath,
+        [
+          "#!/bin/sh",
+          "set -u",
+          backupHelpers,
+          nightlyRestoreHelpers,
+          rollbackFunction,
+          'backup_dir="$HARNESS_ROOT/backup"',
+          "nightly_backup_complete=true",
+          "install_complete=false",
+          "rollback_complete=false",
+          'nightly_timer_unit="t3code-nightly-update.timer"',
+          'nightly_service_unit="t3code-nightly-update.service"',
+          'nightly_timer_path="$HARNESS_ROOT/nightly.timer"',
+          'nightly_service_path="$HARNESS_ROOT/nightly.service"',
+          'nightly_wants_link="$HARNESS_ROOT/nightly.wants"',
+          "nightly_timer_enabled=enabled",
+          "nightly_service_enabled=static",
+          "nightly_timer_active=inactive",
+          "nightly_service_active=inactive",
+          'current_link="$HARNESS_ROOT/current"',
+          'old_dropin_path="$HARNESS_ROOT/old-dropin"',
+          'dropin_path="$HARNESS_ROOT/dropin"',
+          'health_script="$HARNESS_ROOT/health-script"',
+          'health_lock_helper="$HARNESS_ROOT/health-lock-helper"',
+          'health_service="$HARNESS_ROOT/health.service"',
+          'health_timer="$HARNESS_ROOT/health.timer"',
+          "health_enabled=disabled",
+          "health_active=inactive",
+          "service_active=inactive",
+          'release_update_lock() { printf "%s\\n" released >"$LOCK_RELEASE"; }',
+          'if rollback; then printf "%s\\n" 0 >"$ROLLBACK_STATUS";',
+          'else printf "%s\\n" "$?" >"$ROLLBACK_STATUS"; fi',
+          "",
+        ].join("\n"),
+        { mode: 0o700 },
+      );
+
+      const result = NodeChildProcess.spawnSync("/bin/sh", [harnessPath], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HARNESS_ROOT: stateDir,
+          LOCK_RELEASE: lockRelease,
+          PATH: `${mockBin}:/usr/bin:/bin`,
+          ROLLBACK_STATUS: rollbackStatus,
+          SYSTEMCTL_LOG: systemctlLog,
+        },
+      });
+      expect(result.status).toBe(0);
+      expect(NodeFS.readFileSync(rollbackStatus, "utf8").trim()).toBe("1");
+      expect(result.stderr).toContain(
+        `Nightly updater rollback backup preserved at ${backupDir} for recovery.`,
+      );
+      expect(NodeFS.statSync(backupDir).mode & 0o777).toBe(0o700);
+      expect(NodeFS.readFileSync(NodePath.join(backupDir, "nightly_timer"), "utf8")).toBe(
+        "timer-backup\n",
+      );
+      expect(NodeFS.readFileSync(NodePath.join(backupDir, "nightly_service"), "utf8")).toBe(
+        "service-backup\n",
+      );
+      expect(NodeFS.readlinkSync(NodePath.join(backupDir, "nightly_wants"))).toBe(
+        "/etc/systemd/system/t3code-nightly-update.timer",
+      );
+      expect(NodeFS.readFileSync(NodePath.join(stateDir, "current"), "utf8")).toBe(
+        "previous-current\n",
+      );
+      expect(NodeFS.readFileSync(NodePath.join(stateDir, "dropin"), "utf8")).toBe(
+        "previous-dropin\n",
+      );
+      expect(NodeFS.readFileSync(lockRelease, "utf8")).toBe("released\n");
+      expect(NodeFS.readFileSync(systemctlLog, "utf8")).toContain(
+        "unmask t3code-nightly-update.service",
+      );
+    });
+  });
+
   it("commits and disables signal rollback before releasing the verified activation", () => {
     const finalProbeIndex = installer.lastIndexOf("curl --fail --silent --show-error");
     const disableTrapsIndex = installer.indexOf("trap - EXIT HUP INT TERM", finalProbeIndex);

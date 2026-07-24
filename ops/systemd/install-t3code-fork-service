@@ -194,6 +194,8 @@ validate_nightly_preflight ||
 
 # Everything below is one reversible activation transaction.
 backup_dir="$(mktemp -d)"
+chmod 0700 "$backup_dir"
+nightly_backup_complete=false
 backup_file() {
   label="$1"; source="$2"
   if [ -e "$source" ] || [ -L "$source" ]; then cp -a "$source" "$backup_dir/$label"; else : >"$backup_dir/$label.absent"; fi
@@ -231,6 +233,7 @@ validate_nightly_wants_link
 backup_nightly_path nightly_timer "$nightly_timer_path"
 backup_nightly_path nightly_service "$nightly_service_path"
 backup_nightly_path nightly_wants "$nightly_wants_link"
+nightly_backup_complete=true
 health_enabled="$(systemctl is-enabled t3code-fork-healthcheck.timer 2>/dev/null || true)"
 health_active="$(systemctl is-active t3code-fork-healthcheck.timer 2>/dev/null || true)"
 service_active="$(systemctl is-active t3code.service 2>/dev/null || true)"
@@ -277,8 +280,12 @@ rollback() {
     release_update_lock || true
     return
   fi
+  rollback_failed=false
   nightly_restore_failed=false
-  if ! restore_nightly_units; then nightly_restore_failed=true; fi
+  if [ "$nightly_backup_complete" = true ] && ! restore_nightly_units; then
+    nightly_restore_failed=true
+    rollback_failed=true
+  fi
   restore_file current "$current_link"
   restore_file old_dropin "$old_dropin_path"
   restore_file dropin "$dropin_path"
@@ -291,10 +298,13 @@ rollback() {
   case "$health_enabled" in enabled) systemctl enable t3code-fork-healthcheck.timer || true ;; masked) systemctl mask t3code-fork-healthcheck.timer || true ;; *) systemctl disable t3code-fork-healthcheck.timer || true ;; esac
   [ "$health_active" = active ] && systemctl start t3code-fork-healthcheck.timer || systemctl stop t3code-fork-healthcheck.timer || true
   [ "$service_active" = active ] && systemctl restart t3code.service || systemctl stop t3code.service || true
-  rm -rf "$backup_dir"
-  release_update_lock || true
-  [ "$nightly_restore_failed" = false ] ||
-    { printf '%s\n' "Could not restore nightly updater units exactly." >&2; return 1; }
+  if [ "$nightly_restore_failed" = true ]; then
+    printf '%s\n' "Nightly updater rollback backup preserved at ${backup_dir} for recovery." >&2
+  else
+    rm -rf "$backup_dir"
+  fi
+  if ! release_update_lock; then rollback_failed=true; fi
+  [ "$rollback_failed" = false ] || return 1
 }
 exit_handler() {
   status=$?
