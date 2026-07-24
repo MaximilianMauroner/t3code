@@ -152,6 +152,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
+        yield* maintenanceGate.ensureDispatchAllowed(envelope.command);
         const eventBase = yield* decideOrchestrationCommand({
           command: envelope.command,
           readModel: commandReadModel,

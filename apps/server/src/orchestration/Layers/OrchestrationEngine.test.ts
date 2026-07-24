@@ -38,23 +38,29 @@ import {
 } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ServerConfig } from "../../config.ts";
+import { OrchestrationCommandInvariantError } from "../Errors.ts";
 import * as UpdateMaintenanceGate from "../UpdateMaintenanceGate.ts";
+import type { UpdateMaintenanceGateService } from "../UpdateMaintenanceGate.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
 const asCheckpointRef = (value: string): CheckpointRef => CheckpointRef.make(value);
 
-async function createOrchestrationSystem() {
+async function createOrchestrationSystem(gateService: UpdateMaintenanceGateService | null = null) {
   const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-orchestration-engine-test-",
   });
+  const maintenanceGateLayer =
+    gateService === null
+      ? UpdateMaintenanceGate.layer
+      : Layer.succeed(UpdateMaintenanceGate.UpdateMaintenanceGate, gateService);
   const orchestrationLayer = Layer.mergeAll(
-    UpdateMaintenanceGate.layer,
+    maintenanceGateLayer,
     OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
       Layer.provide(OrchestrationProjectionPipelineLive),
-      Layer.provide(UpdateMaintenanceGate.layer),
+      Layer.provide(maintenanceGateLayer),
     ),
     OrchestrationProjectionSnapshotQueryLive,
   ).pipe(
@@ -118,6 +124,58 @@ describe("OrchestrationEngine", () => {
       ),
     ).rejects.toThrow("server update is in progress");
     await system.run(system.maintenanceGate.release);
+    await system.dispose();
+  });
+
+  it("rejects a queued turn when maintenance begins after the early dispatch check", async () => {
+    let turnChecks = 0;
+    let held = false;
+    const gateService: UpdateMaintenanceGateService = {
+      acquire: Effect.sync(() => {
+        held = true;
+      }),
+      release: Effect.sync(() => {
+        held = false;
+      }),
+      isHeld: Effect.sync(() => held),
+      ensureDispatchAllowed: (command) =>
+        Effect.suspend(() => {
+          if (command.type !== "thread.turn.start") return Effect.void;
+          turnChecks += 1;
+          if (turnChecks === 1) {
+            held = true;
+            return Effect.void;
+          }
+          return held
+            ? Effect.fail(
+                new OrchestrationCommandInvariantError({
+                  commandType: command.type,
+                  detail: "A server update is in progress; new turns are temporarily paused.",
+                }),
+              )
+            : Effect.void;
+        }),
+    };
+    const system = await createOrchestrationSystem(gateService);
+    await expect(
+      system.run(
+        system.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-maintenance-race-turn"),
+          threadId: ThreadId.make("thread-maintenance-race"),
+          message: {
+            messageId: asMessageId("msg-maintenance-race"),
+            role: "user",
+            text: "hello",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: now(),
+        }),
+      ),
+    ).rejects.toThrow("server update is in progress");
+    expect(turnChecks).toBe(2);
     await system.dispose();
   });
 

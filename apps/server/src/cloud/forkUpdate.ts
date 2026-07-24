@@ -392,6 +392,9 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
             "The local main branch and fork main have diverged; reconcile them manually.",
           );
         }
+        return yield* statusError(
+          "The local main branch is ahead of fork main; publish or remove the local-only commits before updating.",
+        );
       } else {
         return yield* statusError("Could not determine the fork main ancestry.");
       }
@@ -472,6 +475,8 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
           "apps/server/src/cloud/forkUpdate.test.ts",
           "apps/server/src/cloud/forkHealthcheck.test.ts",
           "apps/server/src/cloud/forkInstaller.test.ts",
+          "apps/web/src/components/ForkUpdateAction.test.tsx",
+          "apps/web/src/components/settings/ConnectionsSettings.logic.test.ts",
         ],
         repo,
       );

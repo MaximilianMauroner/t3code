@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import { describe, expect, it } from "vite-plus/test";
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
@@ -21,7 +22,7 @@ describe("fork service bootstrap installer", () => {
   });
 
   it("establishes rollback before symlink and systemd mutations", () => {
-    const trapIndex = installer.indexOf("trap rollback EXIT HUP INT TERM");
+    const trapIndex = installer.indexOf("trap exit_handler EXIT");
     expect(trapIndex).toBeGreaterThan(-1);
     expect(trapIndex).toBeLessThan(installer.indexOf('mv -Tf "$next_link" "$current_link"'));
     expect(trapIndex).toBeLessThan(
@@ -31,15 +32,39 @@ describe("fork service bootstrap installer", () => {
     expect(installer).toContain("nightly_enabled=");
     expect(installer).toContain("health_enabled=");
     expect(installer).toContain("restore_file dropin");
+    expect(installer).toContain("trap signal_handler HUP INT TERM");
+    expect(installer).toContain("rollback_complete=true");
+    expect(installer).toContain("exit 1");
   });
 
   it("uses controlled tools, exact origin HEAD, and the complete focused validation set", () => {
-    expect(installer).toContain(
-      'pnpm_path="${T3CODE_PNPM_PATH:-/home/codex/.local/share/pnpm/bin/pnpm}"',
-    );
+    expect(installer).toContain('pnpm_path="${T3CODE_PNPM_PATH:-/home/codex/.local/bin/pnpm}"');
     expect(installer).toContain('run_as_user git -C "$repo" fetch --prune origin');
     expect(installer).toContain('[ "$commit" = "$origin_commit" ]');
     expect(installer).toContain("apps/server/src/cloud/forkHealthcheck.test.ts");
+    expect(installer).toContain("apps/web/src/components/ForkUpdateAction.test.tsx");
+    expect(installer).toContain(
+      "apps/web/src/components/settings/ConnectionsSettings.logic.test.ts",
+    );
     expect(installer).toContain('while [ "$verified_seconds" -lt 120 ]');
+  });
+
+  it("uses a working executable at the target host pnpm path", () => {
+    const pnpmPath = "/home/codex/.local/bin/pnpm";
+    NodeFS.accessSync(pnpmPath, NodeFS.constants.X_OK);
+    const result = NodeChildProcess.spawnSync(pnpmPath, ["--version"], { encoding: "utf8" });
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+  });
+
+  it("checks verification and live-owner locks before packaging and activation", () => {
+    const checks = Array.from(installer.matchAll(/^ensure_update_gate_clear$/gm));
+    expect(checks).toHaveLength(2);
+    expect(checks[0]?.index).toBeLessThan(installer.indexOf('if [ ! -f "$sentinel" ]'));
+    expect(checks[1]?.index).toBeLessThan(installer.indexOf('backup_dir="$(mktemp -d)"'));
+    expect(installer).toContain('kill -0 "$lock_pid"');
+    expect(installer).toContain('[ -d "/proc/$lock_pid" ]');
+    expect(installer).toContain('mkdir "$lock_path"');
+    expect(installer).not.toContain('rm -rf "$lock_path"\ninstall -d');
   });
 });

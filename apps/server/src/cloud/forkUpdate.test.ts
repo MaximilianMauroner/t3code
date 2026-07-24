@@ -188,7 +188,7 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
     service: ForkUpdate.ForkUpdate["Service"],
     stages: ReadonlySet<string>,
   ) {
-    for (let attempt = 0; attempt < 200; attempt += 1) {
+    for (let attempt = 0; attempt < 10_000; attempt += 1) {
       const result = yield* service.getStatus;
       if (stages.has(result.status.stage)) return result.status;
       yield* Effect.yieldNow;
@@ -254,8 +254,14 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       const packageIndex = commands.findIndex((command) =>
         command.includes("pnpm --filter t3 pack"),
       );
+      const focusedTests = commands.find((command) => command.includes("vp test run")) ?? "";
       assert.isAtLeast(pushIndex, 0);
       assert.isAbove(pushIndex, packageIndex);
+      assert.include(focusedTests, "apps/web/src/components/ForkUpdateAction.test.tsx");
+      assert.include(
+        focusedTests,
+        "apps/web/src/components/settings/ConnectionsSettings.logic.test.ts",
+      );
       assert.equal(
         yield* FileSystem.FileSystem.pipe(Effect.flatMap((fs) => fs.readLink(context.currentLink))),
         context.currentLink.replace("current", "releases/new-commit"),
@@ -377,6 +383,34 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       const result = yield* awaitStatus(context.service, new Set(["failed"]));
       assert.include(result.error ?? "", "diverged");
       assert.isFalse(commands.some((command) => command.startsWith("git fetch --prune upstream ")));
+    }),
+  );
+
+  it.effect("fails clearly when local main is ahead of fork main", () =>
+    Effect.gen(function* () {
+      const commands: Array<string> = [];
+      const context = yield* makeService({
+        active: false,
+        commands,
+        output: (command, args) => {
+          const invocation = [command, ...args].join(" ");
+          if (invocation === "git branch --show-current") return { stdout: "main\n" };
+          if (invocation === "git remote get-url origin") {
+            return { stdout: "https://github.com/owner/t3code.git\n" };
+          }
+          if (invocation === "git remote get-url upstream") {
+            return { stdout: "git@github.com:upstream/t3code.git\n" };
+          }
+          if (invocation === "git merge-base --is-ancestor HEAD origin/main") return { code: 1 };
+          if (invocation === "git merge-base --is-ancestor origin/main HEAD") return { code: 0 };
+          return {};
+        },
+      });
+      yield* context.service.start;
+      const result = yield* awaitStatus(context.service, new Set(["failed"]));
+      assert.include(result.error ?? "", "ahead of fork main");
+      assert.isFalse(commands.some((command) => command.startsWith("git fetch --prune upstream ")));
+      assert.isFalse(commands.some((command) => command.startsWith("git push origin ")));
     }),
   );
 
