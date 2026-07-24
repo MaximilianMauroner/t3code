@@ -56,7 +56,9 @@ export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabi
 
 export const ForkUpdateDescriptor = Schema.Struct({
   repository: TrimmedNonEmptyString,
+  upstreamRepository: TrimmedNonEmptyString,
   branch: TrimmedNonEmptyString,
+  upstreamBranch: TrimmedNonEmptyString,
   currentCommit: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type ForkUpdateDescriptor = typeof ForkUpdateDescriptor.Type;

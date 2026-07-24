@@ -79,7 +79,9 @@ describe("shouldShowForkUpdate", () => {
     expect(
       shouldShowForkUpdate(EnvironmentId.make("environment-1"), {
         repository: "owner/fork",
+        upstreamRepository: "upstream/project",
         branch: "main",
+        upstreamBranch: "nightly",
         currentCommit: "0123456789abcdef",
       }),
     ).toBe(true);

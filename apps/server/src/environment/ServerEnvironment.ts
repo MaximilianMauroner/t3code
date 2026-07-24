@@ -167,7 +167,9 @@ export const make = Effect.gen(function* () {
       : {
           forkUpdate: {
             repository: forkUpdate.repository,
+            upstreamRepository: forkUpdate.upstreamRepository,
             branch: forkUpdate.branch,
+            upstreamBranch: forkUpdate.upstreamBranch,
             ...(forkCurrentCommit === null ? {} : { currentCommit: forkCurrentCommit }),
           },
         }),
