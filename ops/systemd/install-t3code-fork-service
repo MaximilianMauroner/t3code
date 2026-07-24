@@ -1,0 +1,134 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+  printf '%s\n' "Run this installer as root." >&2
+  exit 1
+fi
+
+run_user="${T3CODE_RUN_USER:-codex}"
+repo="${T3CODE_REPOSITORY_PATH:-/home/codex/work/t3code}"
+state_dir="${T3CODE_STATE_DIR:-/home/codex/.t3code/userdata}"
+releases_dir="${state_dir}/fork-releases"
+current_link="${state_dir}/fork-current"
+dropin_dir="/etc/systemd/system/t3code.service.d"
+dropin_path="${dropin_dir}/fork-update.conf"
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+node_path="/home/codex/.local/share/pnpm/bin/node"
+
+run_as_user() {
+  runuser -u "$run_user" -- "$@"
+}
+
+remote_matches() {
+  actual="$1"
+  expected="$2"
+  case "$actual" in
+    "https://github.com/${expected}"|"https://github.com/${expected}.git"|\
+    "git@github.com:${expected}"|"git@github.com:${expected}.git"|\
+    "ssh://git@github.com/${expected}"|"ssh://git@github.com/${expected}.git") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+[ "$(run_as_user git -C "$repo" status --porcelain)" = "" ] || {
+  printf '%s\n' "Refusing to bootstrap from a dirty checkout." >&2
+  exit 1
+}
+[ "$(run_as_user git -C "$repo" branch --show-current)" = "main" ] || {
+  printf '%s\n' "Refusing to bootstrap from a branch other than main." >&2
+  exit 1
+}
+origin_url="$(run_as_user git -C "$repo" remote get-url origin)"
+upstream_url="$(run_as_user git -C "$repo" remote get-url upstream)"
+remote_matches "$origin_url" "MaximilianMauroner/t3code" || {
+  printf '%s\n' "The origin remote is not MaximilianMauroner/t3code." >&2
+  exit 1
+}
+remote_matches "$upstream_url" "pingdotgg/t3code" || {
+  printf '%s\n' "The upstream remote is not pingdotgg/t3code." >&2
+  exit 1
+}
+
+commit="$(run_as_user git -C "$repo" rev-parse HEAD)"
+release_dir="${releases_dir}/${commit}"
+sentinel="${release_dir}/.t3-fork-release-complete"
+entry="${release_dir}/node_modules/t3/dist/bin.mjs"
+
+install -d -o "$run_user" -g "$run_user" "$state_dir" "$releases_dir"
+if [ ! -f "$sentinel" ] || [ "$(cat "$sentinel")" != "$commit" ] || [ ! -f "$entry" ]; then
+  staged_release="${releases_dir}/.release-${commit}"
+  pack_dir="${releases_dir}/.pack-${commit}"
+  rm -rf "$staged_release" "$pack_dir"
+  install -d -o "$run_user" -g "$run_user" "$staged_release" "$pack_dir"
+
+  run_as_user pnpm -C "$repo" install --frozen-lockfile
+  run_as_user pnpm -C "$repo" exec vp test run \
+    packages/contracts/src/server.test.ts apps/server/src/cloud/forkUpdate.test.ts
+  run_as_user pnpm -C "$repo" exec vp run --filter @t3tools/contracts \
+    --filter @t3tools/web --filter t3 typecheck
+  run_as_user pnpm -C "$repo" exec vp run --filter @t3tools/web build
+  run_as_user pnpm -C "$repo" exec vp run --filter t3 build
+  run_as_user pnpm -C "$repo" --filter t3 pack --pack-destination "$pack_dir"
+  tarball="$(find "$pack_dir" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+  [ -n "$tarball" ] || {
+    printf '%s\n' "The server package was not created." >&2
+    exit 1
+  }
+  run_as_user sh -c 'printf "%s\n" "{ \"private\": true }" >"$1/package.json"' \
+    t3-bootstrap "$staged_release"
+  run_as_user pnpm --ignore-workspace --dir "$staged_release" add --prod "$tarball"
+  staged_entry="${staged_release}/node_modules/t3/dist/bin.mjs"
+  run_as_user "$node_path" "$staged_entry" --version >/dev/null
+  run_as_user sh -c 'printf "%s\n" "$1" >"$2"' t3-bootstrap "$commit" \
+    "${staged_release}/.t3-fork-release-complete"
+  rm -rf "$release_dir"
+  mv "$staged_release" "$release_dir"
+  rm -rf "$pack_dir"
+fi
+
+"$node_path" "$entry" --version >/dev/null
+next_link="${current_link}.bootstrap.$$"
+rm -f "$next_link"
+ln -s "$release_dir" "$next_link"
+mv -Tf "$next_link" "$current_link"
+
+install -d "$dropin_dir"
+backup="$(mktemp)"
+had_dropin=false
+if [ -f "$dropin_path" ]; then
+  cp "$dropin_path" "$backup"
+  had_dropin=true
+fi
+restore_dropin() {
+  if [ "$had_dropin" = true ]; then
+    cp "$backup" "$dropin_path"
+  else
+    rm -f "$dropin_path"
+  fi
+  systemctl daemon-reload || true
+}
+install_complete=false
+cleanup_install() {
+  if [ "$install_complete" != true ]; then
+    restore_dropin
+  fi
+  rm -f "$backup"
+}
+trap cleanup_install EXIT HUP INT TERM
+
+install -m 0644 "$script_dir/t3code.service.d/fork-update.conf" "$dropin_path"
+install -m 0755 "$script_dir/t3code-fork-healthcheck" \
+  /usr/local/sbin/t3code-fork-healthcheck
+install -m 0644 "$script_dir/t3code-fork-healthcheck.service" \
+  /etc/systemd/system/t3code-fork-healthcheck.service
+install -m 0644 "$script_dir/t3code-fork-healthcheck.timer" \
+  /etc/systemd/system/t3code-fork-healthcheck.timer
+systemctl daemon-reload
+systemctl disable --now t3code-nightly-update.timer || true
+systemctl mask t3code-nightly-update.timer
+systemctl enable --now t3code-fork-healthcheck.timer
+systemctl restart t3code.service
+
+install_complete=true
+printf '%s\n' "Installed immutable T3 Code fork release ${commit}."
