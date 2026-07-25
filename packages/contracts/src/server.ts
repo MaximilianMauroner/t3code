@@ -633,9 +633,10 @@ export type ServerForkUpdateStatus = typeof ServerForkUpdateStatus.Type;
 
 export const ServerForkUpdateResult = Schema.Struct({
   status: ServerForkUpdateStatus,
-  /** Current head of the configured upstream nightly branch. Optional for
-      compatibility with servers that predate nightly availability checks. */
-  latestNightlyCommit: Schema.optionalKey(TrimmedNonEmptyString),
+  /** Latest nightly tag reachable from the installed immutable release. */
+  installedNightlyVersion: Schema.optionalKey(TrimmedNonEmptyString),
+  /** Newest nightly tag currently published by the upstream repository. */
+  latestNightlyVersion: Schema.optionalKey(TrimmedNonEmptyString),
 });
 export type ServerForkUpdateResult = typeof ServerForkUpdateResult.Type;
 

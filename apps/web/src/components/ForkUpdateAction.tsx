@@ -78,12 +78,12 @@ export function presentForkUpdateStatus(
   descriptor: ForkUpdateDescriptor,
   status: ServerForkUpdateStatus | null,
   queryError: string | null,
-  latestNightlyCommit?: string,
+  installedNightlyVersion?: string,
+  latestNightlyVersion?: string,
 ): ForkUpdateStatusPresentation {
   return {
-    installedNightly: shortCommit(descriptor.currentCommit),
-    latestReleasedNightly:
-      latestNightlyCommit === undefined ? null : shortCommit(latestNightlyCommit),
+    installedNightly: installedNightlyVersion ?? shortCommit(descriptor.currentCommit),
+    latestReleasedNightly: latestNightlyVersion ?? null,
     stage: status === null ? null : stageLabel(status.stage),
     message: status?.message ?? null,
     detail: status?.error ?? queryError,
@@ -96,14 +96,22 @@ function ForkUpdateStatusView({
   descriptor,
   status,
   queryError,
-  latestNightlyCommit,
+  installedNightlyVersion,
+  latestNightlyVersion,
 }: {
   readonly descriptor: ForkUpdateDescriptor;
   readonly status: ServerForkUpdateStatus | null;
   readonly queryError: string | null;
-  readonly latestNightlyCommit: string | undefined;
+  readonly installedNightlyVersion: string | undefined;
+  readonly latestNightlyVersion: string | undefined;
 }) {
-  const presentation = presentForkUpdateStatus(descriptor, status, queryError, latestNightlyCommit);
+  const presentation = presentForkUpdateStatus(
+    descriptor,
+    status,
+    queryError,
+    installedNightlyVersion,
+    latestNightlyVersion,
+  );
   const compareUrl = forkUpdateCompareUrl(descriptor);
   return (
     <div className="space-y-1">
@@ -254,7 +262,8 @@ export function ForkUpdateAction({
           descriptor={descriptor}
           status={status}
           queryError={requestError ?? statusQuery.error}
-          latestNightlyCommit={statusQuery.data?.latestNightlyCommit}
+          installedNightlyVersion={statusQuery.data?.installedNightlyVersion}
+          latestNightlyVersion={statusQuery.data?.latestNightlyVersion}
         />
       }
       control={

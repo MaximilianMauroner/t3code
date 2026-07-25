@@ -14,7 +14,8 @@ const testState = vi.hoisted(() => ({
   query: {
     data: null as {
       readonly status: ServerForkUpdateStatus;
-      readonly latestNightlyCommit?: string;
+      readonly installedNightlyVersion?: string;
+      readonly latestNightlyVersion?: string;
     } | null,
     error: null as string | null,
     isPending: false,
@@ -175,9 +176,17 @@ describe("ForkUpdateAction", () => {
   });
 
   it("distinguishes the installed nightly from the latest released nightly", () => {
-    expect(presentForkUpdateStatus(DESCRIPTOR, null, null, "fedcba9876543210")).toMatchObject({
-      installedNightly: "01234567",
-      latestReleasedNightly: "fedcba98",
+    expect(
+      presentForkUpdateStatus(
+        DESCRIPTOR,
+        null,
+        null,
+        "v0.0.29-nightly.20260724.896",
+        "v0.0.29-nightly.20260725.899",
+      ),
+    ).toMatchObject({
+      installedNightly: "v0.0.29-nightly.20260724.896",
+      latestReleasedNightly: "v0.0.29-nightly.20260725.899",
     });
   });
 

@@ -32,6 +32,7 @@ const RESTART_DELAY_MS = 2_000;
 const MAX_ERROR_LENGTH = 2_000;
 const RELEASE_SENTINEL = ".t3-fork-release-complete";
 const EXPECTED_UPSTREAM_REPOSITORY = "pingdotgg/t3code";
+const NIGHTLY_TAG_PATTERN = "v*-nightly.*";
 
 const terminalStages = new Set<ServerForkUpdateStatus["stage"]>([
   "idle",
@@ -166,8 +167,9 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
   const statusPath = path.join(config.stateDir, "fork-update.json");
   const verificationPath = path.join(config.stateDir, "fork-update-verification.json");
   const inFlight = yield* Ref.make(false);
-  const latestNightlyCache = yield* Ref.make<{
-    readonly commit: string | null;
+  const nightlyVersionCache = yield* Ref.make<{
+    readonly installed: string | null;
+    readonly latest: string | null;
     readonly checkedAt: number;
   } | null>(null);
 
@@ -728,34 +730,69 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
       if (configuration === null) return { status };
 
       const now = yield* Clock.currentTimeMillis;
-      const cached = yield* Ref.get(latestNightlyCache);
-      const latestNightlyCommit =
+      const cached = yield* Ref.get(nightlyVersionCache);
+      const versions =
         cached !== null && now - cached.checkedAt < 60_000
-          ? cached.commit
-          : yield* runner
-              .run({
-                command: "git",
-                args: [
-                  "ls-remote",
-                  "--heads",
-                  configuration.upstreamRemote,
-                  `refs/heads/${configuration.upstreamBranch}`,
-                ],
-                cwd: configuration.repositoryPath,
-                timeout: Duration.seconds(30),
-              })
-              .pipe(
-                Effect.map((result) => {
-                  if (result.code !== 0) return null;
-                  return /^([0-9a-f]{40,64})\s/iu.exec(result.stdout.trim())?.[1] ?? null;
-                }),
-                Effect.orElseSucceed(() => null),
-                Effect.tap((commit) => Ref.set(latestNightlyCache, { commit, checkedAt: now })),
-              );
+          ? cached
+          : yield* Effect.gen(function* () {
+              const deployedTarget = yield* fs
+                .readLink(configuration.currentLink)
+                .pipe(Effect.orElseSucceed(() => ""));
+              const deployedCommit = path.basename(deployedTarget);
+              const installed =
+                deployedCommit === ""
+                  ? null
+                  : yield* runner
+                      .run({
+                        command: "git",
+                        args: [
+                          "describe",
+                          "--tags",
+                          "--match",
+                          NIGHTLY_TAG_PATTERN,
+                          "--abbrev=0",
+                          deployedCommit,
+                        ],
+                        cwd: configuration.repositoryPath,
+                        timeout: Duration.seconds(30),
+                      })
+                      .pipe(
+                        Effect.map((result) =>
+                          result.code === 0 ? result.stdout.trim() || null : null,
+                        ),
+                        Effect.orElseSucceed(() => null),
+                      );
+              const latest = yield* runner
+                .run({
+                  command: "git",
+                  args: [
+                    "ls-remote",
+                    "--tags",
+                    "--refs",
+                    "--sort=-version:refname",
+                    configuration.upstreamRemote,
+                    `refs/tags/${NIGHTLY_TAG_PATTERN}`,
+                  ],
+                  cwd: configuration.repositoryPath,
+                  timeout: Duration.seconds(30),
+                })
+                .pipe(
+                  Effect.map((result) => {
+                    if (result.code !== 0) return null;
+                    const ref = result.stdout.trim().split(/\s+/u)[1];
+                    return ref?.replace(/^refs\/tags\//u, "") || null;
+                  }),
+                  Effect.orElseSucceed(() => null),
+                );
+              const next = { installed, latest, checkedAt: now };
+              yield* Ref.set(nightlyVersionCache, next);
+              return next;
+            });
 
       return {
         status,
-        ...(latestNightlyCommit === null ? {} : { latestNightlyCommit }),
+        ...(versions.installed === null ? {} : { installedNightlyVersion: versions.installed }),
+        ...(versions.latest === null ? {} : { latestNightlyVersion: versions.latest }),
       };
     }),
     start,

@@ -228,32 +228,52 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       assert.equal(accepted.status.stage, "checking");
       const failed = yield* awaitStatus(context.service, new Set(["failed"]));
       assert.include(failed.error ?? "", "active turns");
-      assert.deepEqual(commands, ["git ls-remote --heads upstream refs/heads/nightly"]);
+      assert.deepEqual(commands, [
+        "git ls-remote --tags --refs --sort=-version:refname upstream refs/tags/v*-nightly.*",
+      ]);
       assert.equal(context.restartCount(), 0);
     }),
   );
 
-  it.effect("reports the latest released nightly without changing the checkout", () =>
-    Effect.gen(function* () {
-      const commands: Array<string> = [];
-      const latestCommit = "fedcba9876543210fedcba9876543210fedcba98";
-      const context = yield* makeService({
-        active: false,
-        commands,
-        deployedCommit: "installed-commit",
-        output: (command, args) =>
-          [command, ...args].join(" ") === "git ls-remote --heads upstream refs/heads/nightly"
-            ? {
-                stdout: `${latestCommit}\trefs/heads/nightly\n`,
-              }
-            : {},
-      });
+  it.effect(
+    "reports installed and latest released nightly versions without changing checkout",
+    () =>
+      Effect.gen(function* () {
+        const commands: Array<string> = [];
+        const installedVersion = "v0.0.29-nightly.20260724.896";
+        const latestVersion = "v0.0.29-nightly.20260725.899";
+        const context = yield* makeService({
+          active: false,
+          commands,
+          deployedCommit: "installed-commit",
+          output: (command, args) => {
+            const invocation = [command, ...args].join(" ");
+            if (
+              invocation === "git describe --tags --match v*-nightly.* --abbrev=0 installed-commit"
+            ) {
+              return { stdout: `${installedVersion}\n` };
+            }
+            if (
+              invocation ===
+              "git ls-remote --tags --refs --sort=-version:refname upstream refs/tags/v*-nightly.*"
+            ) {
+              return {
+                stdout: `latest-commit\trefs/tags/${latestVersion}\nolder\trefs/tags/${installedVersion}\n`,
+              };
+            }
+            return {};
+          },
+        });
 
-      const result = yield* context.service.getStatus;
+        const result = yield* context.service.getStatus;
 
-      assert.equal(result.latestNightlyCommit, latestCommit);
-      assert.deepEqual(commands, ["git ls-remote --heads upstream refs/heads/nightly"]);
-    }),
+        assert.equal(result.installedNightlyVersion, installedVersion);
+        assert.equal(result.latestNightlyVersion, latestVersion);
+        assert.deepEqual(commands, [
+          "git describe --tags --match v*-nightly.* --abbrev=0 installed-commit",
+          "git ls-remote --tags --refs --sort=-version:refname upstream refs/tags/v*-nightly.*",
+        ]);
+      }),
   );
 
   it.effect("pushes the exact merged commit before switching the release link", () =>
