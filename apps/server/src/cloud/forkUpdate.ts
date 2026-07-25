@@ -166,6 +166,10 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
   const statusPath = path.join(config.stateDir, "fork-update.json");
   const verificationPath = path.join(config.stateDir, "fork-update-verification.json");
   const inFlight = yield* Ref.make(false);
+  const latestNightlyCache = yield* Ref.make<{
+    readonly commit: string | null;
+    readonly checkedAt: number;
+  } | null>(null);
 
   const host: ForkUpdateHost = {
     hasActiveTurns:
@@ -719,7 +723,41 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
 
   return ForkUpdate.of({
     configuration,
-    getStatus: readStatus.pipe(Effect.map((status) => ({ status }))),
+    getStatus: Effect.gen(function* () {
+      const status = yield* readStatus;
+      if (configuration === null) return { status };
+
+      const now = yield* Clock.currentTimeMillis;
+      const cached = yield* Ref.get(latestNightlyCache);
+      const latestNightlyCommit =
+        cached !== null && now - cached.checkedAt < 60_000
+          ? cached.commit
+          : yield* runner
+              .run({
+                command: "git",
+                args: [
+                  "ls-remote",
+                  "--heads",
+                  configuration.upstreamRemote,
+                  `refs/heads/${configuration.upstreamBranch}`,
+                ],
+                cwd: configuration.repositoryPath,
+                timeout: Duration.seconds(30),
+              })
+              .pipe(
+                Effect.map((result) => {
+                  if (result.code !== 0) return null;
+                  return /^([0-9a-f]{40,64})\s/iu.exec(result.stdout.trim())?.[1] ?? null;
+                }),
+                Effect.orElseSucceed(() => null),
+                Effect.tap((commit) => Ref.set(latestNightlyCache, { commit, checkedAt: now })),
+              );
+
+      return {
+        status,
+        ...(latestNightlyCommit === null ? {} : { latestNightlyCommit }),
+      };
+    }),
     start,
   });
 });

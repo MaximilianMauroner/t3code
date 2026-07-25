@@ -65,7 +65,8 @@ export function forkUpdateCompareUrl(descriptor: ForkUpdateDescriptor): string |
 }
 
 export interface ForkUpdateStatusPresentation {
-  readonly source: string;
+  readonly installedNightly: string;
+  readonly latestReleasedNightly: string | null;
   readonly stage: string | null;
   readonly message: string | null;
   readonly detail: string | null;
@@ -77,9 +78,12 @@ export function presentForkUpdateStatus(
   descriptor: ForkUpdateDescriptor,
   status: ServerForkUpdateStatus | null,
   queryError: string | null,
+  latestNightlyCommit?: string,
 ): ForkUpdateStatusPresentation {
   return {
-    source: `${descriptor.branch} · ${shortCommit(descriptor.currentCommit)}`,
+    installedNightly: shortCommit(descriptor.currentCommit),
+    latestReleasedNightly:
+      latestNightlyCommit === undefined ? null : shortCommit(latestNightlyCommit),
     stage: status === null ? null : stageLabel(status.stage),
     message: status?.message ?? null,
     detail: status?.error ?? queryError,
@@ -92,16 +96,19 @@ function ForkUpdateStatusView({
   descriptor,
   status,
   queryError,
+  latestNightlyCommit,
 }: {
   readonly descriptor: ForkUpdateDescriptor;
   readonly status: ServerForkUpdateStatus | null;
   readonly queryError: string | null;
+  readonly latestNightlyCommit: string | undefined;
 }) {
-  const presentation = presentForkUpdateStatus(descriptor, status, queryError);
+  const presentation = presentForkUpdateStatus(descriptor, status, queryError, latestNightlyCommit);
   const compareUrl = forkUpdateCompareUrl(descriptor);
   return (
     <div className="space-y-1">
-      <p>{presentation.source}</p>
+      <p>Installed nightly · {presentation.installedNightly}</p>
+      <p>Latest released nightly · {presentation.latestReleasedNightly ?? "unavailable"}</p>
       {compareUrl !== null ? (
         <p>
           <a
@@ -247,6 +254,7 @@ export function ForkUpdateAction({
           descriptor={descriptor}
           status={status}
           queryError={requestError ?? statusQuery.error}
+          latestNightlyCommit={statusQuery.data?.latestNightlyCommit}
         />
       }
       control={

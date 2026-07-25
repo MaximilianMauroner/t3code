@@ -12,7 +12,10 @@ const testState = vi.hoisted(() => ({
   startForkUpdate: vi.fn(),
   refresh: vi.fn(),
   query: {
-    data: null as { readonly status: ServerForkUpdateStatus } | null,
+    data: null as {
+      readonly status: ServerForkUpdateStatus;
+      readonly latestNightlyCommit?: string;
+    } | null,
     error: null as string | null,
     isPending: false,
   },
@@ -169,6 +172,13 @@ describe("ForkUpdateAction", () => {
         upstreamBranch: DESCRIPTOR.upstreamBranch,
       }),
     ).toBeNull();
+  });
+
+  it("distinguishes the installed nightly from the latest released nightly", () => {
+    expect(presentForkUpdateStatus(DESCRIPTOR, null, null, "fedcba9876543210")).toMatchObject({
+      installedNightly: "01234567",
+      latestReleasedNightly: "fedcba98",
+    });
   });
 
   it("keeps the action disabled throughout every active persisted stage", () => {

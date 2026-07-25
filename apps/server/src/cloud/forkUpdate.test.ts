@@ -143,6 +143,7 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
         repository: "owner/t3code",
         upstreamRepository: "upstream/t3code",
         branch: "main",
+        upstreamBranch: "nightly",
         forkRemote: "origin",
         upstreamRemote: "upstream",
         releasesDir,
@@ -227,8 +228,31 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       assert.equal(accepted.status.stage, "checking");
       const failed = yield* awaitStatus(context.service, new Set(["failed"]));
       assert.include(failed.error ?? "", "active turns");
-      assert.lengthOf(commands, 0);
+      assert.deepEqual(commands, ["git ls-remote --heads upstream refs/heads/nightly"]);
       assert.equal(context.restartCount(), 0);
+    }),
+  );
+
+  it.effect("reports the latest released nightly without changing the checkout", () =>
+    Effect.gen(function* () {
+      const commands: Array<string> = [];
+      const latestCommit = "fedcba9876543210fedcba9876543210fedcba98";
+      const context = yield* makeService({
+        active: false,
+        commands,
+        deployedCommit: "installed-commit",
+        output: (command, args) =>
+          [command, ...args].join(" ") === "git ls-remote --heads upstream refs/heads/nightly"
+            ? {
+                stdout: `${latestCommit}\trefs/heads/nightly\n`,
+              }
+            : {},
+      });
+
+      const result = yield* context.service.getStatus;
+
+      assert.equal(result.latestNightlyCommit, latestCommit);
+      assert.deepEqual(commands, ["git ls-remote --heads upstream refs/heads/nightly"]);
     }),
   );
 
