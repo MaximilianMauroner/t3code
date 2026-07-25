@@ -18,6 +18,11 @@ import { useHomeListOptions } from "./home-list-options";
 import { buildHomeProjectScopes } from "./homeThreadList";
 import { usePendingTaskListActions } from "./usePendingTaskListActions";
 import { useThreadListActions } from "./useThreadListActions";
+import {
+  ThreadLifecycleSnackbar,
+  type ThreadLifecycleSnackbarState,
+} from "../threads/ThreadLifecycleSnackbar";
+import { reduceThreadLifecycleSnackbar } from "../threads/threadLifecycleSnackbarState";
 
 /* ─── Route screen ───────────────────────────────────────────────────── */
 
@@ -29,8 +34,17 @@ export function HomeRouteScreen() {
   const { savedConnectionsById } = useSavedRemoteConnections();
   const navigation = useNavigation();
   const [searchQuery, setSearchQuery] = useState("");
-  const { archiveThread, confirmDeleteThread, settleThread, unsettleThread } =
-    useThreadListActions();
+  const [lifecycleSnackbar, setLifecycleSnackbar] = useState<ThreadLifecycleSnackbarState | null>(
+    null,
+  );
+  const {
+    archiveThread,
+    confirmDeleteThread,
+    settleThread,
+    unsettleThread,
+    snoozeThread,
+    wakeThread,
+  } = useThreadListActions();
   const pendingTasks = usePendingNewTasks();
   const { openPendingTask, confirmDeletePendingTask } = usePendingTaskListActions();
   const environments = useMemo(
@@ -136,6 +150,24 @@ export function HomeRouteScreen() {
           onDeleteThread={confirmDeleteThread}
           onSettleThread={settleThread}
           onUnsettleThread={unsettleThread}
+          onSnoozeThread={(thread, until) => {
+            void snoozeThread(thread, until).then((succeeded) => {
+              if (!succeeded) return;
+              setLifecycleSnackbar((current) =>
+                reduceThreadLifecycleSnackbar(current, {
+                  type: "show",
+                  state: {
+                    id: Date.now(),
+                    snoozedUntil: until,
+                    onUndo: () => wakeThread(thread),
+                  },
+                }),
+              );
+            });
+          }}
+          onWakeThread={(thread) => {
+            void wakeThread(thread);
+          }}
           onEnvironmentChange={setSelectedEnvironmentId}
           onProjectChange={setSelectedProjectKey}
           onOpenEnvironments={() =>
@@ -176,6 +208,14 @@ export function HomeRouteScreen() {
           selectedProjectKey={selectedProjectKey}
           threads={threads}
           threadSortOrder={listOptions.threadSortOrder}
+        />
+        <ThreadLifecycleSnackbar
+          state={lifecycleSnackbar}
+          onDismiss={() =>
+            setLifecycleSnackbar((current) =>
+              reduceThreadLifecycleSnackbar(current, { type: "dismiss" }),
+            )
+          }
         />
       </>
     </AndroidHomeFabLayout>

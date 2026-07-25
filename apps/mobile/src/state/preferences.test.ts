@@ -28,6 +28,7 @@ import {
   MobilePreferencesLoadError,
   MobilePreferencesSaveError,
   MobilePreferencesStore,
+  resolveThreadListV2Enabled,
 } from "./preferences";
 
 function deferred<A>() {
@@ -269,4 +270,16 @@ describe("mobile preferences state", () => {
       registry.dispose();
     }),
   );
+});
+
+describe("resolveThreadListV2Enabled", () => {
+  it("defaults absent and unavailable preferences to enabled", () => {
+    expect(resolveThreadListV2Enabled(undefined)).toBe(true);
+    expect(resolveThreadListV2Enabled({})).toBe(true);
+  });
+
+  it("keeps explicit false as the hidden rollback", () => {
+    expect(resolveThreadListV2Enabled({ threadListV2Enabled: false })).toBe(false);
+    expect(resolveThreadListV2Enabled({ threadListV2Enabled: true })).toBe(true);
+  });
 });

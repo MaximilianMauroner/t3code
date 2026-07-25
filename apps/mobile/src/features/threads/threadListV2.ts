@@ -54,6 +54,34 @@ function firstValidTimestampMs(...candidates: ReadonlyArray<string | null | unde
   return 0;
 }
 
+export function resolveThreadListV2SettledTimestamp(
+  thread: Pick<
+    EnvironmentThreadShell,
+    "settledAt" | "latestUserMessageAt" | "latestTurn" | "updatedAt"
+  >,
+): string | null {
+  if (thread.settledAt !== null && !Number.isNaN(Date.parse(thread.settledAt))) {
+    return thread.settledAt;
+  }
+  let latest: string | null = null;
+  let latestMs = Number.NEGATIVE_INFINITY;
+  for (const candidate of [
+    thread.latestUserMessageAt,
+    thread.latestTurn?.requestedAt,
+    thread.latestTurn?.startedAt,
+    thread.latestTurn?.completedAt,
+  ]) {
+    if (candidate == null) continue;
+    const parsed = Date.parse(candidate);
+    if (!Number.isNaN(parsed) && parsed > latestMs) {
+      latest = candidate;
+      latestMs = parsed;
+    }
+  }
+  if (latest !== null) return latest;
+  return !Number.isNaN(Date.parse(thread.updatedAt)) ? thread.updatedAt : null;
+}
+
 /**
  * v2 sort: static creation order, newest thread on top. Activity NEVER
  * reorders the list — a row holds its position from open until settled, so
@@ -72,25 +100,57 @@ export function sortThreadsForListV2<T extends { readonly id: string; readonly c
   );
 }
 
-export interface ThreadListV2Item {
+export interface ThreadListV2RowItem {
+  readonly type: "thread";
   readonly thread: EnvironmentThreadShell;
+  readonly lifecycle: "active" | "snoozed" | "settled";
   readonly variant: "card" | "slim";
   /** First settled row after the card block draws the SETTLED divider. */
   readonly showSettledDivider: boolean;
   readonly isLast: boolean;
 }
 
+export interface ThreadListV2SectionItem {
+  readonly type: "section";
+  readonly lifecycle: "snoozed" | "settled";
+  readonly count: number;
+}
+
+export type ThreadListV2Item = ThreadListV2RowItem | ThreadListV2SectionItem;
+
 export interface ThreadListV2Layout {
   readonly items: ThreadListV2Item[];
+  readonly activeCount: number;
+  readonly snoozedCount: number;
+  readonly settledCount: number;
   /** Settled threads beyond the render limit (behind "Show more"). */
   readonly hiddenSettledCount: number;
-  /** Snoozed threads hidden from the list (visibility parity with web's
-      collapsed Snoozed shelf; mobile has no shelf UI yet). */
-  readonly snoozedCount: number;
   /** Soonest wake time among hidden snoozed threads, or null. Callers arm
       a timeout at this boundary so the list re-partitions the moment a
       snooze expires instead of on the next minute tick. */
   readonly nextSnoozeWakeAt: string | null;
+}
+
+export function resolveAllSnoozedMessage(input: {
+  readonly activeCount: number;
+  readonly snoozedCount: number;
+  readonly settledCount: number;
+  readonly pendingCount: number;
+  readonly searchQuery: string;
+  readonly snoozedExpanded: boolean;
+}): string | null {
+  if (
+    input.snoozedExpanded ||
+    input.snoozedCount === 0 ||
+    input.activeCount > 0 ||
+    input.settledCount > 0 ||
+    input.pendingCount > 0
+  ) {
+    return null;
+  }
+  return input.searchQuery.trim().length > 0
+    ? "All matching threads are snoozed. They’ll return at their wake times."
+    : "All threads are snoozed. They’ll return at their wake times.";
 }
 
 /**
@@ -136,8 +196,8 @@ export function buildThreadListV2Items(input: {
     : null;
 
   const active: EnvironmentThreadShell[] = [];
+  const snoozed: EnvironmentThreadShell[] = [];
   const settled: EnvironmentThreadShell[] = [];
-  let snoozedCount = 0;
   let nextSnoozeWakeAt: string | null = null;
   for (const thread of input.threads) {
     // Callers pass live (unarchived) shells; settled threads are among them
@@ -151,11 +211,12 @@ export function buildThreadListV2Items(input: {
     const supportsSnooze = input.snoozeEnvironmentIds?.has(thread.environmentId) ?? true;
     const changeRequestState =
       input.changeRequestStateByKey?.get(`${thread.environmentId}:${thread.id}`) ?? null;
-    // Visibility parity with web: a snoozed thread leaves the list until it
-    // wakes (or raises its hand — effectiveSnoozed refuses blocked/failed
-    // work). Snooze outranks settled classification, same as web.
-    if (supportsSnooze && effectiveSnoozed(thread, { now: snoozeNow })) {
-      snoozedCount += 1;
+    // Snoozed threads move to their shelf until they wake (or raise a hand —
+    // effectiveSnoozed refuses blocked/failed work). Snooze outranks settled.
+    const mobileWorking =
+      thread.session?.status === "starting" || thread.session?.status === "running";
+    if (supportsSnooze && !mobileWorking && effectiveSnoozed(thread, { now: snoozeNow })) {
+      snoozed.push(thread);
       if (
         thread.snoozedUntil != null &&
         (nextSnoozeWakeAt === null ||
@@ -176,35 +237,77 @@ export function buildThreadListV2Items(input: {
   }
 
   const orderedActive = sortThreadsForListV2(active);
-  const orderedSettled = [...settled].sort(
+  const orderedSnoozed = [...snoozed].sort(
     (left, right) =>
-      firstValidTimestampMs(right.latestUserMessageAt, right.updatedAt) -
-      firstValidTimestampMs(left.latestUserMessageAt, left.updatedAt),
+      firstValidTimestampMs(left.snoozedUntil) - firstValidTimestampMs(right.snoozedUntil) ||
+      left.id.localeCompare(right.id),
   );
+  const orderedSettled = [...settled].sort((left, right) => {
+    const leftTimestamp = resolveThreadListV2SettledTimestamp(left);
+    const rightTimestamp = resolveThreadListV2SettledTimestamp(right);
+    return (
+      firstValidTimestampMs(rightTimestamp) - firstValidTimestampMs(leftTimestamp) ||
+      left.id.localeCompare(right.id)
+    );
+  });
   const settledLimit = input.settledLimit ?? Number.POSITIVE_INFINITY;
   const visibleSettled =
     orderedSettled.length > settledLimit ? orderedSettled.slice(0, settledLimit) : orderedSettled;
 
   const items: ThreadListV2Item[] = [];
   for (const thread of orderedActive) {
-    items.push({ thread, variant: "card", showSettledDivider: false, isLast: false });
+    items.push({
+      type: "thread",
+      thread,
+      lifecycle: "active",
+      variant: "card",
+      showSettledDivider: false,
+      isLast: false,
+    });
+  }
+  if (orderedSnoozed.length > 0) {
+    items.push({ type: "section", lifecycle: "snoozed", count: orderedSnoozed.length });
+  }
+  for (const thread of orderedSnoozed) {
+    items.push({
+      type: "thread",
+      thread,
+      lifecycle: "snoozed",
+      variant: "slim",
+      showSettledDivider: false,
+      isLast: false,
+    });
+  }
+  if (orderedSettled.length > 0) {
+    items.push({ type: "section", lifecycle: "settled", count: orderedSettled.length });
   }
   for (const [index, thread] of visibleSettled.entries()) {
     items.push({
+      type: "thread",
       thread,
+      lifecycle: "settled",
       variant: "slim",
       showSettledDivider: index === 0,
       isLast: false,
     });
   }
-  const last = items.at(-1);
-  if (last) {
-    items[items.length - 1] = { ...last, isLast: true };
+  let lastRowIndex = -1;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (items[index]?.type === "thread") {
+      lastRowIndex = index;
+      break;
+    }
+  }
+  const last = items[lastRowIndex];
+  if (last?.type === "thread") {
+    items[lastRowIndex] = { ...last, isLast: true };
   }
   return {
     items,
+    activeCount: orderedActive.length,
+    snoozedCount: orderedSnoozed.length,
+    settledCount: orderedSettled.length,
     hiddenSettledCount: orderedSettled.length - visibleSettled.length,
-    snoozedCount,
     nextSnoozeWakeAt,
   };
 }

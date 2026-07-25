@@ -1,7 +1,5 @@
 import type { EnvironmentId, SidebarThreadSortOrder } from "@t3tools/contracts";
 import type { MenuAction } from "@react-native-menu/menu";
-import { useAtomValue } from "@effect/atom-react";
-import { AsyncResult } from "effect/unstable/reactivity";
 import { NativeHeaderToolbar, NativeStackScreenOptions } from "../../native/StackHeader";
 import { useCallback, useMemo, useRef } from "react";
 import { Platform, Pressable, Text as RNText, TextInput, View } from "react-native";
@@ -12,7 +10,7 @@ import { ControlPillMenu } from "../../components/ControlPill";
 import { SymbolView } from "../../components/AppSymbol";
 import { T3Wordmark } from "../../components/T3Wordmark";
 import { useThemeColor } from "../../lib/useThemeColor";
-import { mobilePreferencesAtom } from "../../state/preferences";
+import { useThreadListV2Enabled } from "../../state/preferences";
 import { useHardwareKeyboardCommand } from "../keyboard/hardwareKeyboardCommands";
 import { withNativeGlassHeaderItem } from "../layout/native-glass-header-items";
 import { createNativeMailSearchToolbarItem } from "../layout/native-mail-search-toolbar";
@@ -63,10 +61,7 @@ function checkedMenuState(checked: boolean) {
     sort/group filter controls would be silently ignored — hide them and
     key the "customized" icon state off the environment filter alone. */
 function useThreadListV2FilterGate() {
-  const preferencesResult = useAtomValue(mobilePreferencesAtom);
-  return (
-    AsyncResult.isSuccess(preferencesResult) && preferencesResult.value.threadListV2Enabled === true
-  );
+  return useThreadListV2Enabled();
 }
 
 function AndroidHomeHeader(props: HomeHeaderProps) {

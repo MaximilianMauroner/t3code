@@ -46,6 +46,11 @@ import {
 } from "../terminal/terminalLaunchContext";
 import { terminalDebugLog } from "../terminal/terminalDebugLog";
 import { ThreadDetailScreen } from "./ThreadDetailScreen";
+import { ThreadLifecycleNotice } from "./ThreadLifecycleNotice";
+import { useThreadListActions } from "../home/useThreadListActions";
+import { useThreadPr } from "../../state/use-thread-pr";
+import { resolveOpenThreadLifecycleState } from "./threadLifecyclePresentation";
+import { useThreadLifecycleClock } from "./useThreadLifecycleClock";
 import {
   ThreadGitControls,
   useThreadGitCenterHeaderItems,
@@ -191,10 +196,23 @@ function ThreadRouteContent(
   const selectedThreadDetailState = props.selectedThreadDetailState;
   const selectedThreadDetail = Option.getOrNull(selectedThreadDetailState.data);
   const { selectedThreadCwd } = useSelectedThreadWorktree();
+  const selectedThreadPr = useThreadPr(
+    selectedThread,
+    selectedThreadCwd ?? selectedThreadProject?.workspaceRoot ?? null,
+  );
+  const lifecycleIdentity =
+    selectedThread === null
+      ? null
+      : scopedThreadKey(selectedThread.environmentId, selectedThread.id);
+  const lifecycleNow = useThreadLifecycleClock(
+    lifecycleIdentity,
+    selectedThread?.snoozedUntil ?? null,
+  );
   const composer = useThreadComposerState();
   const gitState = useSelectedThreadGitState();
   const gitActions = useSelectedThreadGitActions();
   const requests = useSelectedThreadRequests();
+  const { unsettleThread, wakeThread } = useThreadListActions();
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, "thread interrupt");
   const navigation = useNavigation();
   const params = props.route.params;
@@ -741,6 +759,14 @@ function ThreadRouteContent(
     connectionState: routeConnectionState,
   });
   const serverConfig = routeEnvironmentRuntime?.serverConfig ?? null;
+  const supportsSnooze = serverConfig?.environment.capabilities.threadSnooze === true;
+  const supportsSettlement = serverConfig?.environment.capabilities.threadSettlement === true;
+  const parkedState = resolveOpenThreadLifecycleState(selectedThread, {
+    now: lifecycleNow,
+    supportsSnooze,
+    supportsSettlement,
+    changeRequestState: selectedThreadPr?.state ?? null,
+  });
   const renderThreadRouteBody = (showActionControls: boolean) => (
     <>
       <ThreadGitControls {...threadGitControlProps} showActionControls={showActionControls} />
@@ -748,6 +774,18 @@ function ThreadRouteContent(
       <GitActionProgressOverlay progress={gitActionProgress} onDismiss={dismissGitActionResult} />
 
       <View className="flex-1 bg-screen">
+        {parkedState !== null ? (
+          <ThreadLifecycleNotice
+            state={parkedState}
+            onRestore={() => {
+              if (parkedState === "snoozed") {
+                void wakeThread(selectedThread);
+              } else {
+                void unsettleThread(selectedThread);
+              }
+            }}
+          />
+        ) : null}
         <ThreadDetailScreen
           selectedThread={selectedThreadWithDraftSettings ?? selectedThread}
           contentPresentation={contentPresentation}
