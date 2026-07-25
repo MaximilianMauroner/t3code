@@ -94,7 +94,7 @@ describe("resolveOpenThreadLifecycleState", () => {
     ).toBe("snoozed");
     const refreshed = refreshLifecycleClockSelection(
       retained,
-      { identity: "env:thread", deadline: snoozed.snoozedUntil },
+      { identity: "env:thread", deadline: snoozed.snoozedUntil ?? null },
       "2026-06-02T10:00:30.000Z",
     );
     expect(
