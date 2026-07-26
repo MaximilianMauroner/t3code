@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import { ServerBootIdentity } from "../../serverBootId.ts";
 
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
 import { ProviderSessionDirectoryPersistenceError, ProviderValidationError } from "../Errors.ts";
@@ -86,6 +87,7 @@ function toRuntimeBinding(
 
 const makeProviderSessionDirectory = Effect.gen(function* () {
   const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+  const serverBootId = (yield* ServerBootIdentity).id;
 
   const getBinding = (threadId: ThreadId) =>
     repository.getByThreadId({ threadId }).pipe(
@@ -145,7 +147,9 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
           existingRuntime?.runtimePayload ?? null,
           binding.runtimePayload,
         ),
-        serverBootId: binding.serverBootId ?? existingRuntime?.serverBootId ?? null,
+        // Runtime ownership is process-local. Never preserve or accept a
+        // caller-supplied boot id while writing from this process.
+        serverBootId,
       })
       .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.upsert:upsert")));
   });
@@ -196,8 +200,10 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
 export const ProviderSessionDirectoryLive = Layer.effect(
   ProviderSessionDirectory,
   makeProviderSessionDirectory,
-);
+).pipe(Layer.provide(ServerBootIdentity.layer));
 
 export function makeProviderSessionDirectoryLive() {
-  return Layer.effect(ProviderSessionDirectory, makeProviderSessionDirectory);
+  return Layer.effect(ProviderSessionDirectory, makeProviderSessionDirectory).pipe(
+    Layer.provide(ServerBootIdentity.layer),
+  );
 }

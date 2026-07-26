@@ -89,6 +89,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
+import { isProviderRuntimeEvent, type ProviderAdapterOutput } from "../Services/ProviderAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
 const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.UnknownFromJsonString);
@@ -1367,7 +1368,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       }) as ClaudeQueryRuntime);
 
   const sessions = new Map<ThreadId, ClaudeSessionContext>();
-  const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
+  const runtimeEventQueue = yield* Queue.unbounded<ProviderAdapterOutput>();
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const randomUUIDv4 = crypto.randomUUIDv4.pipe(
@@ -3899,6 +3900,24 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       return context !== undefined && !context.stopped;
     });
 
+  const requestLivenessSample: ClaudeAdapterShape["requestLivenessSample"] = (
+    threadId,
+    markerId,
+    acknowledged,
+  ) =>
+    Queue.offer(runtimeEventQueue, {
+      _tag: "ProviderLivenessMarker",
+      markerId,
+      threadId,
+      sample: (() => {
+        const context = sessions.get(threadId);
+        return context && !context.stopped
+          ? { state: "present" as const, threadId, session: { ...context.session } }
+          : { state: "absent" as const, threadId };
+      })(),
+      acknowledged,
+    }).pipe(Effect.asVoid);
+
   const stopAll: ClaudeAdapterShape["stopAll"] = () =>
     Effect.forEach(
       sessions,
@@ -3940,8 +3959,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     stopSession,
     listSessions,
     hasSession,
+    requestLivenessSample,
     stopAll,
     get streamEvents() {
+      return Stream.fromQueue(runtimeEventQueue).pipe(Stream.filter(isProviderRuntimeEvent));
+    },
+    get streamOutput() {
       return Stream.fromQueue(runtimeEventQueue);
     },
   } satisfies ClaudeAdapterShape;

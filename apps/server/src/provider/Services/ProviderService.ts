@@ -30,6 +30,7 @@ import type * as Stream from "effect/Stream";
 
 import type { ProviderServiceError } from "../Errors.ts";
 import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
+import type { ProviderLivenessSample } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 
 /**
@@ -97,6 +98,15 @@ export interface ProviderServiceShape {
     instanceId: ProviderInstanceId,
   ) => Effect.Effect<ProviderInstanceRoutingInfo, ProviderServiceError>;
 
+  readonly inspectTarget?: (input: {
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly threadId: ThreadId;
+  }) => Effect.Effect<
+    | ProviderLivenessSample
+    | { readonly state: "unknown"; readonly reason: "start-in-flight" | "unavailable" },
+    ProviderServiceError
+  >;
+
   /**
    * Roll back provider conversation state by a number of turns.
    */
@@ -111,6 +121,11 @@ export interface ProviderServiceShape {
    * Fan-out is owned by ProviderService (not by a standalone event-bus service).
    */
   readonly streamEvents: Stream.Stream<ProviderRuntimeEvent>;
+
+  /** Ordered runtime events plus internal liveness markers for ingestion only. */
+  readonly streamIngestion?: Stream.Stream<
+    ProviderRuntimeEvent | import("./ProviderAdapter.ts").ProviderLivenessMarker
+  >;
 }
 
 /**

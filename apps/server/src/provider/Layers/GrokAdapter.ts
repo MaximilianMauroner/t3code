@@ -67,6 +67,7 @@ import {
   XAiAskUserQuestionRequest,
 } from "../acp/XAiAcpExtension.ts";
 import { type GrokAdapterShape } from "../Services/GrokAdapter.ts";
+import { isProviderRuntimeEvent, type ProviderAdapterOutput } from "../Services/ProviderAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
@@ -243,7 +244,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
 
     const sessions = new Map<ThreadId, GrokSessionContext>();
     const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
-    const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+    const runtimeEventPubSub = yield* PubSub.unbounded<ProviderAdapterOutput>();
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(
@@ -1432,6 +1433,28 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
         return c !== undefined && !c.stopped;
       });
 
+    const requestLivenessSample: GrokAdapterShape["requestLivenessSample"] = (
+      threadId,
+      markerId,
+      acknowledged,
+    ) =>
+      withThreadLock(
+        threadId,
+        Effect.gen(function* () {
+          const context = sessions.get(threadId);
+          yield* PubSub.publish(runtimeEventPubSub, {
+            _tag: "ProviderLivenessMarker",
+            markerId,
+            threadId,
+            sample:
+              context && !context.stopped
+                ? { state: "present", threadId, session: { ...context.session } }
+                : { state: "absent", threadId },
+            acknowledged,
+          });
+        }),
+      );
+
     const stopAll: GrokAdapterShape["stopAll"] = () =>
       Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true });
 
@@ -1442,7 +1465,8 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       ),
     );
 
-    const streamEvents = Stream.fromPubSub(runtimeEventPubSub);
+    const streamOutput = Stream.fromPubSub(runtimeEventPubSub);
+    const streamEvents = streamOutput.pipe(Stream.filter(isProviderRuntimeEvent));
 
     return {
       provider: PROVIDER,
@@ -1457,8 +1481,10 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       stopSession,
       listSessions,
       hasSession,
+      requestLivenessSample,
       stopAll,
       streamEvents,
+      streamOutput,
     } satisfies GrokAdapterShape;
   });
 }

@@ -50,6 +50,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
+import { isProviderRuntimeEvent, type ProviderAdapterOutput } from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
@@ -1371,7 +1372,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       : undefined);
   const managedNativeEventLogger =
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
-  const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
+  const runtimeEventQueue = yield* Queue.unbounded<ProviderAdapterOutput>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
 
   const startSession: CodexAdapterShape["startSession"] = (input) =>
@@ -1685,6 +1686,23 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const hasSession: CodexAdapterShape["hasSession"] = (threadId) =>
     Effect.succeed(Boolean(sessions.get(threadId) && !sessions.get(threadId)?.stopped));
 
+  const requestLivenessSample: CodexAdapterShape["requestLivenessSample"] = (
+    threadId,
+    markerId,
+    acknowledged,
+  ) =>
+    Effect.gen(function* () {
+      const context = sessions.get(threadId);
+      const session = context && !context.stopped ? yield* context.runtime.getSession : undefined;
+      yield* Queue.offer(runtimeEventQueue, {
+        _tag: "ProviderLivenessMarker",
+        markerId,
+        threadId,
+        sample: session ? { state: "present", threadId, session } : { state: "absent", threadId },
+        acknowledged,
+      });
+    });
+
   const stopAll: CodexAdapterShape["stopAll"] = () =>
     Effect.forEach(Array.from(sessions.values()), stopSessionInternal, {
       concurrency: 1,
@@ -1714,8 +1732,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     stopSession,
     listSessions,
     hasSession,
+    requestLivenessSample,
     stopAll,
     get streamEvents() {
+      return Stream.fromQueue(runtimeEventQueue).pipe(Stream.filter(isProviderRuntimeEvent));
+    },
+    get streamOutput() {
       return Stream.fromQueue(runtimeEventQueue);
     },
   } satisfies CodexAdapterShape;

@@ -75,6 +75,7 @@ import {
   extractTodosAsPlan,
 } from "../acp/CursorAcpExtension.ts";
 import { type CursorAdapterShape } from "../Services/CursorAdapter.ts";
+import { isProviderRuntimeEvent, type ProviderAdapterOutput } from "../Services/ProviderAdapter.ts";
 import { resolveCursorAcpBaseModelId } from "./CursorProvider.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.UnknownFromJsonString);
@@ -334,7 +335,7 @@ export function makeCursorAdapter(
 
     const sessions = new Map<ThreadId, CursorSessionContext>();
     const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
-    const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+    const runtimeEventPubSub = yield* PubSub.unbounded<ProviderAdapterOutput>();
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(
@@ -1147,6 +1148,28 @@ export function makeCursorAdapter(
         return c !== undefined && !c.stopped;
       });
 
+    const requestLivenessSample: CursorAdapterShape["requestLivenessSample"] = (
+      threadId,
+      markerId,
+      acknowledged,
+    ) =>
+      withThreadLock(
+        threadId,
+        Effect.gen(function* () {
+          const context = sessions.get(threadId);
+          yield* PubSub.publish(runtimeEventPubSub, {
+            _tag: "ProviderLivenessMarker",
+            markerId,
+            threadId,
+            sample:
+              context && !context.stopped
+                ? { state: "present", threadId, session: { ...context.session } }
+                : { state: "absent", threadId },
+            acknowledged,
+          });
+        }),
+      );
+
     const stopAll: CursorAdapterShape["stopAll"] = () =>
       Effect.forEach(sessions.values(), stopSessionInternal, { discard: true });
 
@@ -1160,7 +1183,8 @@ export function makeCursorAdapter(
       ),
     );
 
-    const streamEvents = Stream.fromPubSub(runtimeEventPubSub);
+    const streamOutput = Stream.fromPubSub(runtimeEventPubSub);
+    const streamEvents = streamOutput.pipe(Stream.filter(isProviderRuntimeEvent));
 
     return {
       provider: PROVIDER,
@@ -1175,8 +1199,10 @@ export function makeCursorAdapter(
       stopSession,
       listSessions,
       hasSession,
+      requestLivenessSample,
       stopAll,
       streamEvents,
+      streamOutput,
     } satisfies CursorAdapterShape;
   });
 }

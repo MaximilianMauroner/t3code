@@ -1,18 +1,15 @@
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
-import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+
+const processServerBootId = `${process.pid}-${Date.now()}-${performance.timeOrigin}`;
 
 /** One opaque identity shared by all process-owned runtime bindings and deliveries. */
 export class ServerBootIdentity extends Context.Service<
   ServerBootIdentity,
   { readonly id: string }
->()("t3/server/ServerBootIdentity") {
-  static readonly layer = Layer.effect(
+>()("t3/serverBootId/ServerBootIdentity") {
+  static readonly layer = Layer.succeed(
     ServerBootIdentity,
-    Effect.gen(function* () {
-      const crypto = yield* Crypto.Crypto;
-      return ServerBootIdentity.of({ id: yield* crypto.randomUUIDv4 });
-    }),
+    ServerBootIdentity.of({ id: processServerBootId }),
   );
 }

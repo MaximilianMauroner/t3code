@@ -23,6 +23,7 @@ import { createModelSelection } from "@t3tools/shared/model";
 import { it, assert, vi } from "@effect/vitest";
 
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -42,7 +43,13 @@ import {
   ProviderValidationError,
   type ProviderAdapterError,
 } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import {
+  isProviderLivenessMarker,
+  isProviderRuntimeEvent,
+  type ProviderAdapterOutput,
+  type ProviderAdapterShape,
+  type ProviderLivenessMarker,
+} from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -86,7 +93,7 @@ type LegacyProviderRuntimeEvent = {
 
 function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   const sessions = new Map<ThreadId, ProviderSession>();
-  const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+  const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderAdapterOutput>());
 
   const startSession = vi.fn((input: ProviderSessionStartInput) =>
     Effect.sync(() => {
@@ -168,6 +175,22 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     (threadId: ThreadId): Effect.Effect<boolean> => Effect.succeed(sessions.has(threadId)),
   );
 
+  const requestLivenessSample: NonNullable<
+    ProviderAdapterShape<ProviderAdapterError>["requestLivenessSample"]
+  > = (threadId, markerId, acknowledged) =>
+    PubSub.publish(runtimeEventPubSub, {
+      _tag: "ProviderLivenessMarker",
+      markerId,
+      threadId,
+      sample: (() => {
+        const session = sessions.get(threadId);
+        return session
+          ? { state: "present" as const, threadId, session }
+          : { state: "absent" as const, threadId };
+      })(),
+      acknowledged,
+    }).pipe(Effect.asVoid);
+
   const readThread = vi.fn(
     (
       threadId: ThreadId,
@@ -212,10 +235,14 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     stopSession,
     listSessions,
     hasSession,
+    requestLivenessSample,
     readThread,
     rollbackThread,
     stopAll,
     get streamEvents() {
+      return Stream.fromPubSub(runtimeEventPubSub).pipe(Stream.filter(isProviderRuntimeEvent));
+    },
+    get streamOutput() {
       return Stream.fromPubSub(runtimeEventPubSub);
     },
   };
@@ -247,6 +274,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     stopSession,
     listSessions,
     hasSession,
+    requestLivenessSample,
     readThread,
     rollbackThread,
     stopAll,
@@ -841,6 +869,68 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("keeps overlapping start tokens independent across cancellation", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-overlapping-starts");
+      const firstEntered = yield* Deferred.make<void>();
+      const secondEntered = yield* Deferred.make<void>();
+      const never = yield* Deferred.make<ProviderSession>();
+      routing.codex.startSession.mockImplementationOnce(() =>
+        Deferred.succeed(firstEntered, undefined).pipe(Effect.andThen(Deferred.await(never))),
+      );
+      routing.codex.startSession.mockImplementationOnce(() =>
+        Deferred.succeed(secondEntered, undefined).pipe(Effect.andThen(Deferred.await(never))),
+      );
+      const first = yield* provider
+        .startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(firstEntered);
+      const second = yield* provider
+        .startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(secondEntered);
+      const inspectTarget = provider.inspectTarget;
+      assert.notEqual(inspectTarget, undefined);
+      if (inspectTarget === undefined) return;
+      assert.deepEqual(yield* inspectTarget({ providerInstanceId: codexInstanceId, threadId }), {
+        state: "unknown",
+        reason: "start-in-flight",
+      });
+      yield* Fiber.interrupt(first);
+      assert.deepEqual(yield* inspectTarget({ providerInstanceId: codexInstanceId, threadId }), {
+        state: "unknown",
+        reason: "start-in-flight",
+      });
+      yield* Fiber.interrupt(second);
+
+      const ingestion = provider.streamIngestion;
+      assert.notEqual(ingestion, undefined);
+      if (ingestion === undefined) return;
+      const consumer = yield* Stream.runForEach(ingestion, (output) =>
+        isProviderLivenessMarker(output)
+          ? Deferred.succeed(output.acknowledged, output.sample).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.deepEqual(yield* inspectTarget({ providerInstanceId: codexInstanceId, threadId }), {
+        state: "absent",
+        threadId,
+      });
+      yield* Fiber.interrupt(consumer);
+    }),
+  );
+
   it.effect("routes provider operations and rollback conversation", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -1490,6 +1580,38 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
 const fanout = makeProviderServiceLayer();
 fanout.layer("ProviderServiceLive fanout", (it) => {
+  it.effect("does not complete a liveness sample before ingestion acknowledges its marker", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-liveness-barrier");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const markerSeen = yield* Deferred.make<ProviderLivenessMarker>();
+      const ingestion = provider.streamIngestion;
+      assert.notEqual(ingestion, undefined);
+      if (ingestion === undefined || provider.inspectTarget === undefined) return;
+      const consumer = yield* Stream.runForEach(ingestion, (output) =>
+        isProviderLivenessMarker(output)
+          ? Deferred.succeed(markerSeen, output).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      const inspection = yield* provider
+        .inspectTarget({ providerInstanceId: codexInstanceId, threadId })
+        .pipe(Effect.forkChild);
+      const marker = yield* Deferred.await(markerSeen);
+      assert.equal(inspection.pollUnsafe(), undefined);
+      yield* Deferred.succeed(marker.acknowledged, marker.sample);
+      const sample = yield* Fiber.join(inspection);
+      assert.equal(sample.state, "present");
+      yield* Fiber.interrupt(consumer);
+    }),
+  );
+
   it.effect("fans out adapter turn completion events", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

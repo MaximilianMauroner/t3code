@@ -21,6 +21,7 @@ import type {
   TurnId,
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
+import type * as Deferred from "effect/Deferred";
 import type * as Stream from "effect/Stream";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
@@ -40,6 +41,33 @@ export interface ProviderThreadTurnSnapshot {
 export interface ProviderThreadSnapshot {
   readonly threadId: ThreadId;
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
+}
+
+export type ProviderLivenessSample =
+  | { readonly state: "absent"; readonly threadId: ThreadId }
+  | { readonly state: "present"; readonly threadId: ThreadId; readonly session: ProviderSession };
+
+/** Internal ordering marker. It is never exposed on the provider wire protocol. */
+export interface ProviderLivenessMarker {
+  readonly _tag: "ProviderLivenessMarker";
+  readonly markerId: string;
+  readonly threadId: ThreadId;
+  readonly sample: ProviderLivenessSample;
+  readonly acknowledged: Deferred.Deferred<ProviderLivenessSample>;
+}
+
+export type ProviderAdapterOutput = ProviderRuntimeEvent | ProviderLivenessMarker;
+
+export function isProviderLivenessMarker(
+  output: ProviderAdapterOutput,
+): output is ProviderLivenessMarker {
+  return "_tag" in output && output._tag === "ProviderLivenessMarker";
+}
+
+export function isProviderRuntimeEvent(
+  output: ProviderAdapterOutput,
+): output is ProviderRuntimeEvent {
+  return !isProviderLivenessMarker(output);
 }
 
 export interface ProviderAdapterShape<TError> {
@@ -102,6 +130,16 @@ export interface ProviderAdapterShape<TError> {
   readonly hasSession: (threadId: ThreadId) => Effect.Effect<boolean>;
 
   /**
+   * Samples one target and appends the supplied marker after all lifecycle
+   * events preceding that sample on the adapter's ordered output channel.
+   */
+  readonly requestLivenessSample?: (
+    threadId: ThreadId,
+    markerId: string,
+    acknowledged: Deferred.Deferred<ProviderLivenessSample>,
+  ) => Effect.Effect<void>;
+
+  /**
    * Read a provider thread snapshot.
    */
   readonly readThread: (threadId: ThreadId) => Effect.Effect<ProviderThreadSnapshot, TError>;
@@ -123,4 +161,7 @@ export interface ProviderAdapterShape<TError> {
    * Canonical runtime event stream emitted by this adapter.
    */
   readonly streamEvents: Stream.Stream<ProviderRuntimeEvent>;
+
+  /** Internal ordered output including liveness barriers. */
+  readonly streamOutput?: Stream.Stream<ProviderAdapterOutput>;
 }

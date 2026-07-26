@@ -21,13 +21,20 @@ import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as Duration from "effect/Duration";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import {
+  isProviderLivenessMarker,
+  type ProviderLivenessMarker,
+} from "../../provider/Services/ProviderAdapter.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { isGitRepository } from "../../git/Utils.ts";
@@ -107,6 +114,10 @@ type RuntimeIngestionInput =
   | {
       source: "domain";
       event: TurnStartRequestedDomainEvent;
+    }
+  | {
+      source: "marker";
+      marker: ProviderLivenessMarker;
     };
 
 function toTurnId(value: TurnId | string | undefined): TurnId | undefined {
@@ -1782,8 +1793,16 @@ const make = Effect.gen(function* () {
 
   const processDomainEvent = (_event: TurnStartRequestedDomainEvent) => Effect.void;
 
-  const processInput = (input: RuntimeIngestionInput) =>
-    input.source === "runtime" ? processRuntimeEvent(input.event) : processDomainEvent(input.event);
+  const processInput = (input: RuntimeIngestionInput) => {
+    switch (input.source) {
+      case "runtime":
+        return processRuntimeEvent(input.event);
+      case "domain":
+        return processDomainEvent(input.event);
+      case "marker":
+        return Deferred.succeed(input.marker.acknowledged, input.marker.sample).pipe(Effect.asVoid);
+    }
+  };
 
   const processInputSafely = (input: RuntimeIngestionInput) =>
     processInput(input).pipe(
@@ -1793,22 +1812,30 @@ const make = Effect.gen(function* () {
         }
         return Effect.logWarning("provider runtime ingestion failed to process event", {
           source: input.source,
-          eventId: input.event.eventId,
-          eventType: input.event.type,
+          eventId: input.source === "marker" ? input.marker.markerId : input.event.eventId,
+          eventType: input.source === "marker" ? "provider.liveness-marker" : input.event.type,
           cause: Cause.pretty(cause),
         });
       }),
     );
 
   const worker = yield* makeDrainableWorker(processInputSafely);
+  const providerIngressFiber = yield* Ref.make<Option.Option<Fiber.Fiber<void, never>>>(
+    Option.none(),
+  );
 
   const start: ProviderRuntimeIngestionShape["start"] = () =>
     Effect.gen(function* () {
-      yield* Effect.forkScoped(
-        Stream.runForEach(providerService.streamEvents, (event) =>
-          worker.enqueue({ source: "runtime", event }),
+      const ingressFiber = yield* Effect.forkScoped(
+        Stream.runForEach(
+          providerService.streamIngestion ?? providerService.streamEvents,
+          (output) =>
+            isProviderLivenessMarker(output)
+              ? worker.enqueue({ source: "marker", marker: output })
+              : worker.enqueue({ source: "runtime", event: output }),
         ),
       );
+      yield* Ref.set(providerIngressFiber, Option.some(ingressFiber));
       yield* Effect.forkScoped(
         Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
           if (event.type !== "thread.turn-start-requested") {
@@ -1822,6 +1849,15 @@ const make = Effect.gen(function* () {
   return {
     start,
     drain: worker.drain,
+    closeProviderIngress: Ref.get(providerIngressFiber).pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () => Effect.void,
+          onSome: Fiber.interrupt,
+        }),
+      ),
+      Effect.asVoid,
+    ),
   } satisfies ProviderRuntimeIngestionShape;
 });
 

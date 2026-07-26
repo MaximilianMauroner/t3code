@@ -38,6 +38,7 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { type OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
+import { isProviderRuntimeEvent, type ProviderAdapterOutput } from "../Services/ProviderAdapter.ts";
 import {
   buildOpenCodePermissionRules,
   OpenCodeRuntime,
@@ -584,7 +585,7 @@ export function makeOpenCodeAdapter(
     // `options.nativeEventLogger`, they own its lifecycle.
     const managedNativeEventLogger =
       options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
-    const runtimeEvents = yield* Queue.unbounded<ProviderRuntimeEvent>();
+    const runtimeEvents = yield* Queue.unbounded<ProviderAdapterOutput>();
     const sessions = new Map<ThreadId, OpenCodeSessionContext>();
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(
       Effect.mapError(
@@ -1631,6 +1632,24 @@ export function makeOpenCodeAdapter(
     const hasSession: OpenCodeAdapterShape["hasSession"] = (threadId) =>
       Effect.sync(() => sessions.has(threadId));
 
+    const requestLivenessSample: OpenCodeAdapterShape["requestLivenessSample"] = (
+      threadId,
+      markerId,
+      acknowledged,
+    ) =>
+      Queue.offer(runtimeEvents, {
+        _tag: "ProviderLivenessMarker",
+        markerId,
+        threadId,
+        sample: (() => {
+          const context = sessions.get(threadId);
+          return context
+            ? { state: "present" as const, threadId, session: { ...context.session } }
+            : { state: "absent" as const, threadId };
+        })(),
+        acknowledged,
+      }).pipe(Effect.asVoid);
+
     const readThread: OpenCodeAdapterShape["readThread"] = Effect.fn("readThread")(
       function* (threadId) {
         const context = yield* ensureSessionContext(sessions, threadId);
@@ -1710,10 +1729,14 @@ export function makeOpenCodeAdapter(
       stopSession,
       listSessions,
       hasSession,
+      requestLivenessSample,
       readThread,
       rollbackThread,
       stopAll,
       get streamEvents() {
+        return Stream.fromQueue(runtimeEvents).pipe(Stream.filter(isProviderRuntimeEvent));
+      },
+      get streamOutput() {
         return Stream.fromQueue(runtimeEvents);
       },
     } satisfies OpenCodeAdapterShape;
