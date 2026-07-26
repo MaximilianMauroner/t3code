@@ -519,6 +519,77 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("holds a bootstrap reservation across admission close until enqueue or cancellation", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-bootstrap-reservation");
+    const threadId = ThreadId.make("thread-bootstrap-reservation");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-bootstrap-reservation-project"),
+        projectId,
+        title: "Bootstrap reservation",
+        workspaceRoot: "/tmp/project-bootstrap-reservation",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-bootstrap-reservation-thread"),
+        threadId,
+        projectId,
+        title: "Bootstrap reservation",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+
+    const reservation = await system.run(system.engine.reserveExternalHotAdmission);
+    await system.run(system.engine.closeExternalAdmission);
+    await expect(system.run(system.engine.reserveExternalHotAdmission)).rejects.toMatchObject({
+      _tag: "orchestration_not_ready",
+      phase: "quiescing",
+    });
+    const barrierFiber = await system.run(
+      system.engine.barrier.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    expect(barrierFiber.pollUnsafe()).toBeUndefined();
+
+    const dispatched = await system.run(
+      reservation.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-bootstrap-reservation-start"),
+        threadId,
+        message: {
+          messageId: asMessageId("msg-bootstrap-reservation"),
+          role: "user",
+          text: "hello",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: now(),
+      }),
+    );
+    expect((await system.run(Fiber.join(barrierFiber))).sequence).toBe(dispatched.sequence);
+
+    await system.run(system.engine.openExternalAdmission);
+    const cancelledReservation = await system.run(system.engine.reserveExternalHotAdmission);
+    await system.run(system.engine.closeExternalAdmission);
+    const cancelledBarrier = await system.run(
+      system.engine.barrier.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    expect(cancelledBarrier.pollUnsafe()).toBeUndefined();
+    await system.run(cancelledReservation.cancel);
+    await system.run(Fiber.join(cancelledBarrier));
+    await system.dispose();
+  });
+
   it("forced sealing retains committed delivery work without publishing after the seal", async () => {
     const projectionEntered = Deferred.makeUnsafe<void>();
     const allowProjection = Deferred.makeUnsafe<void>();

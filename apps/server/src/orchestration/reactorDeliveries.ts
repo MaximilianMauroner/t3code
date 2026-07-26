@@ -73,7 +73,10 @@ function deliveryDescriptor(event: OrchestrationEvent): {
       return {
         reactor: "checkpoint",
         kind: "checkpoint-revert",
-        replayPolicy: "replay-idempotent",
+        // Provider rollback has no idempotency key. If execution becomes
+        // uncertain, recovery records evidence and cancels instead of risking
+        // a second external rollback.
+        replayPolicy: "cancel-with-recovery",
       };
     case "thread.session-stop-requested":
       return {

@@ -12,6 +12,8 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -224,7 +226,7 @@ describe("OrchestrationDeliveryRuntime", () => {
           Effect.as("delivered" as const),
         ),
       );
-      const first = deliveryFor(checkpointEvent(1, "event-1"), "prior-boot");
+      const first = deliveryFor(checkpointEvent(1, "event-1"), "current-boot");
       const second = deliveryFor(sessionStopEvent(2, "event-2"), "prior-boot");
       const readiness = yield* Effect.gen(function* () {
         const repository = yield* OrchestrationReactorDeliveries;
@@ -300,6 +302,88 @@ describe("OrchestrationDeliveryRuntime", () => {
       }),
   );
 
+  effectIt.effect("waits through bounded startup retries without overtaking a predecessor", () =>
+    Effect.gen(function* () {
+      const observed: string[] = [];
+      let poisonAttempts = 0;
+      const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>((delivery) =>
+        Effect.sync(() => {
+          observed.push(delivery.deliveryId);
+          if (delivery.sourceSequence === 1 && poisonAttempts++ < 2) {
+            throw new Error("transient startup failure");
+          }
+          return "delivered" as const;
+        }),
+      );
+      const predecessor = deliveryFor(sessionStopEvent(1, "startup-retry"), "prior-boot");
+      const follower = deliveryFor(sessionStopEvent(2, "startup-follower"), "prior-boot");
+
+      const readiness = yield* Effect.gen(function* () {
+        const repository = yield* OrchestrationReactorDeliveries;
+        const runtime = yield* OrchestrationDeliveryRuntime;
+        yield* repository.insert(predecessor);
+        yield* repository.insert(follower);
+        const recovery = yield* runtime.recoverStartup.pipe(Effect.forkChild);
+        yield* TestClock.adjust("1 second");
+        yield* TestClock.adjust("5 seconds");
+        yield* Fiber.join(recovery);
+        return yield* runtime.inspectReadiness;
+      }).pipe(Effect.provide(createLayer({ providerDeliver })));
+
+      expect(observed).toEqual([
+        predecessor.deliveryId,
+        predecessor.deliveryId,
+        predecessor.deliveryId,
+        follower.deliveryId,
+      ]);
+      expect(readiness.counts.total).toBe(0);
+    }),
+  );
+
+  effectIt.effect("keeps startup closed when a poison delivery exhausts its retry budget", () =>
+    Effect.gen(function* () {
+      const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+        Effect.fail("poison"),
+      );
+      const delivery = deliveryFor(sessionStopEvent(1, "startup-poison"), "prior-boot");
+      const exit = yield* Effect.gen(function* () {
+        const repository = yield* OrchestrationReactorDeliveries;
+        const runtime = yield* OrchestrationDeliveryRuntime;
+        yield* repository.insert(delivery);
+        const recovery = yield* runtime.recoverStartup.pipe(Effect.forkChild);
+        yield* TestClock.adjust("1 second");
+        yield* TestClock.adjust("5 seconds");
+        return yield* Effect.exit(Fiber.join(recovery));
+      }).pipe(Effect.provide(createLayer({ providerDeliver })));
+
+      expect(exit._tag).toBe("Failure");
+      expect(providerDeliver).toHaveBeenCalledTimes(3);
+    }),
+  );
+
+  effectIt.effect("fails closed when the next retry exceeds the startup time budget", () =>
+    Effect.gen(function* () {
+      const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+        Effect.succeed("delivered" as const),
+      );
+      const base = deliveryFor(sessionStopEvent(1, "startup-budget"), "prior-boot");
+      const currentTime = yield* DateTime.now;
+      const delayed = decodeNewDelivery({
+        ...base,
+        nextAttemptAt: DateTime.formatIso(DateTime.add(currentTime, { minutes: 1 })),
+      });
+      const exit = yield* Effect.gen(function* () {
+        const repository = yield* OrchestrationReactorDeliveries;
+        const runtime = yield* OrchestrationDeliveryRuntime;
+        yield* repository.insert(delayed);
+        return yield* Effect.exit(runtime.recoverStartup);
+      }).pipe(Effect.provide(createLayer({ providerDeliver })));
+
+      expect(exit._tag).toBe("Failure");
+      expect(providerDeliver).not.toHaveBeenCalled();
+    }),
+  );
+
   effectIt.effect("cancels a prior-boot absent-session start with the exact pending target", () =>
     Effect.gen(function* () {
       const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
@@ -338,6 +422,72 @@ describe("OrchestrationDeliveryRuntime", () => {
           }),
         }),
       );
+      expect(status).toBe("cancelled");
+    }),
+  );
+
+  effectIt.effect(
+    "never replays an uncertain checkpoint rollback after restart and persists evidence",
+    () =>
+      Effect.gen(function* () {
+        const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+          Effect.succeed("delivered" as const),
+        );
+        const checkpointDeliver = vi.fn<CheckpointReactor["Service"]["deliver"]>(() =>
+          Effect.succeed("delivered" as const),
+        );
+        const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
+          () => Effect.succeed({ sequence: 2 }),
+        );
+        const delivery = deliveryFor(checkpointEvent(1, "checkpoint-crash"), "prior-boot");
+        const status = yield* Effect.gen(function* () {
+          const repository = yield* OrchestrationReactorDeliveries;
+          const runtime = yield* OrchestrationDeliveryRuntime;
+          yield* repository.insert(delivery);
+          yield* runtime.drain;
+          yield* runtime.drain;
+          return Option.getOrThrow(yield* repository.getById(delivery.deliveryId)).status;
+        }).pipe(
+          Effect.provide(createLayer({ providerDeliver, checkpointDeliver, dispatchInternal })),
+        );
+
+        expect(checkpointDeliver).not.toHaveBeenCalled();
+        expect(dispatchInternal).toHaveBeenCalledTimes(1);
+        expect(dispatchInternal).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "thread.activity.append",
+            commandId: CommandId.make(`delivery:${delivery.deliveryId}:recovery-evidence`),
+          }),
+        );
+        expect(status).toBe("cancelled");
+      }),
+  );
+
+  effectIt.effect("does not retry checkpoint rollback after an uncertain same-boot failure", () =>
+    Effect.gen(function* () {
+      const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+        Effect.succeed("delivered" as const),
+      );
+      const checkpointDeliver = vi.fn<CheckpointReactor["Service"]["deliver"]>(() =>
+        Effect.fail("crashed after provider rollback"),
+      );
+      const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
+        () => Effect.succeed({ sequence: 2 }),
+      );
+      const delivery = deliveryFor(checkpointEvent(1, "checkpoint-uncertain"), "current-boot");
+      const status = yield* Effect.gen(function* () {
+        const repository = yield* OrchestrationReactorDeliveries;
+        const runtime = yield* OrchestrationDeliveryRuntime;
+        yield* repository.insert(delivery);
+        yield* runtime.drain;
+        yield* TestClock.adjust("1 hour");
+        yield* runtime.drain;
+        return Option.getOrThrow(yield* repository.getById(delivery.deliveryId)).status;
+      }).pipe(
+        Effect.provide(createLayer({ providerDeliver, checkpointDeliver, dispatchInternal })),
+      );
+
+      expect(checkpointDeliver).toHaveBeenCalledTimes(1);
       expect(status).toBe("cancelled");
     }),
   );

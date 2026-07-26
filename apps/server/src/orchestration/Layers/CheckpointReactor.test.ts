@@ -66,6 +66,7 @@ import * as Schema from "effect/Schema";
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
 const decodeReactorDelivery = Schema.decodeUnknownSync(OrchestrationReactorDelivery);
+const decodeProviderRuntimeEvent = Schema.decodeUnknownSync(ProviderRuntimeEvent);
 
 function claimedDeliveryForEvent(event: OrchestrationEvent) {
   const planned = planReactorDelivery(event, "checkpoint-reactor-test");
@@ -84,19 +85,6 @@ function claimedDeliveryForEvent(event: OrchestrationEvent) {
     deadLetteredAt: null,
   });
 }
-
-type LegacyProviderRuntimeEvent = {
-  readonly type: string;
-  readonly eventId: EventId;
-  readonly provider: ProviderDriverKind;
-  readonly createdAt: string;
-  readonly threadId: ThreadId;
-  readonly turnId?: string | undefined;
-  readonly itemId?: string | undefined;
-  readonly requestId?: string | undefined;
-  readonly payload?: unknown | undefined;
-  readonly [key: string]: unknown;
-};
 
 function createProviderServiceHarness(
   cwd: string,
@@ -152,8 +140,8 @@ function createProviderServiceHarness(
     },
   };
 
-  const emit = (event: LegacyProviderRuntimeEvent): void => {
-    Effect.runSync(PubSub.publish(runtimeEventPubSub, event as unknown as ProviderRuntimeEvent));
+  const emit = (event: unknown): void => {
+    Effect.runSync(PubSub.publish(runtimeEventPubSub, decodeProviderRuntimeEvent(event)));
   };
 
   return {
@@ -387,7 +375,7 @@ describe("CheckpointReactor", () => {
                 onSome: (event) => {
                   const delivery = claimedDeliveryForEvent(event);
                   return delivery?.deliveryKind === "checkpoint-revert"
-                    ? reactor.deliver(delivery).pipe(Effect.as(result))
+                    ? reactor.deliver(delivery).pipe(Effect.orDie, Effect.as(result))
                     : Effect.succeed(result);
                 },
               }),
@@ -493,6 +481,7 @@ describe("CheckpointReactor", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       threadId: ThreadId.make("thread-1"),
       turnId: asTurnId("turn-1"),
+      payload: {},
     });
     await waitForGitRefExists(
       harness.cwd,
@@ -591,6 +580,7 @@ describe("CheckpointReactor", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       threadId: ThreadId.make("thread-1"),
       turnId: asTurnId("turn-main"),
+      payload: {},
     });
     await waitForGitRefExists(
       harness.cwd,
@@ -665,6 +655,7 @@ describe("CheckpointReactor", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       threadId: ThreadId.make("thread-1"),
       turnId: asTurnId("turn-claude-1"),
+      payload: {},
     });
     await waitForGitRefExists(
       harness.cwd,
@@ -829,48 +820,6 @@ describe("CheckpointReactor", () => {
     ).toBe("v2\n");
   });
 
-  it("ignores non-v2 checkpoint.captured runtime events", async () => {
-    const harness = await createHarness();
-    const createdAt = "2026-01-01T00:00:00.000Z";
-
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-checkpoint-captured"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
-          threadId: ThreadId.make("thread-1"),
-          status: "ready",
-          providerName: "codex",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: createdAt,
-        },
-        createdAt,
-      }),
-    );
-
-    harness.provider.emit({
-      type: "checkpoint.captured",
-      eventId: EventId.make("evt-checkpoint-captured-3"),
-      provider: ProviderDriverKind.make("codex"),
-
-      createdAt: "2026-01-01T00:00:00.000Z",
-      threadId: ThreadId.make("thread-1"),
-      turnId: asTurnId("turn-3"),
-      turnCount: 3,
-      status: "completed",
-    });
-
-    await harness.drain();
-    const readModel = await harness.readModel();
-    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
-    expect(thread?.checkpoints.some((checkpoint) => checkpoint.checkpointTurnCount === 3)).toBe(
-      false,
-    );
-  });
-
   it("continues processing runtime events after a single checkpoint runtime failure", async () => {
     const nonRepositorySessionCwd = NodeFS.mkdtempSync(
       NodePath.join(NodeOS.tmpdir(), "t3-checkpoint-runtime-non-repo-"),
@@ -920,6 +869,7 @@ describe("CheckpointReactor", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       threadId: ThreadId.make("thread-1"),
       turnId: asTurnId("turn-after-runtime-failure"),
+      payload: {},
     });
 
     await waitForGitRefExists(

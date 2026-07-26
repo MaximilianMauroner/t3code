@@ -689,6 +689,13 @@ const buildAppUnderTest = (options?: {
             options?.layers?.orchestrationEngine?.dispatchExternal?.(command) ??
             options?.layers?.orchestrationEngine?.dispatch?.(command) ??
             Effect.succeed({ sequence: 0 }),
+          reserveExternalHotAdmission: Effect.succeed({
+            dispatch: (command) =>
+              options?.layers?.orchestrationEngine?.dispatchExternal?.(command) ??
+              options?.layers?.orchestrationEngine?.dispatch?.(command) ??
+              Effect.succeed({ sequence: 0 }),
+            cancel: Effect.void,
+          }),
           streamDomainEvents: Stream.empty,
           latestSequence: Effect.succeed(0),
           ...options?.layers?.orchestrationEngine,
@@ -6792,6 +6799,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               cwd: "/tmp/bootstrap-worktree",
             }),
         );
+        const dispatchCommand = (command: OrchestrationCommand) =>
+          Effect.sync(() => {
+            dispatchedCommands.push(command);
+            return { sequence: dispatchedCommands.length };
+          });
 
         yield* buildAppUnderTest({
           layers: {
@@ -6804,11 +6816,16 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               refreshStatus,
             },
             orchestrationEngine: {
-              dispatch: (command) =>
-                Effect.sync(() => {
-                  dispatchedCommands.push(command);
-                  return { sequence: dispatchedCommands.length };
-                }),
+              dispatch: dispatchCommand,
+              reserveExternalHotAdmission: Effect.sync(() => {
+                bootstrapGitOperations.push("reserve-admission");
+                return {
+                  dispatch: dispatchCommand,
+                  cancel: Effect.sync(() => {
+                    bootstrapGitOperations.push("release-admission");
+                  }),
+                };
+              }),
               readEvents: () => Stream.empty,
             },
             projectSetupScriptRunner: {
@@ -6886,9 +6903,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           fallbackRemoteName: "origin",
         });
         assert.deepEqual(bootstrapGitOperations, [
+          "reserve-admission",
           "fetch",
           "resolve-remote-commit",
           "create-worktree",
+          "release-admission",
         ]);
         assert.deepEqual(runForThread.mock.calls[0]?.[0], {
           threadId: ThreadId.make("thread-bootstrap"),

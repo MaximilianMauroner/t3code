@@ -27,6 +27,7 @@ const UpdatedDelivery = Schema.Struct({ deliveryId: Schema.String });
 const ClaimInput = Schema.Struct({
   deliveryId: Schema.String,
   claimToken: TrimmedNonEmptyString,
+  currentBootId: TrimmedNonEmptyString,
   claimedAt: IsoDateTime,
   leaseExpiresAt: IsoDateTime,
   reactor: Schema.NullOr(Schema.String),
@@ -149,7 +150,7 @@ const make = Effect.gen(function* () {
   const claimRow = SqlSchema.findOneOption({
     Request: ClaimInput,
     Result: DeliveryDbRow,
-    execute: ({ deliveryId, claimToken, claimedAt, leaseExpiresAt, reactor }) =>
+    execute: ({ deliveryId, claimToken, currentBootId, claimedAt, leaseExpiresAt, reactor }) =>
       sql.unsafe(
         `UPDATE orchestration_reactor_deliveries
          SET status = 'delivering', claim_token = ?, claimed_at = ?, lease_expires_at = ?,
@@ -163,10 +164,21 @@ const make = Effect.gen(function* () {
            )
            AND (
              (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
-             OR (status = 'delivering' AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
+             OR (status = 'delivering' AND (
+               source_boot_id <> ? OR lease_expires_at IS NULL OR lease_expires_at <= ?
+             ))
            )
          RETURNING ${selectFields}`,
-        [claimToken, claimedAt, leaseExpiresAt, deliveryId, reactor, claimedAt, claimedAt],
+        [
+          claimToken,
+          claimedAt,
+          leaseExpiresAt,
+          deliveryId,
+          reactor,
+          claimedAt,
+          currentBootId,
+          claimedAt,
+        ],
       ),
   });
   const updateDelivered = SqlSchema.findOneOption({
@@ -275,6 +287,7 @@ const make = Effect.gen(function* () {
                 if (next.status === "dead-letter") return Effect.succeed(Option.none());
                 if (
                   next.status === "delivering" &&
+                  next.sourceBootId === input.currentBootId &&
                   next.leaseExpiresAt !== null &&
                   next.leaseExpiresAt > input.claimedAt
                 ) {

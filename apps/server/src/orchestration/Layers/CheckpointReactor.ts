@@ -612,6 +612,7 @@ const make = Effect.gen(function* () {
 
   const handleRevertRequested = Effect.fn("handleRevertRequested")(function* (
     event: Extract<OrchestrationEvent, { type: "thread.checkpoint-revert-requested" }>,
+    completionCommandId?: CommandId,
   ) {
     const now = DateTime.formatIso(yield* DateTime.now);
 
@@ -722,7 +723,7 @@ const make = Effect.gen(function* () {
     yield* orchestrationEngine
       .dispatch({
         type: "thread.revert.complete",
-        commandId: yield* serverCommandId("checkpoint-revert-complete"),
+        commandId: completionCommandId ?? (yield* serverCommandId("checkpoint-revert-complete")),
         threadId: event.payload.threadId,
         turnCount: event.payload.turnCount,
         createdAt: now,
@@ -845,7 +846,10 @@ const make = Effect.gen(function* () {
     if (event.type !== "thread.checkpoint-revert-requested") {
       return yield* Effect.die(`checkpoint-revert delivery contains ${event.type}`);
     }
-    yield* handleRevertRequested(event);
+    yield* handleRevertRequested(
+      event,
+      CommandId.make(`delivery:${delivery.deliveryId}:checkpoint-revert-complete`),
+    );
     return "delivered" as const;
   });
 

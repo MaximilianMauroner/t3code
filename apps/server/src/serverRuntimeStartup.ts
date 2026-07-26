@@ -475,13 +475,7 @@ export const make = Effect.gen(function* () {
           );
         }
         yield* deliveryRuntime.start().pipe(Scope.provide(reactorScope));
-        yield* deliveryRuntime.drain;
-        const readiness = yield* deliveryRuntime.inspectReadiness;
-        if (readiness.counts.total > 0) {
-          return yield* Effect.die(
-            `orchestration delivery recovery blocked by ${readiness.counts.total} unresolved row(s)`,
-          );
-        }
+        yield* deliveryRuntime.recoverStartup;
       }),
     );
 

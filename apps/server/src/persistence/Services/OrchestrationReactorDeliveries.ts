@@ -63,6 +63,8 @@ export type NewOrchestrationReactorDelivery = typeof NewOrchestrationReactorDeli
 
 export interface OrchestrationReactorDeliveryClaimInput {
   readonly claimToken: string;
+  /** The boot taking the claim. Prior-boot claims are never allowed to retain a lease. */
+  readonly currentBootId: string;
   readonly claimedAt: string;
   readonly leaseExpiresAt: string;
   readonly reactor?: string | undefined;

@@ -1,10 +1,13 @@
 import {
+  CommandId,
+  EventId,
   type OrchestrationExpectedSession,
   type OrchestrationRecoveryTarget,
   type OrchestrationSession,
   OrchestrationEvent,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -36,6 +39,7 @@ import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 const MAX_DELIVERY_ATTEMPTS = 3;
 const CLAIM_LEASE_MINUTES = 5;
 const RETRY_BACKOFF_MILLIS = [1_000, 5_000, 30_000] as const;
+const STARTUP_RECOVERY_BUDGET_MILLIS = 40_000;
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 
 function expectedSessionFrom(session: OrchestrationSession): OrchestrationExpectedSession {
@@ -62,6 +66,29 @@ const make = Effect.gen(function* () {
   const bootId = (yield* ServerBootIdentity).id;
   const drainLock = yield* Semaphore.make(1);
   const liveSourceEventIds = new Set<string>();
+
+  const appendCheckpointCancellationEvidence = Effect.fn("appendCheckpointCancellationEvidence")(
+    function* (delivery: OrchestrationReactorDelivery, detail: string, createdAt: string) {
+      yield* engine.dispatchInternal({
+        type: "thread.activity.append",
+        commandId: CommandId.make(`delivery:${delivery.deliveryId}:recovery-evidence`),
+        threadId: delivery.threadId,
+        activity: {
+          id: EventId.make(`delivery:${delivery.deliveryId}:recovery-evidence`),
+          tone: "error",
+          kind: "checkpoint.revert.failed",
+          summary: "Checkpoint revert recovery cancelled",
+          payload: {
+            deliveryId: delivery.deliveryId,
+            detail,
+          },
+          turnId: null,
+          createdAt,
+        },
+        createdAt,
+      });
+    },
+  );
 
   const dispatchClaimed = Effect.fn("dispatchClaimed")(function* (
     delivery: OrchestrationReactorDelivery,
@@ -107,6 +134,15 @@ const make = Effect.gen(function* () {
     delivery: OrchestrationReactorDelivery,
   ) {
     const event = yield* decodeOrchestrationEvent(delivery.payload);
+    if (delivery.deliveryKind === "checkpoint-revert") {
+      const detectedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* appendCheckpointCancellationEvidence(
+        delivery,
+        "The server restarted while checkpoint rollback completion was uncertain; replay was suppressed to prevent duplicate provider rollback.",
+        detectedAt,
+      );
+      return "cancelled" as const;
+    }
     const thread = yield* snapshots
       .getThreadDetailById(delivery.threadId)
       .pipe(Effect.map(Option.getOrUndefined));
@@ -198,6 +234,7 @@ const make = Effect.gen(function* () {
     const claimToken = yield* crypto.randomUUIDv4;
     const claimed = yield* deliveries.claimNext({
       claimToken,
+      currentBootId: bootId,
       claimedAt,
       leaseExpiresAt: DateTime.formatIso(
         DateTime.add(claimedAtValue, { minutes: CLAIM_LEASE_MINUTES }),
@@ -212,6 +249,27 @@ const make = Effect.gen(function* () {
         return Effect.gen(function* () {
           const failedAtValue = yield* DateTime.now;
           const failedAt = DateTime.formatIso(failedAtValue);
+          if (
+            claimed.value.deliveryKind === "checkpoint-revert" &&
+            claimed.value.replayPolicy === "cancel-with-recovery"
+          ) {
+            yield* appendCheckpointCancellationEvidence(
+              claimed.value,
+              `Checkpoint rollback failed with uncertain external state; replay was suppressed. ${Cause.pretty(cause)}`,
+              failedAt,
+            );
+            const cancelled = yield* deliveries.markCancelled(
+              claimed.value.deliveryId,
+              failedAt,
+              claimToken,
+            );
+            if (!cancelled) {
+              return yield* Effect.die(
+                `checkpoint delivery claim was lost before cancellation could be retained`,
+              );
+            }
+            return false;
+          }
           const backoffMs =
             RETRY_BACKOFF_MILLIS[
               Math.min(claimed.value.attempts - 1, RETRY_BACKOFF_MILLIS.length - 1)
@@ -289,7 +347,35 @@ const make = Effect.gen(function* () {
     Effect.flatMap((observedAt) => deliveries.inspectReadiness(DateTime.formatIso(observedAt))),
   );
 
-  return OrchestrationDeliveryRuntime.of({ start, drain, inspectReadiness });
+  const recoverStartup: OrchestrationDeliveryRuntimeShape["recoverStartup"] = Effect.gen(
+    function* () {
+      const deadline = (yield* Clock.currentTimeMillis) + STARTUP_RECOVERY_BUDGET_MILLIS;
+      while (true) {
+        yield* drain;
+        const readiness = yield* inspectReadiness;
+        if (readiness.counts.total === 0) return;
+        if (readiness.counts.deadLetter > 0) {
+          return yield* Effect.die(
+            `orchestration delivery recovery encountered ${readiness.counts.deadLetter} poison row(s)`,
+          );
+        }
+
+        const oldest = Option.getOrUndefined(readiness.oldest);
+        const nextAttemptAt = oldest?.delivery.nextAttemptAt ?? null;
+        const now = yield* Clock.currentTimeMillis;
+        const retryAt = nextAttemptAt === null ? now + 100 : Date.parse(nextAttemptAt);
+        const waitMillis = Math.max(1, Number.isFinite(retryAt) ? retryAt - now : 100);
+        if (now + waitMillis > deadline) {
+          return yield* Effect.die(
+            `orchestration delivery recovery exceeded ${STARTUP_RECOVERY_BUDGET_MILLIS}ms budget`,
+          );
+        }
+        yield* Effect.sleep(`${waitMillis} millis`);
+      }
+    },
+  );
+
+  return OrchestrationDeliveryRuntime.of({ start, drain, recoverStartup, inspectReadiness });
 });
 
 export const OrchestrationDeliveryRuntimeLive = Layer.effect(OrchestrationDeliveryRuntime, make);

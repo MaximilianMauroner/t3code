@@ -9,6 +9,8 @@ export interface OrchestrationDeliveryRuntimeShape {
   readonly start: () => Effect.Effect<void, never, Scope.Scope>;
   /** Processes ordered durable work until the first unresolved blocker or completion. */
   readonly drain: Effect.Effect<void>;
+  /** Resolves startup work through scheduled retries within the bounded recovery budget. */
+  readonly recoverStartup: Effect.Effect<void, unknown>;
   /** Exposes unresolved and poison rows to the startup readiness gate. */
   readonly inspectReadiness: Effect.Effect<OrchestrationReactorDeliveryReadiness, unknown>;
 }

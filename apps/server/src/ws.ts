@@ -853,6 +853,11 @@ const makeWsRpcLayer = (
         command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>,
       ): Effect.Effect<{ readonly sequence: number }, OrchestrationDispatchCommandError> =>
         Effect.gen(function* () {
+          const admissionReservation = yield* orchestrationEngine.reserveExternalHotAdmission.pipe(
+            Effect.mapError((cause) =>
+              toDispatchCommandError(cause, "Failed to reserve bootstrap command admission."),
+            ),
+          );
           const bootstrap = command.bootstrap;
           const { bootstrap: _bootstrap, ...finalTurnStartCommand } = command;
           let createdThread = false;
@@ -1041,7 +1046,7 @@ const makeWsRpcLayer = (
 
             yield* runSetupProgram();
 
-            return yield* orchestrationEngine.dispatchExternal(finalTurnStartCommand);
+            return yield* admissionReservation.dispatch(finalTurnStartCommand);
           });
 
           return yield* bootstrapProgram.pipe(
@@ -1052,6 +1057,7 @@ const makeWsRpcLayer = (
               }
               return cleanupCreatedThread().pipe(Effect.flatMap(() => Effect.fail(dispatchError)));
             }),
+            Effect.ensuring(admissionReservation.cancel),
           );
         });
 

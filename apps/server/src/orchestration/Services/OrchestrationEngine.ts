@@ -25,6 +25,15 @@ import type { OrchestrationEventStoreError } from "../../persistence/Errors.ts";
 /**
  * OrchestrationEngineShape - Service API for orchestration command and event flow.
  */
+export interface OrchestrationHotAdmissionReservation {
+  /** Consumes the reservation by enqueueing its one hot command. */
+  readonly dispatch: (
+    command: DispatchableClientOrchestrationCommand,
+  ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+  /** Releases an unused reservation after bootstrap cleanup has finished. */
+  readonly cancel: Effect.Effect<void, never, never>;
+}
+
 export interface OrchestrationEngineShape {
   /**
    * Replay persisted orchestration events from an exclusive sequence cursor.
@@ -67,6 +76,13 @@ export interface OrchestrationEngineShape {
 
   /** Opens hot external command admission after startup recovery is fully settled. */
   readonly openExternalAdmission: Effect.Effect<void, never, never>;
+
+  /** Reserves one hot enqueue before a bootstrap performs side effects. */
+  readonly reserveExternalHotAdmission: Effect.Effect<
+    OrchestrationHotAdmissionReservation,
+    OrchestrationDispatchError,
+    never
+  >;
 
   /** Resolves after all earlier envelopes have committed and planned deliveries are durable. */
   readonly barrier: Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
