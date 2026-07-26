@@ -6,7 +6,7 @@ import {
   type ProjectId,
   ThreadId,
   TurnId,
-  type OrchestrationEvent,
+  OrchestrationEvent,
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -35,8 +35,11 @@ import type { OrchestrationDispatchError } from "../Errors.ts";
 import { isGitRepository } from "../../git/Utils.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
+import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import * as Schema from "effect/Schema";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+const decodeOrchestrationEvent = Schema.decodeEffect(OrchestrationEvent);
 
 type ReactorInput =
   | {
@@ -832,13 +835,26 @@ const make = Effect.gen(function* () {
 
   const worker = yield* makeDrainableWorker(processInputSafely);
 
+  const deliver: CheckpointReactorShape["deliver"] = Effect.fn("deliver")(function* (
+    delivery: OrchestrationReactorDelivery,
+  ) {
+    if (delivery.deliveryKind !== "checkpoint-revert") {
+      return yield* Effect.die(`checkpoint reactor cannot handle ${delivery.deliveryKind}`);
+    }
+    const event = yield* decodeOrchestrationEvent(delivery.payload);
+    if (event.type !== "thread.checkpoint-revert-requested") {
+      return yield* Effect.die(`checkpoint-revert delivery contains ${event.type}`);
+    }
+    yield* handleRevertRequested(event);
+    return "delivered" as const;
+  });
+
   const start: CheckpointReactorShape["start"] = Effect.fn("start")(function* () {
     yield* Effect.forkScoped(
       Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
         if (
           event.type !== "thread.turn-start-requested" &&
           event.type !== "thread.message-sent" &&
-          event.type !== "thread.checkpoint-revert-requested" &&
           event.type !== "thread.turn-diff-completed"
         ) {
           return Effect.void;
@@ -860,6 +876,7 @@ const make = Effect.gen(function* () {
   return {
     start,
     drain: worker.drain,
+    deliver,
   } satisfies CheckpointReactorShape;
 });
 

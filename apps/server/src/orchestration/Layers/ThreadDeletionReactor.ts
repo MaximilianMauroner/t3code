@@ -1,19 +1,19 @@
-import type { OrchestrationEvent } from "@t3tools/contracts";
-import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
+import { OrchestrationEvent } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import * as TerminalManager from "../../terminal/Manager.ts";
-import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
   ThreadDeletionReactor,
   type ThreadDeletionReactorShape,
 } from "../Services/ThreadDeletionReactor.ts";
+import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
+const decodeOrchestrationEvent = Schema.decodeEffect(OrchestrationEvent);
 
 export const logCleanupCauseUnlessInterrupted = <R, E>({
   effect,
@@ -37,62 +37,32 @@ export const logCleanupCauseUnlessInterrupted = <R, E>({
   );
 
 const make = Effect.gen(function* () {
-  const orchestrationEngine = yield* OrchestrationEngineService;
   const providerService = yield* ProviderService;
   const terminalManager = yield* TerminalManager.TerminalManager;
 
-  const stopProviderSession = (threadId: ThreadDeletedEvent["payload"]["threadId"]) =>
-    logCleanupCauseUnlessInterrupted({
-      effect: providerService.stopSession({ threadId }),
-      message: "thread deletion cleanup skipped provider session stop",
-      threadId,
-    });
-
-  const closeThreadTerminals = (threadId: ThreadDeletedEvent["payload"]["threadId"]) =>
-    logCleanupCauseUnlessInterrupted({
-      effect: terminalManager.close({ threadId, deleteHistory: true }),
-      message: "thread deletion cleanup skipped terminal close",
-      threadId,
-    });
-
-  const processThreadDeleted = Effect.fn("processThreadDeleted")(function* (
-    event: ThreadDeletedEvent,
+  const deliver: ThreadDeletionReactorShape["deliver"] = Effect.fn("deliver")(function* (
+    delivery: OrchestrationReactorDelivery,
   ) {
-    const { threadId } = event.payload;
-    yield* stopProviderSession(threadId);
-    yield* closeThreadTerminals(threadId);
+    if (delivery.deliveryKind !== "thread-delete") {
+      return yield* Effect.die(`thread deletion reactor cannot handle ${delivery.deliveryKind}`);
+    }
+    const event = yield* decodeOrchestrationEvent(delivery.payload);
+    if (event.type !== "thread.deleted") {
+      return yield* Effect.die(`thread-delete delivery contains ${event.type}`);
+    }
+    yield* providerService.stopSession({ threadId: event.payload.threadId });
+    yield* terminalManager.close({ threadId: event.payload.threadId, deleteHistory: true });
+    return "delivered" as const;
   });
 
-  const processThreadDeletedSafely = (event: ThreadDeletedEvent) =>
-    processThreadDeleted(event).pipe(
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterruptsOnly(cause)) {
-          return Effect.failCause(cause);
-        }
-        return Effect.logWarning("thread deletion reactor failed to process event", {
-          eventType: event.type,
-          threadId: event.payload.threadId,
-          cause: Cause.pretty(cause),
-        });
-      }),
-    );
-
-  const worker = yield* makeDrainableWorker(processThreadDeletedSafely);
-
   const start: ThreadDeletionReactorShape["start"] = Effect.fn("start")(function* () {
-    yield* Effect.forkScoped(
-      Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
-        if (event.type !== "thread.deleted") {
-          return Effect.void;
-        }
-        return worker.enqueue(event);
-      }),
-    );
+    yield* Effect.void;
   });
 
   return {
     start,
-    drain: worker.drain,
+    drain: Effect.void,
+    deliver,
   } satisfies ThreadDeletionReactorShape;
 });
 

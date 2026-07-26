@@ -15,6 +15,7 @@ import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EventId,
   MessageId,
+  type OrchestrationEvent,
   ProjectId,
   ThreadId,
   TurnId,
@@ -25,6 +26,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -57,9 +59,31 @@ import { checkpointRefForThreadTurn } from "../../checkpointing/Utils.ts";
 import { ServerConfig } from "../../config.ts";
 import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 import * as WorkspacePaths from "../../workspace/WorkspacePaths.ts";
+import { planReactorDelivery } from "../reactorDeliveries.ts";
+import { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import * as Schema from "effect/Schema";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
+const decodeReactorDelivery = Schema.decodeUnknownSync(OrchestrationReactorDelivery);
+
+function claimedDeliveryForEvent(event: OrchestrationEvent) {
+  const planned = planReactorDelivery(event, "checkpoint-reactor-test");
+  if (planned === null) return null;
+  return decodeReactorDelivery({
+    ...planned,
+    status: "delivering",
+    attempts: 1,
+    lastError: null,
+    lastFailedAt: null,
+    claimToken: "checkpoint-reactor-test-claim",
+    claimedAt: planned.createdAt,
+    leaseExpiresAt: "2026-01-01T01:00:00.000Z",
+    deliveredAt: null,
+    cancelledAt: null,
+    deadLetteredAt: null,
+  });
+}
 
 type LegacyProviderRuntimeEvent = {
   readonly type: string;
@@ -353,6 +377,25 @@ describe("CheckpointReactor", () => {
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
     const drain = () => Effect.runPromise(reactor.drain);
+    const dispatchAndDeliver: typeof engine.dispatch = (command) =>
+      engine.dispatch(command).pipe(
+        Effect.flatMap((result) =>
+          Stream.runHead(engine.readEvents(result.sequence - 1, 1)).pipe(
+            Effect.flatMap(
+              Option.match({
+                onNone: () => Effect.succeed(result),
+                onSome: (event) => {
+                  const delivery = claimedDeliveryForEvent(event);
+                  return delivery?.deliveryKind === "checkpoint-revert"
+                    ? reactor.deliver(delivery).pipe(Effect.as(result))
+                    : Effect.succeed(result);
+                },
+              }),
+            ),
+          ),
+        ),
+      );
+    const testEngine = { ...engine, dispatch: dispatchAndDeliver };
 
     const createdAt = "2026-01-01T00:00:00.000Z";
     await Effect.runPromise(
@@ -412,7 +455,7 @@ describe("CheckpointReactor", () => {
     }
 
     return {
-      engine,
+      engine: testEngine,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       provider,
       cwd,

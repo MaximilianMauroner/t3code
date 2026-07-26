@@ -9,6 +9,9 @@
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
+import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+
+export type OrchestrationDeliveryResolution = "delivered" | "cancelled";
 
 /**
  * ProviderCommandReactorShape - Service API for provider command reactors.
@@ -30,6 +33,11 @@ export interface ProviderCommandReactorShape {
    * Intended for test use to replace timing-sensitive sleeps.
    */
   readonly drain: Effect.Effect<void>;
+
+  /** Executes one already-claimed provider delivery. */
+  readonly deliver: (
+    delivery: OrchestrationReactorDelivery,
+  ) => Effect.Effect<OrchestrationDeliveryResolution, unknown>;
 }
 
 /**

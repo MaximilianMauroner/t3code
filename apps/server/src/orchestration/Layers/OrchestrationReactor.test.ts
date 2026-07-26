@@ -35,6 +35,7 @@ describe("OrchestrationReactor", () => {
               return Effect.void;
             },
             drain: Effect.void,
+            deliver: () => Effect.succeed("delivered" as const),
           }),
         ),
         Layer.provideMerge(
@@ -44,6 +45,7 @@ describe("OrchestrationReactor", () => {
               return Effect.void;
             },
             drain: Effect.void,
+            deliver: () => Effect.succeed("delivered" as const),
           }),
         ),
         Layer.provideMerge(
@@ -53,6 +55,7 @@ describe("OrchestrationReactor", () => {
               return Effect.void;
             },
             drain: Effect.void,
+            deliver: () => Effect.succeed("delivered" as const),
           }),
         ),
         Layer.provideMerge(

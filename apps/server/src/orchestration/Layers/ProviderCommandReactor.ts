@@ -3,7 +3,7 @@ import {
   CommandId,
   EventId,
   type ModelSelection,
-  type OrchestrationEvent,
+  OrchestrationEvent,
   ProviderDriverKind,
   type ProjectId,
   type OrchestrationSession,
@@ -13,10 +13,8 @@ import {
   type TurnId,
 } from "@t3tools/contracts";
 import { isTemporaryWorktreeBranch, WORKTREE_BRANCH_PREFIX } from "@t3tools/shared/git";
-import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
@@ -41,8 +39,10 @@ import {
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
+const decodeOrchestrationEvent = Schema.decodeEffect(OrchestrationEvent);
 
 type ProviderIntentEvent = Extract<
   OrchestrationEvent,
@@ -80,17 +80,19 @@ function mapProviderSessionStatusToOrchestrationStatus(
   }
 }
 
-const turnStartKeyForEvent = (event: ProviderIntentEvent): string =>
-  event.commandId !== null ? `command:${event.commandId}` : `event:${event.eventId}`;
-
-const HANDLED_TURN_START_KEY_MAX = 10_000;
-const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const DEFAULT_THREAD_TITLE = "New thread";
 
 export function providerErrorLabel(value: string | undefined): string {
   const normalized = value?.trim();
   return normalized && normalized.length > 0 ? normalized : "unknown";
+}
+
+export function archiveStopCommandId(input: {
+  readonly eventId: EventId;
+  readonly threadId: ThreadId;
+}): CommandId {
+  return CommandId.make(`archive-stop:${input.eventId}:${input.threadId}`);
 }
 
 export function providerErrorLabelFromInstanceHint(input: {
@@ -199,19 +201,6 @@ const make = Effect.gen(function* () {
   const serverCommandId = (tag: string) =>
     crypto.randomUUIDv4.pipe(Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)));
   const serverEventId = () => crypto.randomUUIDv4.pipe(Effect.map(EventId.make));
-  const handledTurnStartKeys = yield* Cache.make<string, true>({
-    capacity: HANDLED_TURN_START_KEY_MAX,
-    timeToLive: HANDLED_TURN_START_KEY_TTL,
-    lookup: () => Effect.succeed(true),
-  });
-
-  const hasHandledTurnStartRecently = (key: string) =>
-    Cache.getOption(handledTurnStartKeys, key).pipe(
-      Effect.flatMap((cached) =>
-        Cache.set(handledTurnStartKeys, key, true).pipe(Effect.as(Option.isSome(cached))),
-      ),
-    );
-
   const threadModelSelections = new Map<string, ModelSelection>();
 
   const appendProviderFailureActivity = (input: {
@@ -771,11 +760,6 @@ const make = Effect.gen(function* () {
   const processTurnStartRequested = Effect.fn("processTurnStartRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
   ) {
-    const key = turnStartKeyForEvent(event);
-    if (yield* hasHandledTurnStartRecently(key)) {
-      return;
-    }
-
     const thread = yield* resolveThread(event.payload.threadId);
     if (!thread) {
       return;
@@ -881,7 +865,7 @@ const make = Effect.gen(function* () {
 
     yield* providerService
       .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
+      .pipe(Effect.catchCause(recoverTurnStartFailure));
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (
@@ -1084,16 +1068,66 @@ const make = Effect.gen(function* () {
 
   const worker = yield* makeDrainableWorker(processDomainEventSafely);
 
+  const decodeDeliveryEvent = (delivery: OrchestrationReactorDelivery) =>
+    decodeOrchestrationEvent(delivery.payload);
+
+  const deliver: ProviderCommandReactorShape["deliver"] = Effect.fn("deliver")(
+    function* (delivery) {
+      const event = yield* decodeDeliveryEvent(delivery);
+      switch (delivery.deliveryKind) {
+        case "turn-start":
+          if (event.type !== "thread.turn-start-requested") {
+            return yield* Effect.die(`turn-start delivery contains ${event.type}`);
+          }
+          yield* processTurnStartRequested(event);
+          return "delivered" as const;
+        case "turn-interrupt":
+          if (event.type !== "thread.turn-interrupt-requested") {
+            return yield* Effect.die(`turn-interrupt delivery contains ${event.type}`);
+          }
+          yield* processTurnInterruptRequested(event);
+          return "delivered" as const;
+        case "approval-response":
+          if (event.type !== "thread.approval-response-requested") {
+            return yield* Effect.die(`approval-response delivery contains ${event.type}`);
+          }
+          yield* processApprovalResponseRequested(event);
+          return "delivered" as const;
+        case "user-input-response":
+          if (event.type !== "thread.user-input-response-requested") {
+            return yield* Effect.die(`user-input-response delivery contains ${event.type}`);
+          }
+          yield* processUserInputResponseRequested(event);
+          return "delivered" as const;
+        case "session-stop":
+          if (event.type !== "thread.session-stop-requested") {
+            return yield* Effect.die(`session-stop delivery contains ${event.type}`);
+          }
+          yield* processSessionStopRequested(event);
+          return "delivered" as const;
+        case "archive-cleanup":
+          if (event.type !== "thread.archived") {
+            return yield* Effect.die(`archive-cleanup delivery contains ${event.type}`);
+          }
+          yield* orchestrationEngine.dispatchInternal({
+            type: "thread.session.stop",
+            commandId: archiveStopCommandId(event),
+            threadId: event.payload.threadId,
+            createdAt: event.payload.archivedAt,
+          });
+          return "delivered" as const;
+        case "checkpoint-revert":
+        case "thread-delete":
+          return yield* Effect.die(
+            `provider command reactor cannot handle ${delivery.deliveryKind}`,
+          );
+      }
+    },
+  );
+
   const start: ProviderCommandReactorShape["start"] = Effect.fn("start")(function* () {
     const processEvent = Effect.fn("processEvent")(function* (event: OrchestrationEvent) {
-      if (
-        event.type === "thread.runtime-mode-set" ||
-        event.type === "thread.turn-start-requested" ||
-        event.type === "thread.turn-interrupt-requested" ||
-        event.type === "thread.approval-response-requested" ||
-        event.type === "thread.user-input-response-requested" ||
-        event.type === "thread.session-stop-requested"
-      ) {
+      if (event.type === "thread.runtime-mode-set") {
         return yield* worker.enqueue(event);
       }
     });
@@ -1106,6 +1140,7 @@ const make = Effect.gen(function* () {
   return {
     start,
     drain: worker.drain,
+    deliver,
   } satisfies ProviderCommandReactorShape;
 });
 

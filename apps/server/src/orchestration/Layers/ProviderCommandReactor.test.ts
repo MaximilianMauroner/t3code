@@ -17,6 +17,7 @@ import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EventId,
   MessageId,
+  type OrchestrationEvent,
   ProjectId,
   ThreadId,
   TurnId,
@@ -24,8 +25,10 @@ import {
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -49,6 +52,7 @@ import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
 import {
+  archiveStopCommandId,
   providerErrorLabel,
   providerErrorLabelFromInstanceHint,
   ProviderCommandReactorLive,
@@ -61,11 +65,33 @@ import * as Clock from "effect/Clock";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
+import { planReactorDelivery } from "../reactorDeliveries.ts";
+import { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import * as Schema from "effect/Schema";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
+const decodeReactorDelivery = Schema.decodeUnknownSync(OrchestrationReactorDelivery);
+
+function claimedDeliveryForEvent(event: OrchestrationEvent) {
+  const planned = planReactorDelivery(event, "provider-reactor-test");
+  if (planned === null) return null;
+  return decodeReactorDelivery({
+    ...planned,
+    status: "delivering",
+    attempts: 1,
+    lastError: null,
+    lastFailedAt: null,
+    claimToken: "provider-reactor-test-claim",
+    claimedAt: planned.createdAt,
+    leaseExpiresAt: "2026-01-01T01:00:00.000Z",
+    deliveredAt: null,
+    cancelledAt: null,
+    deadLetteredAt: null,
+  });
+}
 
 const deriveServerPathsSync = (baseDir: string, devUrl: URL | undefined) =>
   Effect.runSync(deriveServerPaths(baseDir, devUrl).pipe(Effect.provide(NodeServices.layer)));
@@ -118,6 +144,17 @@ describe("ProviderCommandReactor", () => {
   });
 
   describe("provider error attribution", () => {
+    it("derives a stable archive stop identity from the source event and session", () => {
+      const input = {
+        eventId: EventId.make("archive-event-1"),
+        threadId: ThreadId.make("thread-1"),
+      };
+      expect(archiveStopCommandId(input)).toBe(archiveStopCommandId(input));
+      expect(archiveStopCommandId(input)).not.toBe(
+        archiveStopCommandId({ ...input, eventId: EventId.make("archive-event-2") }),
+      );
+    });
+
     it("uses the current provider instance slug when current instance lookup fails", () => {
       expect(
         providerErrorLabelFromInstanceHint({
@@ -389,7 +426,41 @@ describe("ProviderCommandReactor", () => {
     const reactor = await runtime.runPromise(Effect.service(ProviderCommandReactor));
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
-    const drain = () => Effect.runPromise(reactor.drain);
+    const deliveryFibers: Array<Fiber.Fiber<unknown, unknown>> = [];
+    const drain = () =>
+      Effect.runPromise(
+        Effect.forEach(deliveryFibers.splice(0), Fiber.await).pipe(
+          Effect.flatMap(() => reactor.drain),
+        ),
+      );
+    const dispatchAndDeliver: typeof engine.dispatch = (command) =>
+      engine.dispatch(command).pipe(
+        Effect.flatMap((result) =>
+          Stream.runHead(engine.readEvents(result.sequence - 1, 1)).pipe(
+            Effect.flatMap(
+              Option.match({
+                onNone: () => Effect.succeed(result),
+                onSome: (event) => {
+                  const delivery = claimedDeliveryForEvent(event);
+                  return delivery === null
+                    ? Effect.succeed(result)
+                    : reactor.deliver(delivery).pipe(
+                        Scope.provide(scope!),
+                        Effect.forkIn(scope!),
+                        Effect.tap((fiber) =>
+                          Effect.sync(() => {
+                            deliveryFibers.push(fiber);
+                          }),
+                        ),
+                        Effect.as(result),
+                      );
+                },
+              }),
+            ),
+          ),
+        ),
+      );
+    const testEngine = { ...engine, dispatch: dispatchAndDeliver };
 
     await Effect.runPromise(
       engine.dispatch({
@@ -419,7 +490,7 @@ describe("ProviderCommandReactor", () => {
     );
 
     return {
-      engine,
+      engine: testEngine,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       startSession,
       sendTurn,
