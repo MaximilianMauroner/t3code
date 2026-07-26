@@ -12,6 +12,7 @@ import {
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
@@ -652,9 +653,32 @@ describe("OrchestrationEngine", () => {
       }),
     );
 
-    const reservation = await system.run(system.engine.reserveExternalHotAdmission);
+    const reservedTurnCommand = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-bootstrap-reservation-start"),
+      threadId,
+      message: {
+        messageId: asMessageId("msg-bootstrap-reservation"),
+        role: "user",
+        text: "hello",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+    const reservation = await system.run(
+      system.engine.reserveExternalHotAdmission(reservedTurnCommand),
+    );
+    const updateFiber = await system.run(
+      system.maintenanceGate.acquire.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Effect.yieldNow);
+    expect(updateFiber.pollUnsafe()).toBeUndefined();
     await system.run(system.engine.closeExternalAdmission);
-    await expect(system.run(system.engine.reserveExternalHotAdmission)).rejects.toMatchObject({
+    await expect(
+      system.run(system.engine.reserveExternalHotAdmission(reservedTurnCommand)),
+    ).rejects.toMatchObject({
       _tag: "orchestration_not_ready",
       phase: "quiescing",
     });
@@ -663,26 +687,18 @@ describe("OrchestrationEngine", () => {
     );
     expect(barrierFiber.pollUnsafe()).toBeUndefined();
 
-    const dispatched = await system.run(
-      reservation.dispatch({
-        type: "thread.turn.start",
-        commandId: CommandId.make("cmd-bootstrap-reservation-start"),
-        threadId,
-        message: {
-          messageId: asMessageId("msg-bootstrap-reservation"),
-          role: "user",
-          text: "hello",
-          attachments: [],
-        },
-        runtimeMode: "full-access",
-        interactionMode: "default",
-        createdAt: now(),
-      }),
-    );
+    const dispatched = await system.run(reservation.dispatch(reservedTurnCommand));
+    await system.run(Fiber.join(updateFiber));
+    await system.run(system.maintenanceGate.release);
     expect((await system.run(Fiber.join(barrierFiber))).sequence).toBe(dispatched.sequence);
 
     await system.run(system.engine.openExternalAdmission);
-    const cancelledReservation = await system.run(system.engine.reserveExternalHotAdmission);
+    const cancelledReservation = await system.run(
+      system.engine.reserveExternalHotAdmission({
+        ...reservedTurnCommand,
+        commandId: CommandId.make("cmd-bootstrap-reservation-cancelled"),
+      }),
+    );
     await system.run(system.engine.closeExternalAdmission);
     const cancelledBarrier = await system.run(
       system.engine.barrier.pipe(Effect.forkDetach({ startImmediately: true })),
@@ -774,6 +790,84 @@ describe("OrchestrationEngine", () => {
     const pending = await system.run(system.deliveries.listPendingOrdered());
     expect(pending).toHaveLength(1);
     expect(pending[0]?.deliveryKind).toBe("turn-start");
+    await system.dispose();
+  });
+
+  it("force-stops without waiting for a hung command envelope", async () => {
+    const projectionEntered = Deferred.makeUnsafe<void>();
+    const allowProjection = Deferred.makeUnsafe<void>();
+    const pipeline: OrchestrationProjectionPipelineShape = {
+      bootstrap: Effect.void,
+      projectEvent: (event) =>
+        event.type === "thread.turn-start-requested"
+          ? Deferred.succeed(projectionEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(allowProjection)),
+            )
+          : Effect.void,
+    };
+    const system = await createOrchestrationSystem(null, pipeline);
+    const projectId = asProjectId("project-force-stop-hung");
+    const threadId = ThreadId.make("thread-force-stop-hung");
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-force-stop-hung-project"),
+        projectId,
+        title: "Force stop hung",
+        workspaceRoot: "/tmp/project-force-stop-hung",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-force-stop-hung-thread"),
+        threadId,
+        projectId,
+        title: "Force stop hung",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+
+    const dispatchFiber = await system.run(
+      system.engine
+        .dispatchExternal({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-force-stop-hung-start"),
+          threadId,
+          message: {
+            messageId: asMessageId("message-force-stop-hung"),
+            role: "user",
+            text: "hang",
+            attachments: [],
+          },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdAt: now(),
+        })
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(projectionEntered));
+
+    await system.run(system.engine.forceStop);
+    expect(await system.run(system.engine.isSealed)).toBe(true);
+    const dispatchExit = await system.run(Fiber.await(dispatchFiber));
+    expect(Exit.isFailure(dispatchExit)).toBe(true);
+    await expect(
+      system.run(
+        system.engine.dispatchInternal({
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-force-stop-after"),
+          threadId,
+        }),
+      ),
+    ).rejects.toMatchObject({ phase: "sealed" });
+    await system.run(Deferred.succeed(allowProjection, undefined));
     await system.dispose();
   });
 
@@ -922,6 +1016,14 @@ describe("OrchestrationEngine", () => {
               )
             : Effect.succeed({ generation: 0 });
         }),
+      reserveDispatchAllowed: (command) =>
+        gateService.ensureDispatchAllowed(command).pipe(
+          Effect.map(() => ({
+            withDispatchAllowed: (reservedCommand, effect) =>
+              gateService.ensureDispatchAllowed(reservedCommand).pipe(Effect.andThen(effect)),
+            cancel: Effect.void,
+          })),
+        ),
       withDispatchAllowed: (command, _acceptance, effect) =>
         gateService.ensureDispatchAllowed(command).pipe(Effect.andThen(effect)),
     };

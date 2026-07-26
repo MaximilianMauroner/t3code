@@ -78,17 +78,18 @@ export interface OrchestrationEngineShape {
   readonly openExternalAdmission: Effect.Effect<void, never, never>;
 
   /** Reserves one hot enqueue before a bootstrap performs side effects. */
-  readonly reserveExternalHotAdmission: Effect.Effect<
-    OrchestrationHotAdmissionReservation,
-    OrchestrationDispatchError,
-    never
-  >;
+  readonly reserveExternalHotAdmission: (
+    command: DispatchableClientOrchestrationCommand,
+  ) => Effect.Effect<OrchestrationHotAdmissionReservation, OrchestrationDispatchError, never>;
 
   /** Resolves after all earlier envelopes have committed and planned deliveries are durable. */
   readonly barrier: Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   /** Idempotently reject new work, stop the queue worker, and prohibit later publication. */
   readonly sealAndStop: Effect.Effect<void, never, never>;
+
+  /** Immediately seals admission and tears down worker transports without an in-band queue stop. */
+  readonly forceStop: Effect.Effect<void, never, never>;
 
   readonly isSealed: Effect.Effect<boolean, never, never>;
 

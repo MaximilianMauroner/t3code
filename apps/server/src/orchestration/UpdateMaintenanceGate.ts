@@ -3,6 +3,7 @@ import type { OrchestrationCommand } from "@t3tools/contracts";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -18,6 +19,14 @@ export interface UpdateDispatchAcceptance {
   readonly generation: number;
 }
 
+export interface UpdateDispatchReservation {
+  readonly withDispatchAllowed: <A, E, R>(
+    command: OrchestrationCommand,
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | OrchestrationCommandInvariantError, R>;
+  readonly cancel: Effect.Effect<void>;
+}
+
 export interface UpdateLockOwner {
   readonly pid: number;
   readonly token: string;
@@ -30,6 +39,9 @@ export interface UpdateMaintenanceGateService {
   readonly ensureDispatchAllowed: (
     command: OrchestrationCommand,
   ) => Effect.Effect<UpdateDispatchAcceptance, OrchestrationCommandInvariantError>;
+  readonly reserveDispatchAllowed: (
+    command: OrchestrationCommand,
+  ) => Effect.Effect<UpdateDispatchReservation, OrchestrationCommandInvariantError>;
   readonly withDispatchAllowed: <A, E, R>(
     command: OrchestrationCommand,
     acceptance: UpdateDispatchAcceptance,
@@ -53,6 +65,11 @@ const allowAll: UpdateMaintenanceGateService = {
   release: Effect.void,
   isHeld: Effect.succeed(false),
   ensureDispatchAllowed: () => Effect.succeed({ generation: 0 }),
+  reserveDispatchAllowed: () =>
+    Effect.succeed({
+      withDispatchAllowed: (_command, effect) => effect,
+      cancel: Effect.void,
+    }),
   withDispatchAllowed: (_command, _acceptance, effect) => effect,
 };
 
@@ -168,6 +185,10 @@ export const make = Effect.gen(function* () {
   const semaphore = yield* Semaphore.make(1);
   const generation = yield* Ref.make(0);
   const ownedToken = yield* Ref.make<string | null>(null);
+  let nextReservationId = 0;
+  const activeReservationIds = new Set<number>();
+  let reservationsDrained = yield* Deferred.make<void>();
+  yield* Deferred.succeed(reservationsDrained, undefined);
   const lockPath = path.join(config.stateDir, "fork-update.lock");
   const ownerPath = path.join(lockPath, "pid");
   const tokenPath = path.join(lockPath, "token");
@@ -228,9 +249,75 @@ export const make = Effect.gen(function* () {
           }),
         );
 
+  const reserveDispatchAllowed: UpdateMaintenanceGateService["reserveDispatchAllowed"] = (
+    command,
+  ) =>
+    !isHotExternalCommand(command)
+      ? Effect.succeed({
+          withDispatchAllowed: (_reservedCommand, effect) => effect,
+          cancel: Effect.void,
+        })
+      : Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const acceptedGeneration = yield* Ref.get(generation);
+            if (yield* isHeld) return yield* dispatchError(command);
+            const reservationId = yield* restore(
+              semaphore.withPermit(
+                Effect.gen(function* () {
+                  if (acceptedGeneration !== (yield* Ref.get(generation)) || (yield* isHeld)) {
+                    return yield* dispatchError(command);
+                  }
+                  if (activeReservationIds.size === 0) {
+                    reservationsDrained = yield* Deferred.make<void>();
+                  }
+                  const id = nextReservationId++;
+                  activeReservationIds.add(id);
+                  return id;
+                }),
+              ),
+            );
+
+            let active = true;
+            const cancel = semaphore.withPermit(
+              Effect.gen(function* () {
+                if (!active) return;
+                active = false;
+                activeReservationIds.delete(reservationId);
+                if (activeReservationIds.size === 0) {
+                  yield* Deferred.succeed(reservationsDrained, undefined);
+                }
+              }),
+            );
+            const reservedCommandId = command.commandId;
+            const withReservedDispatch = <A, E, R>(
+              reservedCommand: OrchestrationCommand,
+              effect: Effect.Effect<A, E, R>,
+            ): Effect.Effect<A, E | OrchestrationCommandInvariantError, R> => {
+              if (
+                active &&
+                reservedCommand.commandId === reservedCommandId &&
+                isHotExternalCommand(reservedCommand)
+              ) {
+                return effect.pipe(Effect.ensuring(cancel));
+              }
+              return Effect.fail(dispatchError(reservedCommand));
+            };
+            return {
+              withDispatchAllowed: withReservedDispatch,
+              cancel,
+            } satisfies UpdateDispatchReservation;
+          }),
+        );
+
   const acquire = Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
-      yield* restore(semaphore.take(1));
+      while (true) {
+        yield* restore(semaphore.take(1));
+        if (activeReservationIds.size === 0) break;
+        const pendingReservations = reservationsDrained;
+        yield* semaphore.release(1);
+        yield* restore(Deferred.await(pendingReservations));
+      }
       const token = NodeCrypto.randomUUID();
       const acquired = yield* Effect.try({
         try: () => {
@@ -313,6 +400,7 @@ export const make = Effect.gen(function* () {
     release,
     isHeld,
     ensureDispatchAllowed,
+    reserveDispatchAllowed,
     withDispatchAllowed,
   };
 });

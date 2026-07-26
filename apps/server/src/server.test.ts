@@ -21,6 +21,7 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   ORCHESTRATION_WS_METHODS,
+  OrchestrationNotReadyError,
   type PreviewEvent,
   ProjectId,
   ProviderDriverKind,
@@ -689,13 +690,14 @@ const buildAppUnderTest = (options?: {
             options?.layers?.orchestrationEngine?.dispatchExternal?.(command) ??
             options?.layers?.orchestrationEngine?.dispatch?.(command) ??
             Effect.succeed({ sequence: 0 }),
-          reserveExternalHotAdmission: Effect.succeed({
-            dispatch: (command) =>
-              options?.layers?.orchestrationEngine?.dispatchExternal?.(command) ??
-              options?.layers?.orchestrationEngine?.dispatch?.(command) ??
-              Effect.succeed({ sequence: 0 }),
-            cancel: Effect.void,
-          }),
+          reserveExternalHotAdmission: () =>
+            Effect.succeed({
+              dispatch: (command) =>
+                options?.layers?.orchestrationEngine?.dispatchExternal?.(command) ??
+                options?.layers?.orchestrationEngine?.dispatch?.(command) ??
+                Effect.succeed({ sequence: 0 }),
+              cancel: Effect.void,
+            }),
           streamDomainEvents: Stream.empty,
           latestSequence: Effect.succeed(0),
           ...options?.layers?.orchestrationEngine,
@@ -6732,6 +6734,75 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("rejects bootstrap before worktree side effects when maintenance owns admission", () =>
+    Effect.gen(function* () {
+      const createWorktree = vi.fn(() => Effect.die("worktree side effect must not run"));
+      yield* buildAppUnderTest({
+        layers: {
+          gitVcsDriver: { createWorktree },
+          orchestrationEngine: {
+            reserveExternalHotAdmission: () =>
+              Effect.fail(
+                new OrchestrationNotReadyError({
+                  message: "Server update is in progress.",
+                  retryable: true,
+                  retryAfterMs: 1_000,
+                  phase: "quiescing",
+                }),
+              ),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const error = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+              type: "thread.turn.start",
+              commandId: CommandId.make("cmd-bootstrap-maintenance-rejected"),
+              threadId: ThreadId.make("thread-bootstrap-maintenance-rejected"),
+              message: {
+                messageId: MessageId.make("msg-bootstrap-maintenance-rejected"),
+                role: "user",
+                text: "hello",
+                attachments: [],
+              },
+              modelSelection: defaultModelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              bootstrap: {
+                createThread: {
+                  projectId: defaultProjectId,
+                  title: "Rejected bootstrap",
+                  modelSelection: defaultModelSelection,
+                  runtimeMode: "full-access",
+                  interactionMode: "default",
+                  branch: "main",
+                  worktreePath: null,
+                  createdAt,
+                },
+                prepareWorktree: {
+                  projectCwd: "/tmp/project",
+                  baseBranch: "main",
+                  branch: "t3code/rejected-bootstrap",
+                  startFromOrigin: false,
+                },
+                runSetupScript: true,
+              },
+              createdAt,
+            }),
+          ),
+        ),
+      );
+
+      assert.equal(error._tag, "OrchestrationDispatchCommandError");
+      assert.equal(createWorktree.mock.calls.length, 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect(
     "bootstraps first-send worktree turns on the server before dispatching turn start",
     () =>
@@ -6817,15 +6888,16 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             },
             orchestrationEngine: {
               dispatch: dispatchCommand,
-              reserveExternalHotAdmission: Effect.sync(() => {
-                bootstrapGitOperations.push("reserve-admission");
-                return {
-                  dispatch: dispatchCommand,
-                  cancel: Effect.sync(() => {
-                    bootstrapGitOperations.push("release-admission");
-                  }),
-                };
-              }),
+              reserveExternalHotAdmission: () =>
+                Effect.sync(() => {
+                  bootstrapGitOperations.push("reserve-admission");
+                  return {
+                    dispatch: dispatchCommand,
+                    cancel: Effect.sync(() => {
+                      bootstrapGitOperations.push("release-admission");
+                    }),
+                  };
+                }),
               readEvents: () => Stream.empty,
             },
             projectSetupScriptRunner: {

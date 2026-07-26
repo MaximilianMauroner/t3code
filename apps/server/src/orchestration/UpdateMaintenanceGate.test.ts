@@ -86,6 +86,45 @@ function writeOwner(
 }
 
 describe("UpdateMaintenanceGate", () => {
+  it.effect("holds a bootstrap reservation through its durable commit", () =>
+    withFixture((fixture) =>
+      Effect.gen(function* () {
+        const reservation = yield* fixture.gate.reserveDispatchAllowed(turnCommand);
+        const commitEntered = yield* Deferred.make<void>();
+        const allowCommit = yield* Deferred.make<void>();
+        const commitFiber = yield* reservation
+          .withDispatchAllowed(
+            turnCommand,
+            Deferred.succeed(commitEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(allowCommit)),
+              Effect.as("committed"),
+            ),
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(commitEntered);
+
+        const updateFiber = yield* fixture.gate.acquire.pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        expect(updateFiber.pollUnsafe()).toBeUndefined();
+        yield* Deferred.succeed(allowCommit, undefined);
+        expect(yield* Fiber.join(commitFiber)).toBe("committed");
+        yield* Fiber.join(updateFiber);
+        yield* fixture.gate.release;
+      }),
+    ),
+  );
+
+  it.effect("rejects bootstrap reservation before side effects when maintenance already won", () =>
+    withFixture((fixture) =>
+      Effect.gen(function* () {
+        yield* fixture.gate.acquire;
+        const error = yield* fixture.gate.reserveDispatchAllowed(turnCommand).pipe(Effect.flip);
+        expect(error.message).toContain("server update is in progress");
+        yield* fixture.gate.release;
+      }),
+    ),
+  );
+
   it.effect("lets a turn finish its durable section before update acquisition completes", () =>
     withFixture((fixture) =>
       Effect.gen(function* () {

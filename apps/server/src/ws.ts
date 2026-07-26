@@ -853,13 +853,15 @@ const makeWsRpcLayer = (
         command: Extract<OrchestrationCommand, { type: "thread.turn.start" }>,
       ): Effect.Effect<{ readonly sequence: number }, OrchestrationDispatchCommandError> =>
         Effect.gen(function* () {
-          const admissionReservation = yield* orchestrationEngine.reserveExternalHotAdmission.pipe(
-            Effect.mapError((cause) =>
-              toDispatchCommandError(cause, "Failed to reserve bootstrap command admission."),
-            ),
-          );
           const bootstrap = command.bootstrap;
           const { bootstrap: _bootstrap, ...finalTurnStartCommand } = command;
+          const admissionReservation = yield* orchestrationEngine
+            .reserveExternalHotAdmission(finalTurnStartCommand)
+            .pipe(
+              Effect.mapError((cause) =>
+                toDispatchCommandError(cause, "Failed to reserve bootstrap command admission."),
+              ),
+            );
           let createdThread = false;
           let targetProjectId = bootstrap?.createThread?.projectId;
           let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;

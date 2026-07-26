@@ -32,9 +32,11 @@ it.effect("records the graceful shutdown linearization order", () =>
       "deliveries",
       "ingress-close",
       "ingestion-drain",
+      "interrupt",
+      "internal-barrier",
+      "deliveries",
       "reactors-drain",
       "internal-barrier",
-      "interrupt",
       "seal",
       "reactors-close",
     ]);

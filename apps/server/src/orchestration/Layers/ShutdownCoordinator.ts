@@ -35,9 +35,11 @@ export const runShutdownSequence = Effect.fn("ShutdownCoordinator.runShutdownSeq
   yield* actions.drainDeliveries;
   yield* actions.closeProviderIngress;
   yield* actions.drainProviderIngestion;
+  yield* actions.interruptActiveTargets;
+  yield* actions.internalEngineBarrier;
+  yield* actions.drainDeliveries;
   yield* actions.drainRemainingReactors;
   yield* actions.internalEngineBarrier;
-  yield* actions.interruptActiveTargets;
   yield* actions.sealAndStopEngine;
   yield* actions.closeReactorScope;
 });
@@ -65,6 +67,15 @@ const make = Effect.gen(function* () {
   const shutdown: ShutdownCoordinatorShape["shutdown"] = Effect.fn("ShutdownCoordinator.shutdown")(
     function* ({ reactorScope, closeExternalAdmission }) {
       const closeReactorScope = Scope.close(reactorScope, Exit.void);
+      const forceCloseReactorScope = Effect.sync(() =>
+        Scope.closeUnsafe(reactorScope, Exit.void),
+      ).pipe(
+        Effect.flatMap((finalizers) =>
+          finalizers === undefined
+            ? Effect.void
+            : finalizers.pipe(Effect.forkDetach({ startImmediately: true }), Effect.asVoid),
+        ),
+      );
       yield* runShutdownWithBudget({
         actions: {
           closeExternalAdmission: closeExternalAdmission.pipe(
@@ -80,16 +91,9 @@ const make = Effect.gen(function* () {
           sealAndStopEngine: engine.sealAndStop,
           closeReactorScope,
         },
-        forced: deliveries.inspectReadiness.pipe(
-          Effect.catch(() => Effect.succeed(undefined)),
-          Effect.flatMap((readiness) =>
-            Effect.logError("orchestration shutdown coordinator exceeded its budget", {
-              unresolvedDeliveries: readiness?.counts.total ?? "unknown",
-            }),
-          ),
-          Effect.andThen(engine.sealAndStop),
-          Effect.andThen(closeReactorScope),
-        ),
+        forced: Effect.logError("orchestration shutdown coordinator exceeded its budget", {
+          unresolvedDeliveries: "unknown",
+        }).pipe(Effect.andThen(engine.forceStop), Effect.andThen(forceCloseReactorScope)),
       });
     },
   );
