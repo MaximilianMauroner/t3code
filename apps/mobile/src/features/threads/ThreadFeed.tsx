@@ -550,9 +550,45 @@ function useMarkdownStyles(onLinkPress: (href: string) => void): MarkdownStyleSe
       blockBackgroundColor: string,
       blockTextColor: string,
       copyTintColor: ColorValue,
+      paragraphMarginBottom: number,
       preserveSoftBreaks: boolean,
       highlightCode: boolean,
     ): CustomRenderers => ({
+      paragraph: ({ children }) => (
+        <NativeText
+          selectable
+          style={{
+            color: inlineTextColor,
+            fontFamily: regularFontFamily,
+            fontSize: markdownFontSizes.m,
+            lineHeight: markdownFontSizes.bodyLineHeight,
+            marginBottom: paragraphMarginBottom,
+            ...(Platform.OS === "android" ? { includeFontPadding: false } : null),
+          }}
+        >
+          {children}
+        </NativeText>
+      ),
+      heading: ({ children, level = 1 }) => {
+        const fontSize = markdownFontSizes[`h${level}`];
+        return (
+          <NativeText
+            selectable
+            style={{
+              color: inlineTextColor,
+              fontFamily: boldFontFamily,
+              fontSize,
+              fontWeight: "700",
+              lineHeight: fontSize * 1.3,
+              marginTop: 18,
+              marginBottom: 8,
+              ...(Platform.OS === "android" ? { includeFontPadding: false } : null),
+            }}
+          >
+            {children}
+          </NativeText>
+        );
+      },
       link: ({ children, href = "" }) => {
         const presentation = resolveMarkdownLinkPresentation(href);
         if (presentation.kind === "file") {
@@ -722,6 +758,7 @@ function useMarkdownStyles(onLinkPress: (href: string) => void): MarkdownStyleSe
           markdownUserFenceBg,
           markdownUserFenceText,
           userBubbleForegroundMuted,
+          0,
           true,
           false,
         ),
@@ -755,6 +792,7 @@ function useMarkdownStyles(onLinkPress: (href: string) => void): MarkdownStyleSe
           markdownCodeBg,
           markdownCodeText,
           iconSubtleColor,
+          10,
           false,
           true,
         ),
