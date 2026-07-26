@@ -230,6 +230,11 @@ import {
   shouldShowProviderStatusBanner,
 } from "./chat/ProviderStatusBanner";
 import { ThreadErrorBanner } from "./chat/ThreadErrorBanner";
+import { ThreadRecoveryBanner } from "./chat/ThreadRecoveryBanner";
+import {
+  buildThreadRecoveryPresentation,
+  resolveThreadRecoveryRetry,
+} from "../threadRecoveryPresentation";
 import { resolveThreadPr } from "./ThreadStatusIndicators";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import {
@@ -302,6 +307,20 @@ const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
+
+async function fetchRecoveryAttachmentDataUrl(input: {
+  readonly url: string;
+  readonly name: string;
+  readonly mimeType: string;
+}): Promise<string> {
+  const response = await fetch(input.url);
+  if (!response.ok) {
+    throw new Error(`Could not load original attachment (${response.status}).`);
+  }
+  const blob = await response.blob();
+  return readFileAsDataUrl(new File([blob], input.name, { type: input.mimeType }));
+}
+
 function useDraftHeroLayoutTransition(isDraftHeroState: boolean) {
   const transitionGroupRef = useRef<HTMLDivElement | null>(null);
   const composerAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -1278,6 +1297,7 @@ function ChatViewContent(props: ChatViewProps) {
   const [attachmentPreviewHandoffByMessageId, setAttachmentPreviewHandoffByMessageId] = useState<
     Record<string, string[]>
   >({});
+  const [isRetryingRecovery, setIsRetryingRecovery] = useState(false);
   const [pendingServerThreadEnvMode, setPendingServerThreadEnvMode] =
     useState<DraftThreadEnvMode | null>(null);
   const [pendingServerThreadBranch, setPendingServerThreadBranch] = useState<string | null>();
@@ -2106,6 +2126,164 @@ function ChatViewContent(props: ChatViewProps) {
       ),
     [serverAttachmentIds, serverAttachmentUrls],
   );
+  const recoveryPresentation = useMemo(
+    () => (activeThread ? buildThreadRecoveryPresentation(activeThread) : null),
+    [activeThread],
+  );
+  const setThreadError = useCallback(
+    (targetThreadId: ThreadId | null, error: string | null) => {
+      if (!targetThreadId) return;
+      const nextError = sanitizeThreadErrorMessage(error);
+      const nextEntry: LocalThreadErrorEntry = { message: nextError, at: Date.now() };
+      if (
+        serverThread &&
+        targetThreadId === routeThreadRef.threadId &&
+        serverThread.environmentId === routeThreadRef.environmentId &&
+        serverThread.id === targetThreadId
+      ) {
+        setLocalServerErrorsByThreadKey((existing) => {
+          if ((existing[routeThreadKey]?.message ?? null) === nextError) {
+            return existing;
+          }
+          return {
+            ...existing,
+            [routeThreadKey]: nextEntry,
+          };
+        });
+        return;
+      }
+      const localDraftErrorKey = draftId ?? targetThreadId;
+      setLocalDraftErrorsByDraftId((existing) => {
+        if ((existing[localDraftErrorKey]?.message ?? null) === nextError) {
+          return existing;
+        }
+        return {
+          ...existing,
+          [localDraftErrorKey]: nextEntry,
+        };
+      });
+    },
+    [draftId, routeThreadKey, routeThreadRef, serverThread],
+  );
+  const recoveryRetry = useMemo(
+    () =>
+      activeThread
+        ? resolveThreadRecoveryRetry(activeThread, serverAttachmentUrlById)
+        : ({ kind: "unavailable", reason: "not-interrupted" } as const),
+    [activeThread, serverAttachmentUrlById],
+  );
+
+  const onRetryInterruptedTurn = useCallback(async () => {
+    if (
+      !activeThread ||
+      recoveryRetry.kind !== "available" ||
+      isRetryingRecovery ||
+      isSendBusy ||
+      isConnecting ||
+      activeEnvironmentUnavailable ||
+      sendInFlightRef.current
+    ) {
+      return;
+    }
+
+    const threadIdForRetry = activeThread.id;
+    const messageIdForRetry = newMessageId();
+    const createdAt = new Date().toISOString();
+    let optimisticMessageAdded = false;
+
+    setIsRetryingRecovery(true);
+    sendInFlightRef.current = true;
+    beginLocalDispatch({ preparingWorktree: false });
+    setThreadError(threadIdForRetry, null);
+
+    try {
+      const attachments = await Promise.all(
+        recoveryRetry.attachments.map(async ({ attachment, url }) => ({
+          type: "image" as const,
+          name: attachment.name,
+          mimeType: attachment.mimeType,
+          sizeBytes: attachment.sizeBytes,
+          dataUrl: await fetchRecoveryAttachmentDataUrl({
+            url,
+            name: attachment.name,
+            mimeType: attachment.mimeType,
+          }),
+        })),
+      );
+      const optimisticAttachments = recoveryRetry.attachments.map(({ attachment, url }) => ({
+        ...attachment,
+        previewUrl: url,
+      }));
+      setOptimisticUserMessages((existing) => [
+        ...existing,
+        {
+          id: messageIdForRetry,
+          role: "user",
+          text: recoveryRetry.text,
+          ...(optimisticAttachments.length > 0 ? { attachments: optimisticAttachments } : {}),
+          turnId: null,
+          createdAt,
+          updatedAt: createdAt,
+          streaming: false,
+        },
+      ]);
+      optimisticMessageAdded = true;
+
+      const startResult = await startThreadTurn({
+        environmentId,
+        input: {
+          threadId: threadIdForRetry,
+          message: {
+            messageId: messageIdForRetry,
+            role: "user",
+            text: recoveryRetry.text,
+            attachments,
+          },
+          modelSelection: activeThread.modelSelection,
+          titleSeed: activeThread.title,
+          runtimeMode: activeThread.runtimeMode,
+          interactionMode: activeThread.interactionMode,
+          ...(recoveryRetry.sourceProposedPlan
+            ? { sourceProposedPlan: recoveryRetry.sourceProposedPlan }
+            : {}),
+          createdAt,
+        },
+      });
+      if (startResult._tag === "Failure") {
+        if (!isAtomCommandInterrupted(startResult)) {
+          const error = squashAtomCommandFailure(startResult);
+          throw error instanceof Error ? error : new Error("Failed to retry the interrupted turn.");
+        }
+        return;
+      }
+    } catch (error) {
+      if (optimisticMessageAdded) {
+        setOptimisticUserMessages((existing) =>
+          existing.filter((message) => message.id !== messageIdForRetry),
+        );
+      }
+      setThreadError(
+        threadIdForRetry,
+        error instanceof Error ? error.message : "Failed to retry the interrupted turn.",
+      );
+      resetLocalDispatch();
+    } finally {
+      sendInFlightRef.current = false;
+      setIsRetryingRecovery(false);
+    }
+  }, [
+    activeEnvironmentUnavailable,
+    activeThread,
+    beginLocalDispatch,
+    environmentId,
+    isConnecting,
+    isRetryingRecovery,
+    isSendBusy,
+    recoveryRetry,
+    resetLocalDispatch,
+    setThreadError,
+    startThreadTurn,
+  ]);
   const displayServerMessages = useMemo<ReadonlyArray<ChatMessage>>(() => {
     if (!serverMessages) return [];
     return serverMessages.map((message) => {
@@ -2452,42 +2630,6 @@ function ChatViewContent(props: ChatViewProps) {
     null;
   const hasReachedSplitLimit =
     (activeTerminalGroup?.terminalIds.length ?? 0) >= MAX_TERMINALS_PER_GROUP;
-  const setThreadError = useCallback(
-    (targetThreadId: ThreadId | null, error: string | null) => {
-      if (!targetThreadId) return;
-      const nextError = sanitizeThreadErrorMessage(error);
-      const nextEntry: LocalThreadErrorEntry = { message: nextError, at: Date.now() };
-      if (
-        serverThread &&
-        targetThreadId === routeThreadRef.threadId &&
-        serverThread.environmentId === routeThreadRef.environmentId &&
-        serverThread.id === targetThreadId
-      ) {
-        setLocalServerErrorsByThreadKey((existing) => {
-          if ((existing[routeThreadKey]?.message ?? null) === nextError) {
-            return existing;
-          }
-          return {
-            ...existing,
-            [routeThreadKey]: nextEntry,
-          };
-        });
-        return;
-      }
-      const localDraftErrorKey = draftId ?? targetThreadId;
-      setLocalDraftErrorsByDraftId((existing) => {
-        if ((existing[localDraftErrorKey]?.message ?? null) === nextError) {
-          return existing;
-        }
-        return {
-          ...existing,
-          [localDraftErrorKey]: nextEntry,
-        };
-      });
-    },
-    [draftId, routeThreadKey, routeThreadRef, serverThread],
-  );
-
   const focusComposer = useCallback(() => {
     composerRef.current?.focusAtEnd();
   }, [composerRef]);
@@ -5658,6 +5800,13 @@ function ChatViewContent(props: ChatViewProps) {
         <ThreadErrorBanner
           error={threadError}
           onDismiss={() => setThreadError(activeThread.id, null)}
+        />
+        <ThreadRecoveryBanner
+          presentation={recoveryPresentation}
+          retry={recoveryRetry}
+          retrying={isRetryingRecovery}
+          timestampFormat={timestampFormat}
+          onRetry={() => void onRetryInterruptedTurn()}
         />
         {/* Main content area with optional plan sidebar */}
         <div className="flex min-h-0 min-w-0 flex-1">
