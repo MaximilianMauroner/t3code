@@ -280,6 +280,109 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("rejects recovery after the durable pending start is replaced without appending an event", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-replaced-pending-recovery");
+    const threadId = ThreadId.make("thread-replaced-pending-recovery");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-replaced-pending-project"),
+        projectId,
+        title: "Replaced pending recovery",
+        workspaceRoot: "/tmp/project-replaced-pending-recovery",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-replaced-pending-thread"),
+        threadId,
+        projectId,
+        title: "Replaced pending recovery",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-replaced-pending-start"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-original-pending"),
+          role: "user",
+          text: "preserve the replacement",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: now(),
+      }),
+    );
+    const originalDelivery = (await system.run(system.deliveries.listPendingOrdered()))[0]!;
+    await system.run(
+      system.turns.replacePendingTurnStart({
+        threadId,
+        messageId: asMessageId("message-replacement-pending"),
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        requestedAt: "2026-01-01T00:00:02.000Z",
+        pendingDeliveryId: "delivery-replacement",
+        pendingEventId: "event-replacement",
+      }),
+    );
+    const sequenceBeforeRecovery = await system.run(system.engine.latestSequence);
+
+    await expect(
+      system.run(
+        system.engine.dispatchInternal({
+          type: "thread.session.interrupt-if-active",
+          commandId: CommandId.make("recovery-replaced-pending"),
+          threadId,
+          target: {
+            kind: "pendingStart",
+            pendingMessageId: asMessageId("message-original-pending"),
+            deliveryId: originalDelivery.deliveryId,
+            sourceEventId: originalDelivery.sourceEventId,
+            expectedSession: { kind: "absent" },
+          },
+          reason: "server-restarted",
+          interruptionCode: "server_restart",
+          serverBootId: "boot-2",
+          detectedAt: "2026-01-01T00:00:03.000Z",
+          createdAt: "2026-01-01T00:00:03.000Z",
+        }),
+      ),
+    ).rejects.toMatchObject({
+      _tag: "OrchestrationCommandInvariantError",
+      detail: "Recovery target no longer matches the durable pending turn start.",
+    });
+
+    expect(await system.run(system.engine.latestSequence)).toBe(sequenceBeforeRecovery);
+    expect(
+      Option.getOrThrow(await system.run(system.deliveries.getById(originalDelivery.deliveryId)))
+        .status,
+    ).toBe("pending");
+    expect(
+      Option.getOrThrow(await system.run(system.turns.getPendingTurnStartByThreadId({ threadId }))),
+    ).toMatchObject({
+      messageId: "message-replacement-pending",
+      pendingDeliveryId: "delivery-replacement",
+      pendingEventId: "event-replacement",
+    });
+    const snapshot = await system.readModel();
+    const thread = snapshot.threads.find((candidate) => candidate.id === threadId)!;
+    expect(thread.activities).toEqual([]);
+    expect(thread.session).toBeNull();
+    await system.dispose();
+  });
+
   it("persists concrete interruption evidence across later session writes and snapshots", async () => {
     const system = await createOrchestrationSystem();
     const projectId = asProjectId("project-concrete-recovery");

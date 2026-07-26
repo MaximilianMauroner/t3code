@@ -15,7 +15,7 @@ import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
-import { decideOrchestrationCommand } from "./decider.ts";
+import { decideOrchestrationCommand, type PendingTurnStartCommandState } from "./decider.ts";
 
 const STARTED = "2026-07-26T00:00:00.000Z";
 const UPDATED = "2026-07-26T00:00:01.000Z";
@@ -194,6 +194,11 @@ it.layer(NodeServices.layer)("recovery decider", (it) => {
       };
       const event = yield* decideOrchestrationCommand({
         readModel: pendingModel,
+        pendingTurnStart: {
+          messageId: "message-1",
+          deliveryId: "delivery-1",
+          sourceEventId: "event-1",
+        },
         command: {
           type: "thread.session.interrupt-if-active",
           commandId: CommandId.make("recovery-pending"),
@@ -233,6 +238,11 @@ it.layer(NodeServices.layer)("recovery decider", (it) => {
       };
       const event = yield* decideOrchestrationCommand({
         readModel: pendingModel,
+        pendingTurnStart: {
+          messageId: "message-1",
+          deliveryId: "delivery-1",
+          sourceEventId: "event-1",
+        },
         command: {
           type: "thread.session.interrupt-if-active",
           commandId: CommandId.make("recovery-pending-present"),
@@ -274,6 +284,59 @@ it.layer(NodeServices.layer)("recovery decider", (it) => {
           providerInstanceId: "codex",
         });
       }
+    }),
+  );
+
+  it.effect("rejects a replaced or historically incomplete durable pending start", () =>
+    Effect.gen(function* () {
+      const model = readModel();
+      const thread = model.threads[0]!;
+      const pendingModel: OrchestrationReadModel = {
+        ...model,
+        threads: [{ ...thread, session: null, latestTurn: null }],
+      };
+      const command = {
+        type: "thread.session.interrupt-if-active" as const,
+        commandId: CommandId.make("recovery-pending-stale"),
+        threadId: ThreadId.make("thread-1"),
+        target: {
+          kind: "pendingStart" as const,
+          pendingMessageId: MessageId.make("message-1"),
+          deliveryId: "delivery-1",
+          sourceEventId: EventId.make("event-1"),
+          expectedSession: { kind: "absent" as const },
+        },
+        reason: "server-restarted" as const,
+        interruptionCode: "server_restart" as const,
+        serverBootId: "boot-2",
+        detectedAt: DETECTED,
+        createdAt: DETECTED,
+      };
+      const staleStates = [
+        null,
+        { messageId: "message-2", deliveryId: "delivery-1", sourceEventId: "event-1" },
+        { messageId: "message-1", deliveryId: "delivery-2", sourceEventId: "event-1" },
+        { messageId: "message-1", deliveryId: "delivery-1", sourceEventId: "event-2" },
+        { messageId: "message-1" },
+      ] satisfies ReadonlyArray<PendingTurnStartCommandState | null>;
+
+      for (const pendingTurnStart of staleStates) {
+        const error = yield* decideOrchestrationCommand({
+          readModel: pendingModel,
+          pendingTurnStart,
+          command,
+        }).pipe(Effect.flip);
+        expect(error).toMatchObject({
+          _tag: "OrchestrationCommandInvariantError",
+          detail: "Recovery target no longer matches the durable pending turn start.",
+        });
+      }
+
+      const missingLookupError = yield* decideOrchestrationCommand({
+        readModel: pendingModel,
+        command,
+      }).pipe(Effect.flip);
+      expect(missingLookupError._tag).toBe("OrchestrationCommandInvariantError");
     }),
   );
 });

@@ -36,6 +36,8 @@ import { OrchestrationEventStore } from "../../persistence/Services/Orchestratio
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import { OrchestrationReactorDeliveries } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 import { OrchestrationReactorDeliveriesLive } from "../../persistence/Layers/OrchestrationReactorDeliveries.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import {
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
@@ -108,6 +110,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const maintenanceGate = yield* UpdateMaintenanceGate;
   const reactorDeliveries = yield* OrchestrationReactorDeliveries;
+  const projectionTurns = yield* ProjectionTurnRepository;
   const serverBootId = (yield* ServerBootIdentity).id;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -187,25 +190,54 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           envelope.command,
           envelope.maintenanceAcceptance,
           Effect.gen(function* () {
-            const eventBase = yield* decideOrchestrationCommand({
-              command: envelope.command,
-              readModel: commandReadModel,
-            }).pipe(
-              Effect.provideService(Crypto.Crypto, crypto),
-              Effect.mapError((cause) =>
-                isOrchestrationCommandInvariantError(cause)
-                  ? cause
-                  : new OrchestrationCommandInvariantError({
-                      commandType: envelope.command.type,
-                      detail: "Failed to generate an event identifier.",
-                      cause,
-                    }),
-              ),
-            );
-            const eventBases = Array.isArray(eventBase) ? eventBase : [eventBase];
             const committed = yield* sql
               .withTransaction(
                 Effect.gen(function* () {
+                  const pendingTurnStart =
+                    envelope.command.type === "thread.session.interrupt-if-active" &&
+                    envelope.command.target.kind === "pendingStart"
+                      ? yield* projectionTurns
+                          .getPendingTurnStartByThreadId({
+                            threadId: envelope.command.threadId,
+                          })
+                          .pipe(
+                            Effect.map(
+                              Option.match({
+                                onNone: () => null,
+                                onSome: (pending) => {
+                                  const deliveryId = pending.pendingDeliveryId;
+                                  const sourceEventId = pending.pendingEventId;
+                                  return {
+                                    messageId: pending.messageId,
+                                    ...(deliveryId !== undefined && deliveryId !== null
+                                      ? { deliveryId }
+                                      : {}),
+                                    ...(sourceEventId !== undefined && sourceEventId !== null
+                                      ? { sourceEventId }
+                                      : {}),
+                                  };
+                                },
+                              }),
+                            ),
+                          )
+                      : undefined;
+                  const eventBase = yield* decideOrchestrationCommand({
+                    command: envelope.command,
+                    readModel: commandReadModel,
+                    ...(pendingTurnStart !== undefined ? { pendingTurnStart } : {}),
+                  }).pipe(
+                    Effect.provideService(Crypto.Crypto, crypto),
+                    Effect.mapError((cause) =>
+                      isOrchestrationCommandInvariantError(cause)
+                        ? cause
+                        : new OrchestrationCommandInvariantError({
+                            commandType: envelope.command.type,
+                            detail: "Failed to generate an event identifier.",
+                            cause,
+                          }),
+                    ),
+                  );
+                  const eventBases = Array.isArray(eventBase) ? eventBase : [eventBase];
                   const committedEvents: OrchestrationEvent[] = [];
                   let nextCommandReadModel = commandReadModel;
 
@@ -590,7 +622,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 export const OrchestrationEngineCoreLive = Layer.effect(
   OrchestrationEngineService,
   makeOrchestrationEngine,
-).pipe(Layer.provide(OrchestrationReactorDeliveriesLive));
+).pipe(
+  Layer.provide(OrchestrationReactorDeliveriesLive),
+  Layer.provide(ProjectionTurnRepositoryLive),
+);
 
 export const OrchestrationEngineLive = OrchestrationEngineCoreLive.pipe(
   Layer.provide(ServerBootIdentity.layer),

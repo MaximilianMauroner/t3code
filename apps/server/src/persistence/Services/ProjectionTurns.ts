@@ -89,8 +89,10 @@ export const ProjectionPendingTurnStart = Schema.Struct({
   sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
   sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
   requestedAt: IsoDateTime,
-  pendingDeliveryId: Schema.optionalKey(Schema.String),
-  pendingEventId: Schema.optionalKey(Schema.String),
+  // Historic pending rows predate durable delivery identity and decode as null.
+  // Recovery treats either null or absence as non-matchable rather than guessing.
+  pendingDeliveryId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  pendingEventId: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 export type ProjectionPendingTurnStart = typeof ProjectionPendingTurnStart.Type;
 

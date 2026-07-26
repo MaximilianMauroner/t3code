@@ -200,6 +200,13 @@ type DecideOrchestrationCommandResult =
   | PlannedOrchestrationEvent
   | ReadonlyArray<PlannedOrchestrationEvent>;
 
+/** Exact durable pending-start identity read in the command transaction. */
+export interface PendingTurnStartCommandState {
+  readonly messageId: string;
+  readonly deliveryId?: string;
+  readonly sourceEventId?: string;
+}
+
 const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
   commands,
   readModel,
@@ -237,9 +244,11 @@ const decideCommandSequence = Effect.fn("decideCommandSequence")(function* ({
 export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand")(function* ({
   command,
   readModel,
+  pendingTurnStart,
 }: {
   readonly command: OrchestrationCommand;
   readonly readModel: OrchestrationReadModel;
+  readonly pendingTurnStart?: PendingTurnStartCommandState | null;
 }): Effect.fn.Return<
   DecideOrchestrationCommandResult,
   OrchestrationCommandInvariantError | PlatformError.PlatformError,
@@ -1056,6 +1065,19 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             serverBootId: command.serverBootId,
           },
         };
+      }
+
+      if (
+        pendingTurnStart === undefined ||
+        pendingTurnStart === null ||
+        pendingTurnStart.messageId !== command.target.pendingMessageId ||
+        pendingTurnStart.deliveryId !== command.target.deliveryId ||
+        pendingTurnStart.sourceEventId !== command.target.sourceEventId
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Recovery target no longer matches the durable pending turn start.",
+        });
       }
 
       return {

@@ -33,6 +33,38 @@ it.layer(testLayer)("ProjectionTurnRepository recovery evidence", (it) => {
         pendingEventId: "event-start",
       });
 
+      yield* repository.replacePendingTurnStart({
+        threadId,
+        messageId: MessageId.make("message-replacement"),
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        requestedAt: "2026-07-26T00:00:01.000Z",
+        pendingDeliveryId: "delivery-replacement",
+        pendingEventId: "event-replacement",
+      });
+      expect(
+        Option.getOrThrow(yield* repository.getPendingTurnStartByThreadId({ threadId })),
+      ).toMatchObject({
+        messageId: "message-replacement",
+        pendingDeliveryId: "delivery-replacement",
+        pendingEventId: "event-replacement",
+      });
+
+      yield* repository.replacePendingTurnStart({
+        threadId,
+        messageId,
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        requestedAt: "2026-07-26T00:00:02.000Z",
+      });
+      expect(
+        Option.getOrThrow(yield* repository.getPendingTurnStartByThreadId({ threadId })),
+      ).toMatchObject({
+        messageId: "message-source",
+        pendingDeliveryId: null,
+        pendingEventId: null,
+      });
+
       const turnId = TurnId.make("turn-1");
       yield* repository.upsertByTurnId({
         threadId,

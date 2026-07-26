@@ -1432,7 +1432,9 @@ const makeProviderRuntimeIngestion = Effect.fn("makeProviderRuntimeIngestion")(f
               }
             : Option.isSome(pendingTurnStart) &&
                 pendingTurnStart.value.pendingDeliveryId !== undefined &&
-                pendingTurnStart.value.pendingEventId !== undefined
+                pendingTurnStart.value.pendingDeliveryId !== null &&
+                pendingTurnStart.value.pendingEventId !== undefined &&
+                pendingTurnStart.value.pendingEventId !== null
               ? {
                   kind: "pendingStart" as const,
                   pendingMessageId: pendingTurnStart.value.messageId,
