@@ -17,7 +17,7 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   const checkpointReactor = yield* CheckpointReactor;
   const threadDeletionReactor = yield* ThreadDeletionReactor;
   const agentAwarenessRelay = yield* AgentAwarenessRelay.AgentAwarenessRelay;
-  const auxiliaryScope = yield* Scope.make("sequential");
+  const auxiliaryScope = yield* Scope.fork(yield* Effect.scope, "sequential");
 
   const start: OrchestrationReactorShape["start"] = Effect.fn("start")(function* () {
     yield* providerCommandReactor.start().pipe(Scope.provide(auxiliaryScope));
@@ -27,10 +27,10 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   });
 
   const quiesceAndDrain = Scope.close(auxiliaryScope, Exit.void).pipe(
-    Effect.andThen(providerCommandReactor.drain),
+    Effect.andThen(providerCommandReactor.quiesceAndDrain),
     Effect.andThen(checkpointReactor.drain),
     Effect.andThen(threadDeletionReactor.drain),
-    Effect.andThen(agentAwarenessRelay.drain),
+    Effect.andThen(agentAwarenessRelay.quiesceAndDrain),
   );
 
   return {

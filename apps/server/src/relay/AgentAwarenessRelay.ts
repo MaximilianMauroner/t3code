@@ -23,10 +23,12 @@ import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
-import type * as Scope from "effect/Scope";
+import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import * as HttpClient from "effect/unstable/http/HttpClient";
@@ -51,6 +53,7 @@ export class AgentAwarenessRelay extends Context.Service<
     readonly publishThread: (threadId: ThreadId) => Effect.Effect<void>;
     readonly start: () => Effect.Effect<void, never, Scope.Scope>;
     readonly drain: Effect.Effect<void>;
+    readonly quiesceAndDrain: Effect.Effect<void>;
   }
 >()("t3/relay/AgentAwarenessRelay") {}
 
@@ -299,6 +302,9 @@ export const make = Effect.gen(function* () {
   const cloudLinkKeyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(secrets);
   const activeSnapshotPublishedRef = yield* Ref.make(false);
   const publishedStateByThreadRef = yield* Ref.make(new Map<ThreadId, string>());
+  const confirmationTaskScope = yield* Scope.fork(yield* Effect.scope, "sequential");
+  const confirmationAdmissionOpen = yield* Ref.make(true);
+  const confirmationAdmissionLock = yield* Semaphore.make(1);
 
   const readSecretString = (name: string) =>
     secrets
@@ -563,17 +569,42 @@ export const make = Effect.gen(function* () {
   const worker = yield* makeDrainableWorker(publishThread);
 
   schedulePublishConfirm = (threadId) =>
-    Effect.forkDetach(
-      Effect.sleep("5 seconds").pipe(
-        Effect.andThen(worker.enqueue(threadId)),
-        Effect.catchCause((cause) =>
-          Effect.logWarning("deferred agent activity confirmation failed", {
-            threadId,
-            cause: Cause.pretty(cause),
-          }),
-        ),
+    confirmationAdmissionLock.withPermit(
+      Ref.get(confirmationAdmissionOpen).pipe(
+        Effect.flatMap((admissionOpen) => {
+          if (!admissionOpen) {
+            return Effect.void;
+          }
+          return Effect.sleep("5 seconds").pipe(
+            Effect.andThen(worker.enqueue(threadId)),
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.interrupt
+                : Effect.logWarning("deferred agent activity confirmation failed", {
+                    threadId,
+                    cause: Cause.pretty(cause),
+                  }),
+            ),
+            Effect.forkIn(confirmationTaskScope),
+            Effect.asVoid,
+          );
+        }),
       ),
-    ).pipe(Effect.asVoid);
+    );
+
+  const closeConfirmationAdmission = confirmationAdmissionLock.withPermit(
+    Ref.get(confirmationAdmissionOpen).pipe(
+      Effect.flatMap((admissionOpen) =>
+        admissionOpen
+          ? Ref.set(confirmationAdmissionOpen, false).pipe(
+              Effect.andThen(Scope.close(confirmationTaskScope, Exit.void)),
+            )
+          : Effect.void,
+      ),
+    ),
+  );
+
+  const quiesceAndDrain = closeConfirmationAdmission.pipe(Effect.andThen(worker.drain));
 
   const start: AgentAwarenessRelay["Service"]["start"] = Effect.fn("AgentAwarenessRelay.start")(
     function* () {
@@ -635,6 +666,7 @@ export const make = Effect.gen(function* () {
     publishThread,
     start,
     drain: worker.drain,
+    quiesceAndDrain,
   });
 });
 

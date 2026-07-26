@@ -187,6 +187,7 @@ describe("OrchestrationDeliveryRuntime", () => {
         Layer.succeed(ProviderCommandReactor, {
           start: () => Effect.void,
           drain: Effect.void,
+          quiesceAndDrain: Effect.void,
           deliver: input.providerDeliver,
         }),
       ),

@@ -34,6 +34,9 @@ export interface ProviderCommandReactorShape {
    */
   readonly drain: Effect.Effect<void>;
 
+  /** Closes background-task admission, cancels owned tasks, and drains queued work. */
+  readonly quiesceAndDrain: Effect.Effect<void>;
+
   /** Executes one already-claimed provider delivery. */
   readonly deliver: (
     delivery: OrchestrationReactorDelivery,

@@ -35,6 +35,7 @@ describe("OrchestrationReactor", () => {
               return Effect.void;
             },
             drain: Effect.sync(() => drained.push("provider-command-reactor")),
+            quiesceAndDrain: Effect.sync(() => drained.push("provider-command-quiesce")),
             deliver: () => Effect.succeed("delivered" as const),
           }),
         ),
@@ -62,6 +63,7 @@ describe("OrchestrationReactor", () => {
           Layer.succeed(AgentAwarenessRelay.AgentAwarenessRelay, {
             publishThread: () => Effect.void,
             drain: Effect.sync(() => drained.push("agent-awareness-relay")),
+            quiesceAndDrain: Effect.sync(() => drained.push("agent-awareness-quiesce")),
             start: () => {
               started.push("agent-awareness-relay");
               return Effect.void;
@@ -84,10 +86,10 @@ describe("OrchestrationReactor", () => {
 
     await runtime!.runPromise(reactor.quiesceAndDrain);
     expect(drained).toEqual([
-      "provider-command-reactor",
+      "provider-command-quiesce",
       "checkpoint-reactor",
       "thread-deletion-reactor",
-      "agent-awareness-relay",
+      "agent-awareness-quiesce",
     ]);
 
     await Effect.runPromise(Scope.close(scope, Exit.void));

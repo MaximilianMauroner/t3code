@@ -502,6 +502,7 @@ describe("ProviderCommandReactor", () => {
       refreshStatus,
       generateBranchName,
       generateThreadTitle,
+      reactor,
       runtimeSessions,
       stateDir,
       drain,
@@ -707,6 +708,164 @@ describe("ProviderCommandReactor", () => {
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.title).toBe("Generated title");
   });
+
+  effectIt.effect("keeps first-turn title generation alive after delivery acknowledgement", () =>
+    Effect.gen(function* () {
+      const generationStarted = yield* Deferred.make<void>();
+      const releaseGeneration = yield* Deferred.make<void>();
+      const harness = yield* Effect.promise(() => createHarness());
+      const now = "2026-01-01T00:00:00.000Z";
+      const seededTitle = "Investigate lifecycle ownership";
+      harness.generateThreadTitle.mockReturnValue(
+        Deferred.succeed(generationStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseGeneration)),
+          Effect.as({ title: "Lifecycle ownership fixed" }),
+        ),
+      );
+
+      yield* harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-title-lifecycle-seed"),
+        threadId: ThreadId.make("thread-1"),
+        title: seededTitle,
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-lifecycle-title"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-lifecycle-title"),
+          role: "user",
+          text: "Investigate lifecycle ownership",
+          attachments: [],
+        },
+        titleSeed: seededTitle,
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      });
+
+      yield* Deferred.await(generationStarted);
+      yield* Effect.promise(() => harness.drain());
+      expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+      expect(
+        (yield* Effect.promise(() => harness.readModel())).threads.find(
+          (entry) => entry.id === ThreadId.make("thread-1"),
+        )?.title,
+      ).toBe(seededTitle);
+
+      yield* Deferred.succeed(releaseGeneration, undefined);
+      yield* Effect.promise(() =>
+        waitFor(async () => {
+          const readModel = await harness.readModel();
+          return (
+            readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"))?.title ===
+            "Lifecycle ownership fixed"
+          );
+        }),
+      );
+    }),
+  );
+
+  effectIt.effect("cancels pending first-turn background tasks during quiesce", () =>
+    Effect.gen(function* () {
+      const generationStarted = yield* Deferred.make<void>();
+      const generationInterrupted = yield* Deferred.make<void>();
+      const harness = yield* Effect.promise(() => createHarness());
+      const now = "2026-01-01T00:00:00.000Z";
+      const seededTitle = "Cancel this generation on shutdown";
+      harness.generateThreadTitle.mockReturnValue(
+        Deferred.succeed(generationStarted, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.onInterrupt(() => Deferred.succeed(generationInterrupted, undefined)),
+        ),
+      );
+
+      yield* harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-title-quiesce-seed"),
+        threadId: ThreadId.make("thread-1"),
+        title: seededTitle,
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-quiesce-title"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-quiesce-title"),
+          role: "user",
+          text: "Cancel this generation on shutdown",
+          attachments: [],
+        },
+        titleSeed: seededTitle,
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      });
+
+      yield* Deferred.await(generationStarted);
+      yield* Effect.promise(() => harness.drain());
+      yield* harness.reactor.quiesceAndDrain;
+      yield* Deferred.await(generationInterrupted);
+      yield* harness.reactor.quiesceAndDrain;
+
+      expect(
+        (yield* Effect.promise(() => harness.readModel())).threads.find(
+          (entry) => entry.id === ThreadId.make("thread-1"),
+        )?.title,
+      ).toBe(seededTitle);
+    }),
+  );
+
+  effectIt.effect("contains first-turn background task failures", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() => createHarness());
+      const now = "2026-01-01T00:00:00.000Z";
+      const seededTitle = "Contain generation failure";
+      harness.generateThreadTitle.mockReturnValue(
+        Effect.fail(
+          new TextGenerationError({
+            operation: "generateThreadTitle",
+            detail: "deterministic background failure",
+          }),
+        ),
+      );
+
+      yield* harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-title-failure-seed"),
+        threadId: ThreadId.make("thread-1"),
+        title: seededTitle,
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-title-failure"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-title-failure"),
+          role: "user",
+          text: "Contain generation failure",
+          attachments: [],
+        },
+        titleSeed: seededTitle,
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      });
+
+      yield* Effect.promise(() =>
+        waitFor(() => harness.generateThreadTitle.mock.calls.length === 1),
+      );
+      yield* Effect.promise(() => harness.drain());
+      yield* harness.reactor.quiesceAndDrain;
+      expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+      expect(
+        (yield* Effect.promise(() => harness.readModel())).threads.find(
+          (entry) => entry.id === ThreadId.make("thread-1"),
+        )?.title,
+      ).toBe(seededTitle);
+    }),
+  );
 
   it("does not overwrite an existing custom thread title on the first turn", async () => {
     const harness = await createHarness();

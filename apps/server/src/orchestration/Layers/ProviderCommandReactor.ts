@@ -17,9 +17,13 @@ import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
@@ -204,6 +208,20 @@ const make = Effect.gen(function* () {
     crypto.randomUUIDv4.pipe(Effect.map((uuid) => CommandId.make(`server:${tag}:${uuid}`)));
   const serverEventId = () => crypto.randomUUIDv4.pipe(Effect.map(EventId.make));
   const threadModelSelections = new Map<string, ModelSelection>();
+  const backgroundTaskScope = yield* Scope.fork(yield* Effect.scope, "sequential");
+  const backgroundAdmissionOpen = yield* Ref.make(true);
+  const backgroundAdmissionLock = yield* Semaphore.make(1);
+
+  const forkBackgroundTask = (task: Effect.Effect<void>) =>
+    backgroundAdmissionLock.withPermit(
+      Ref.get(backgroundAdmissionOpen).pipe(
+        Effect.flatMap((admissionOpen) =>
+          admissionOpen
+            ? task.pipe(Effect.forkIn(backgroundTaskScope), Effect.asVoid)
+            : Effect.void,
+        ),
+      ),
+    );
 
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -704,12 +722,17 @@ const make = Effect.gen(function* () {
       yield* vcsStatusBroadcaster.refreshStatus(cwd).pipe(Effect.ignoreCause({ log: true }));
     }).pipe(
       Effect.catchCause((cause) =>
-        Effect.logWarning("provider command reactor failed to generate or rename worktree branch", {
-          threadId: input.threadId,
-          cwd,
-          oldBranch,
-          cause: Cause.pretty(cause),
-        }),
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning(
+              "provider command reactor failed to generate or rename worktree branch",
+              {
+                threadId: input.threadId,
+                cwd,
+                oldBranch,
+                cause: Cause.pretty(cause),
+              },
+            ),
       ),
     );
   });
@@ -749,11 +772,16 @@ const make = Effect.gen(function* () {
         });
       }).pipe(
         Effect.catchCause((cause) =>
-          Effect.logWarning("provider command reactor failed to generate or rename thread title", {
-            threadId: input.threadId,
-            cwd: input.cwd,
-            cause: Cause.pretty(cause),
-          }),
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.interrupt
+            : Effect.logWarning(
+                "provider command reactor failed to generate or rename thread title",
+                {
+                  threadId: input.threadId,
+                  cwd: input.cwd,
+                  cause: Cause.pretty(cause),
+                },
+              ),
         ),
       );
     },
@@ -795,19 +823,23 @@ const make = Effect.gen(function* () {
         ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
       };
 
-      yield* maybeGenerateAndRenameWorktreeBranchForFirstTurn({
-        threadId: event.payload.threadId,
-        branch: thread.branch,
-        worktreePath: thread.worktreePath,
-        ...generationInput,
-      }).pipe(Effect.forkScoped);
+      yield* forkBackgroundTask(
+        maybeGenerateAndRenameWorktreeBranchForFirstTurn({
+          threadId: event.payload.threadId,
+          branch: thread.branch,
+          worktreePath: thread.worktreePath,
+          ...generationInput,
+        }),
+      );
 
       if (canReplaceThreadTitle(thread.title, event.payload.titleSeed)) {
-        yield* maybeGenerateThreadTitleForFirstTurn({
-          threadId: event.payload.threadId,
-          cwd: generationCwd,
-          ...generationInput,
-        }).pipe(Effect.forkScoped);
+        yield* forkBackgroundTask(
+          maybeGenerateThreadTitleForFirstTurn({
+            threadId: event.payload.threadId,
+            cwd: generationCwd,
+            ...generationInput,
+          }),
+        );
       }
     }
 
@@ -1143,9 +1175,24 @@ const make = Effect.gen(function* () {
     yield* Effect.void;
   });
 
+  const closeBackgroundAdmission = backgroundAdmissionLock.withPermit(
+    Ref.get(backgroundAdmissionOpen).pipe(
+      Effect.flatMap((admissionOpen) =>
+        admissionOpen
+          ? Ref.set(backgroundAdmissionOpen, false).pipe(
+              Effect.andThen(Scope.close(backgroundTaskScope, Exit.void)),
+            )
+          : Effect.void,
+      ),
+    ),
+  );
+
+  const quiesceAndDrain = closeBackgroundAdmission.pipe(Effect.andThen(worker.drain));
+
   return {
     start,
     drain: worker.drain,
+    quiesceAndDrain,
     deliver,
   } satisfies ProviderCommandReactorShape;
 });
