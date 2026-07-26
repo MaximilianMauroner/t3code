@@ -103,15 +103,14 @@ type TestThreadInput = OrchestrationThreadStreamItem | Error;
 
 function testSession(
   client: WsRpcProtocolClient,
-  options?: { readonly completionMarker?: boolean },
+  options?: { readonly completionMarker?: boolean; readonly recoveryEvents?: boolean },
 ): RpcSession.RpcSession {
   return {
     client,
-    initialConfig: Effect.succeed(
-      options?.completionMarker === true
-        ? ({ threadResumeCompletionMarker: true } as never)
-        : ({} as never),
-    ),
+    initialConfig: Effect.succeed({
+      ...(options?.completionMarker === true ? { threadResumeCompletionMarker: true } : {}),
+      ...(options?.recoveryEvents === true ? { threadRecoveryEventsV1: true } : {}),
+    } as never),
     ready: Effect.void,
     probe: Effect.void,
     closed: Effect.never,
@@ -133,6 +132,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   readonly cached?: OrchestrationThread;
   readonly httpSnapshot?: Option.Option<OrchestrationThreadDetailSnapshot>;
   readonly completionMarker?: boolean;
+  readonly recoveryEvents?: boolean;
 }) {
   const inputs = yield* Queue.unbounded<TestThreadInput>();
   const observed = yield* Queue.unbounded<EnvironmentThreadState>();
@@ -142,6 +142,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   const loaderCalls = yield* Ref.make(0);
   const lastSubscribeAfterSequence = yield* Ref.make<number | undefined>(undefined);
   const lastRequestCompletionMarker = yield* Ref.make<boolean | undefined>(undefined);
+  const lastThreadRecoveryEventsV1 = yield* Ref.make<boolean | undefined>(undefined);
   const savedThreads = yield* Ref.make<ReadonlyArray<OrchestrationThreadDetailSnapshot>>([]);
   const removedThreads = yield* Ref.make<ReadonlyArray<ThreadId>>([]);
   const wakeups = yield* Queue.unbounded<ConnectionWakeups.ConnectionWakeup>();
@@ -158,11 +159,13 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     [ORCHESTRATION_WS_METHODS.subscribeThread]: (input: {
       readonly afterSequence?: number;
       readonly requestCompletionMarker?: boolean;
+      readonly threadRecoveryEventsV1?: boolean;
     }) =>
       Stream.unwrap(
         Ref.updateAndGet(subscriptionCount, (count) => count + 1).pipe(
           Effect.andThen(Ref.set(lastSubscribeAfterSequence, input.afterSequence)),
           Effect.andThen(Ref.set(lastRequestCompletionMarker, input.requestCompletionMarker)),
+          Effect.andThen(Ref.set(lastThreadRecoveryEventsV1, input.threadRecoveryEventsV1)),
           Effect.as(streamFrom(inputs)),
         ),
       ),
@@ -171,7 +174,12 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     Option.some(
       testSession(
         client,
-        options?.completionMarker === true ? { completionMarker: true } : undefined,
+        options?.completionMarker === true || options?.recoveryEvents === true
+          ? {
+              completionMarker: options.completionMarker,
+              recoveryEvents: options.recoveryEvents,
+            }
+          : undefined,
       ),
     ),
   );
@@ -244,6 +252,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     loaderCalls,
     lastSubscribeAfterSequence,
     lastRequestCompletionMarker,
+    lastThreadRecoveryEventsV1,
     supervisorState,
     supervisorSession,
     savedThreads,
@@ -254,7 +263,12 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
       Option.some(
         testSession(
           client,
-          options?.completionMarker === true ? { completionMarker: true } : undefined,
+          options?.completionMarker === true || options?.recoveryEvents === true
+            ? {
+                completionMarker: options.completionMarker,
+                recoveryEvents: options.recoveryEvents,
+              }
+            : undefined,
         ),
       ),
     ),
@@ -341,6 +355,50 @@ const deleted = (): OrchestrationThreadStreamItem => ({
   },
 });
 
+const interrupted = (sequence: number, legacy: boolean): OrchestrationThreadStreamItem => ({
+  kind: "event",
+  event: legacy
+    ? {
+        eventId: EventId.make(`event-interrupted-${sequence}`),
+        sequence,
+        occurredAt: "2026-04-01T01:02:00.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "thread",
+        aggregateId: THREAD_ID,
+        type: "thread.turn-interrupt-requested",
+        payload: {
+          threadId: THREAD_ID,
+          turnId: TurnId.make("turn-1"),
+          createdAt: "2026-04-01T01:02:00.000Z",
+        },
+      }
+    : {
+        eventId: EventId.make(`event-interrupted-${sequence}`),
+        sequence,
+        occurredAt: "2026-04-01T01:02:00.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        aggregateKind: "thread",
+        aggregateId: THREAD_ID,
+        type: "thread.session-interrupted",
+        payload: {
+          threadId: THREAD_ID,
+          turnId: TurnId.make("turn-1"),
+          interruptionCode: "server_restart",
+          reason: "server-restarted",
+          detectedAt: "2026-04-01T01:02:00.000Z",
+          timestampFallback: true,
+          retrySourceMessageId: null,
+          serverBootId: "boot-2",
+        },
+      },
+});
+
 describe("EnvironmentThreads", () => {
   it.effect("publishes cached data immediately from a warm cache", () =>
     Effect.gen(function* () {
@@ -371,6 +429,52 @@ describe("EnvironmentThreads", () => {
       // full snapshot over HTTP.
       expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(CACHED_SNAPSHOT_SEQUENCE);
       expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+    }),
+  );
+
+  it.effect("opts into recovery events only when the server advertises support", () =>
+    Effect.gen(function* () {
+      const capable = yield* makeHarness({ cached: BASE_THREAD, recoveryEvents: true });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(capable.subscriptionCount)) >= 1) break;
+        yield* Effect.yieldNow;
+      }
+      expect(yield* Ref.get(capable.lastThreadRecoveryEventsV1)).toBe(true);
+
+      const legacy = yield* makeHarness({ cached: BASE_THREAD });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(legacy.subscriptionCount)) >= 1) break;
+        yield* Effect.yieldNow;
+      }
+      expect(yield* Ref.get(legacy.lastThreadRecoveryEventsV1)).toBeUndefined();
+    }),
+  );
+
+  it.effect("applies capable and legacy recovery once and resumes after their sequence", () =>
+    Effect.gen(function* () {
+      for (const legacy of [false, true]) {
+        const harness = yield* makeHarness({
+          cached: ACTIVE_THREAD,
+          recoveryEvents: !legacy,
+        });
+        yield* Queue.offer(harness.inputs, interrupted(CACHED_SNAPSHOT_SEQUENCE + 1, legacy));
+        yield* Queue.offer(harness.inputs, interrupted(CACHED_SNAPSHOT_SEQUENCE + 1, legacy));
+        const state = yield* awaitThreadState(
+          harness.observed,
+          (value) =>
+            Option.isSome(value.data) && value.data.value.session?.status === "interrupted",
+        );
+        expect(Option.getOrThrow(state.data).session?.activeTurnId).toBeNull();
+
+        yield* harness.replaceSession;
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if ((yield* Ref.get(harness.subscriptionCount)) >= 2) break;
+          yield* Effect.yieldNow;
+        }
+        expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(
+          CACHED_SNAPSHOT_SEQUENCE + 1,
+        );
+      }
     }),
   );
 

@@ -213,6 +213,17 @@ export function applyThreadDetailEvent(
         kind: "updated",
         thread: {
           ...thread,
+          session:
+            thread.session !== null &&
+            (thread.session.activeTurnId === null ||
+              thread.session.activeTurnId === event.payload.turnId)
+              ? {
+                  ...thread.session,
+                  status: "interrupted",
+                  activeTurnId: null,
+                  updatedAt: event.payload.createdAt,
+                }
+              : thread.session,
           latestTurn: {
             ...latestTurn,
             state: "interrupted",
@@ -275,6 +286,7 @@ export function applyThreadDetailEvent(
         event.payload.turnId !== null &&
         (thread.latestTurn === null || thread.latestTurn.turnId === event.payload.turnId)
           ? {
+              ...(thread.latestTurn?.turnId === event.payload.turnId ? thread.latestTurn : {}),
               turnId: event.payload.turnId,
               state: settlesTurn
                 ? thread.latestTurn?.state === "interrupted"
@@ -330,6 +342,9 @@ export function applyThreadDetailEvent(
       const latestTurn: OrchestrationLatestTurn | null =
         event.payload.session.status === "running" && event.payload.session.activeTurnId !== null
           ? {
+              ...(thread.latestTurn?.turnId === event.payload.session.activeTurnId
+                ? thread.latestTurn
+                : {}),
               turnId: event.payload.session.activeTurnId,
               state: "running",
               requestedAt:
@@ -387,6 +402,87 @@ export function applyThreadDetailEvent(
             },
           };
 
+    case "thread.session-interrupted": {
+      const latestTurn = thread.latestTurn;
+      if (latestTurn === null || latestTurn.turnId !== event.payload.turnId) {
+        return { kind: "unchanged" };
+      }
+
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          session:
+            thread.session !== null &&
+            (thread.session.activeTurnId === null ||
+              thread.session.activeTurnId === event.payload.turnId)
+              ? {
+                  ...thread.session,
+                  status: "interrupted",
+                  activeTurnId: null,
+                  lastError: event.payload.interruptionCode,
+                  updatedAt: event.payload.detectedAt,
+                }
+              : thread.session,
+          latestTurn: {
+            ...latestTurn,
+            state: "interrupted",
+            completedAt: event.payload.executionLastObservedAt ?? event.payload.detectedAt,
+            interruptionCode: event.payload.interruptionCode,
+            interruptionDetectedAt: event.payload.detectedAt,
+            executionLastObservedAt: event.payload.executionLastObservedAt ?? null,
+            interruptionTimestampFallback: event.payload.timestampFallback,
+            retrySourceMessageId: event.payload.retrySourceMessageId,
+          },
+          updatedAt: event.occurredAt,
+        },
+      };
+    }
+
+    case "thread.session-start-interrupted": {
+      const pendingMessageExists = thread.messages.some(
+        (message) =>
+          message.id === event.payload.pendingMessageId &&
+          message.role === "user" &&
+          message.turnId === null,
+      );
+      const activity: OrchestrationThreadActivity = {
+        id: event.eventId,
+        tone: "error",
+        kind: "session.start.interrupted",
+        summary: "Turn start was interrupted before a provider session was established.",
+        payload: event.payload,
+        turnId: null,
+        sequence: event.sequence,
+        createdAt: event.payload.detectedAt,
+      };
+      const hasActivity = thread.activities.some((entry) => entry.id === activity.id);
+      if (!pendingMessageExists && hasActivity) {
+        return { kind: "unchanged" };
+      }
+
+      const activities = hasActivity
+        ? thread.activities
+        : pipe(thread.activities, Arr.append(activity), Arr.sort(activityOrder));
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          session:
+            pendingMessageExists && thread.session?.status === "starting"
+              ? {
+                  ...thread.session,
+                  status: "interrupted",
+                  activeTurnId: null,
+                  updatedAt: event.payload.detectedAt,
+                }
+              : thread.session,
+          activities,
+          updatedAt: event.occurredAt,
+        },
+      };
+    }
+
     // ── Proposed plans ──────────────────────────────────────────────
     case "thread.proposed-plan-upserted": {
       const proposedPlan = event.payload.proposedPlan;
@@ -438,6 +534,7 @@ export function applyThreadDetailEvent(
         !diffTurnStillRunning &&
         (thread.latestTurn === null || thread.latestTurn.turnId === event.payload.turnId)
           ? {
+              ...(thread.latestTurn?.turnId === event.payload.turnId ? thread.latestTurn : {}),
               turnId: event.payload.turnId,
               state: checkpointStatusToTurnState(event.payload.status),
               requestedAt: thread.latestTurn?.requestedAt ?? event.payload.completedAt,
@@ -505,6 +602,16 @@ export function applyThreadDetailEvent(
 
     // ── Activities ──────────────────────────────────────────────────
     case "thread.activity-appended": {
+      const pendingStartMessageId = pendingStartMessageIdFromActivity(event.payload.activity);
+      const clearsPendingStart =
+        pendingStartMessageId !== null &&
+        thread.messages.some(
+          (message) =>
+            message.id === pendingStartMessageId &&
+            message.role === "user" &&
+            message.turnId === null,
+        ) &&
+        thread.session?.status === "starting";
       const activities = pipe(
         thread.activities,
         Arr.filter((activity) => activity.id !== event.payload.activity.id),
@@ -514,7 +621,19 @@ export function applyThreadDetailEvent(
 
       return {
         kind: "updated",
-        thread: { ...thread, activities, updatedAt: event.occurredAt },
+        thread: {
+          ...thread,
+          session: clearsPendingStart
+            ? {
+                ...thread.session,
+                status: "interrupted",
+                activeTurnId: null,
+                updatedAt: event.payload.activity.createdAt,
+              }
+            : thread.session,
+          activities,
+          updatedAt: event.occurredAt,
+        },
       };
     }
 
@@ -592,4 +711,17 @@ function retainMessagesAfterRevert(
     }
     return retainedTurnIds.has(message.turnId);
   });
+}
+
+function pendingStartMessageIdFromActivity(activity: OrchestrationThreadActivity): string | null {
+  if (
+    activity.kind !== "session.start.interrupted" ||
+    typeof activity.payload !== "object" ||
+    activity.payload === null ||
+    !("pendingMessageId" in activity.payload) ||
+    typeof activity.payload.pendingMessageId !== "string"
+  ) {
+    return null;
+  }
+  return activity.payload.pendingMessageId;
 }

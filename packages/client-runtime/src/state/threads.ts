@@ -248,6 +248,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           Effect.map((config) => config.threadResumeCompletionMarker === true),
           Effect.orElseSucceed(() => false),
         );
+        const supportsRecoveryEvents = yield* session.initialConfig.pipe(
+          Effect.map((config) => config.threadRecoveryEventsV1 === true),
+          Effect.orElseSucceed(() => false),
+        );
         yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
         yield* setSynchronizing;
 
@@ -288,6 +292,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           threadId,
           ...(canResume ? { afterSequence: sequence } : {}),
           ...(supportsCompletionMarker ? { requestCompletionMarker: true as const } : {}),
+          ...(supportsRecoveryEvents ? { threadRecoveryEventsV1: true as const } : {}),
         };
       }),
       {
@@ -351,5 +356,6 @@ export * from "./composerPathSearch.ts";
 export * from "./threadCommands.ts";
 export * from "./threadDetail.ts";
 export * from "./threadReducer.ts";
+export * from "./threadRecovery.ts";
 export * from "./threadShell.ts";
 export * from "./threadState.ts";
