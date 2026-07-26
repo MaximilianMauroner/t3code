@@ -21,6 +21,14 @@ health_script="/usr/local/sbin/t3code-fork-healthcheck"
 health_lock_helper="/usr/local/sbin/t3code-fork-lock"
 health_service="/etc/systemd/system/t3code-fork-healthcheck.service"
 health_timer="/etc/systemd/system/t3code-fork-healthcheck.timer"
+availability_script="/usr/local/sbin/t3code-availability-healthcheck"
+availability_service="/etc/systemd/system/t3code-availability-healthcheck.service"
+availability_timer="/etc/systemd/system/t3code-availability-healthcheck.timer"
+tmpfiles_config="/etc/tmpfiles.d/t3code-watchdog.conf"
+watchdog_group="t3code-watchdog"
+watchdog_runtime_dir="/run/t3code-watchdog"
+installer_lock="${watchdog_runtime_dir}/installer.lock"
+authority_lock="${watchdog_runtime_dir}/authority.lock"
 nightly_unit_dir="/etc/systemd/system"
 nightly_timer_unit="t3code-nightly-update.timer"
 nightly_service_unit="t3code-nightly-update.service"
@@ -34,6 +42,38 @@ health_url="${T3CODE_HEALTH_URL:-http://127.0.0.1:41731/.well-known/t3/environme
 [ -x "$corepack_path" ] || { printf '%s\n' "Fixed Corepack executable is unavailable." >&2; exit 1; }
 [ -x "$lock_helper" ] || { printf '%s\n' "Update lock helper is unavailable." >&2; exit 1; }
 command -v flock >/dev/null 2>&1 || { printf '%s\n' "flock is unavailable." >&2; exit 1; }
+
+# Establish the process-local and shared authority locks before the legacy
+# fork-update guard. Runtime entries are root-owned and cannot be replaced by
+# the application group.
+/usr/sbin/groupadd --system --force "$watchdog_group"
+if [ -e "$watchdog_runtime_dir" ] || [ -L "$watchdog_runtime_dir" ]; then
+  [ -d "$watchdog_runtime_dir" ] && [ ! -L "$watchdog_runtime_dir" ] || {
+    printf '%s\n' "Watchdog runtime is unsafe." >&2
+    exit 1
+  }
+  [ "$(stat -c '%U:%G:%a' "$watchdog_runtime_dir")" = "root:${watchdog_group}:750" ] || {
+    printf '%s\n' "Watchdog runtime ownership is unsafe." >&2
+    exit 1
+  }
+else
+  install -d -m 0750 -o root -g "$watchdog_group" "$watchdog_runtime_dir"
+fi
+if [ ! -e "$installer_lock" ] && [ ! -L "$installer_lock" ]; then
+  (umask 077; set -C; : >"$installer_lock") 2>/dev/null || true
+fi
+if [ ! -e "$authority_lock" ] && [ ! -L "$authority_lock" ]; then
+  (umask 0117; set -C; : >"$authority_lock") 2>/dev/null || true
+  chown root:"$watchdog_group" "$authority_lock"
+fi
+[ -f "$installer_lock" ] && [ ! -L "$installer_lock" ] || exit 1
+[ -f "$authority_lock" ] && [ ! -L "$authority_lock" ] || exit 1
+[ "$(stat -c '%u:%a:%h' "$installer_lock")" = "0:600:1" ] || exit 1
+[ "$(stat -c '%u:%a:%h' "$authority_lock")" = "0:660:1" ] || exit 1
+exec 8<>"$installer_lock"
+flock -n 8 || { printf '%s\n' "Another watchdog installer is active." >&2; exit 1; }
+exec 9<>"$authority_lock"
+flock -x 9
 
 passwd_entry="$(/usr/bin/getent passwd "$run_user")"
 [ -n "$passwd_entry" ] || { printf '%s\n' "Configured run user does not exist." >&2; exit 1; }
@@ -261,6 +301,10 @@ backup_file health_script "$health_script"
 backup_file health_lock_helper "$health_lock_helper"
 backup_file health_service "$health_service"
 backup_file health_timer "$health_timer"
+backup_file availability_script "$availability_script"
+backup_file availability_service "$availability_service"
+backup_file availability_timer "$availability_timer"
+backup_file tmpfiles_config "$tmpfiles_config"
 validate_nightly_source_path "$nightly_timer_path"
 validate_nightly_source_path "$nightly_service_path"
 validate_nightly_wants_link
@@ -270,6 +314,14 @@ backup_nightly_path nightly_wants "$nightly_wants_link"
 nightly_backup_complete=true
 health_enabled="$(systemctl is-enabled t3code-fork-healthcheck.timer 2>/dev/null || true)"
 health_active="$(systemctl is-active t3code-fork-healthcheck.timer 2>/dev/null || true)"
+health_service_enabled="$(systemctl is-enabled t3code-fork-healthcheck.service 2>/dev/null || true)"
+health_service_active="$(systemctl is-active t3code-fork-healthcheck.service 2>/dev/null || true)"
+health_service_failed="$(systemctl is-failed t3code-fork-healthcheck.service 2>/dev/null || true)"
+availability_enabled="$(systemctl is-enabled t3code-availability-healthcheck.timer 2>/dev/null || true)"
+availability_active="$(systemctl is-active t3code-availability-healthcheck.timer 2>/dev/null || true)"
+availability_service_enabled="$(systemctl is-enabled t3code-availability-healthcheck.service 2>/dev/null || true)"
+availability_service_active="$(systemctl is-active t3code-availability-healthcheck.service 2>/dev/null || true)"
+availability_service_failed="$(systemctl is-failed t3code-availability-healthcheck.service 2>/dev/null || true)"
 service_active="$(systemctl is-active t3code.service 2>/dev/null || true)"
 install_complete=false
 rollback_complete=false
@@ -306,6 +358,31 @@ restore_nightly_units() {
   esac
   verify_nightly_original_state
 }
+restore_checker_service_state() {
+  unit="$1"; enabled="$2"; active="$3"; failed="$4"
+  case "$enabled" in
+    enabled) systemctl unmask "$unit" || return 1; systemctl enable "$unit" || return 1 ;;
+    masked) systemctl mask "$unit" || return 1 ;;
+    static|disabled) systemctl unmask "$unit" || return 1 ;;
+    not-found|"") : ;;
+    *) return 1 ;;
+  esac
+  case "$active" in
+    active) systemctl start "$unit" || return 1 ;;
+    inactive|failed|not-found|"") systemctl stop "$unit" >/dev/null 2>&1 || true ;;
+    *) return 1 ;;
+  esac
+  if [ "$failed" = failed ]; then
+    [ "$(systemctl is-failed "$unit" 2>/dev/null || true)" = failed ] || {
+      systemctl start "$unit" >/dev/null 2>&1 || true
+      [ "$(systemctl is-failed "$unit" 2>/dev/null || true)" = failed ] || return 1
+    }
+  else
+    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  fi
+  [ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" = "$enabled" ] || return 1
+  [ "$(systemctl is-active "$unit" 2>/dev/null || true)" = "$active" ] || return 1
+}
 rollback() {
   [ "$rollback_complete" = true ] && return
   rollback_complete=true
@@ -327,14 +404,24 @@ rollback() {
   restore_file health_lock_helper "$health_lock_helper"
   restore_file health_service "$health_service"
   restore_file health_timer "$health_timer"
+  restore_file availability_script "$availability_script"
+  restore_file availability_service "$availability_service"
+  restore_file availability_timer "$availability_timer"
+  restore_file tmpfiles_config "$tmpfiles_config"
   systemctl daemon-reload || true
-  systemctl reset-failed t3code-fork-healthcheck.timer t3code-fork-healthcheck.service || true
+  systemctl reset-failed t3code-fork-healthcheck.timer t3code-fork-healthcheck.service t3code-availability-healthcheck.timer t3code-availability-healthcheck.service || true
   systemctl unmask t3code-fork-healthcheck.timer >/dev/null 2>&1 || true
   case "$health_enabled" in enabled) systemctl enable t3code-fork-healthcheck.timer || true ;; masked) systemctl mask t3code-fork-healthcheck.timer || true ;; *) systemctl disable t3code-fork-healthcheck.timer || true ;; esac
   [ "$health_active" = active ] && systemctl start t3code-fork-healthcheck.timer || systemctl stop t3code-fork-healthcheck.timer || true
+  case "$availability_enabled" in enabled) systemctl enable t3code-availability-healthcheck.timer || true ;; masked) systemctl mask t3code-availability-healthcheck.timer || true ;; *) systemctl disable t3code-availability-healthcheck.timer || true ;; esac
+  [ "$availability_active" = active ] && systemctl start t3code-availability-healthcheck.timer || systemctl stop t3code-availability-healthcheck.timer || true
+  [ "$health_service_active" = active ] && systemctl start t3code-fork-healthcheck.service || systemctl stop t3code-fork-healthcheck.service || true
+  [ "$availability_service_active" = active ] && systemctl start t3code-availability-healthcheck.service || systemctl stop t3code-availability-healthcheck.service || true
+  if ! restore_checker_service_state t3code-fork-healthcheck.service "$health_service_enabled" "$health_service_active" "$health_service_failed"; then rollback_failed=true; fi
+  if ! restore_checker_service_state t3code-availability-healthcheck.service "$availability_service_enabled" "$availability_service_active" "$availability_service_failed"; then rollback_failed=true; fi
   [ "$service_active" = active ] && systemctl restart t3code.service || systemctl stop t3code.service || true
-  if [ "$nightly_restore_failed" = true ]; then
-    printf '%s\n' "Nightly updater rollback backup preserved at ${backup_dir} for recovery." >&2
+  if [ "$nightly_restore_failed" = true ] || [ "$rollback_failed" = true ]; then
+    printf '%s\n' "Watchdog rollback backup preserved at ${backup_dir} for recovery." >&2
   else
     rm -rf "$backup_dir"
   fi
@@ -355,20 +442,36 @@ signal_handler() {
 trap exit_handler EXIT
 trap signal_handler HUP INT TERM
 
+# Quiesce both timer/service pairs before replacing any executable or unit.
+systemctl stop t3code-fork-healthcheck.timer
+systemctl stop t3code-fork-healthcheck.service
+systemctl stop t3code-availability-healthcheck.timer 2>/dev/null || true
+systemctl stop t3code-availability-healthcheck.service 2>/dev/null || true
+[ "$(systemctl is-active t3code-fork-healthcheck.service 2>/dev/null || true)" != active ]
+[ "$(systemctl is-active t3code-availability-healthcheck.service 2>/dev/null || true)" != active ]
+
 next_link="${current_link}.bootstrap.$$"
 ln -s "$release_dir" "$next_link"
 mv -Tf "$next_link" "$current_link"
 install -d "$dropin_dir"
 rm -f "$old_dropin_path"
+/usr/sbin/usermod -a -G "$watchdog_group" "$run_user"
 install -m 0644 "$script_dir/t3code.service.d/zz-fork-update.conf" "$dropin_path"
 install -m 0755 "$script_dir/t3code-fork-healthcheck" "$health_script"
 install -m 0755 "$lock_helper" "$health_lock_helper"
 install -m 0644 "$script_dir/t3code-fork-healthcheck.service" "$health_service"
 install -m 0644 "$script_dir/t3code-fork-healthcheck.timer" "$health_timer"
+install -m 0755 "$script_dir/t3code-availability-healthcheck" "$availability_script"
+install -m 0644 "$script_dir/t3code-availability-healthcheck.service" "$availability_service"
+install -m 0644 "$script_dir/t3code-availability-healthcheck.timer" "$availability_timer"
+install -m 0644 "$script_dir/t3code-watchdog.tmpfiles" "$tmpfiles_config"
+/usr/bin/systemd-tmpfiles --create "$tmpfiles_config"
 systemctl daemon-reload
-systemctl reset-failed t3code-fork-healthcheck.timer t3code-fork-healthcheck.service
+systemctl reset-failed t3code-fork-healthcheck.timer t3code-fork-healthcheck.service t3code-availability-healthcheck.timer t3code-availability-healthcheck.service
 systemctl disable --now t3code-fork-healthcheck.timer
 systemctl stop t3code-fork-healthcheck.service
+systemctl disable --now t3code-availability-healthcheck.timer
+systemctl stop t3code-availability-healthcheck.service
 systemctl show t3code.service -p ExecStart --value | grep -F "fork-current/node_modules/t3/dist/bin.mjs" >/dev/null
 systemctl stop "$nightly_timer_unit"
 systemctl stop "$nightly_service_unit"
@@ -396,6 +499,9 @@ systemctl restart t3code.service
 wait_for_release_ready
 watch_release_health
 systemctl enable --now t3code-fork-healthcheck.timer
+# Availability is deliberately staged disabled for a separate rollout decision.
+[ "$(systemctl is-enabled t3code-availability-healthcheck.timer 2>/dev/null || true)" = disabled ]
+[ "$(systemctl is-active t3code-availability-healthcheck.timer 2>/dev/null || true)" = inactive ]
 
 # Commit activation before releasing ownership. From here on, failures leave
 # the verified deployment in place and never run rollback.

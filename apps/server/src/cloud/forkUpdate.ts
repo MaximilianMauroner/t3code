@@ -6,6 +6,8 @@ import {
 } from "@t3tools/contracts";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
 import * as Clock from "effect/Clock";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -137,6 +139,11 @@ export function normalizeGitHubRepository(remoteUrl: string): string | null {
 interface ForkUpdateHost {
   readonly hasActiveTurns: Effect.Effect<boolean, ProjectionRepositoryError>;
   readonly restartService: (serviceName: string) => void;
+  readonly acquireWatchdogAuthority: Effect.Effect<WatchdogAuthorityLease, ServerForkUpdateError>;
+}
+
+interface WatchdogAuthorityLease {
+  readonly release: Effect.Effect<void>;
 }
 
 export class ForkUpdate extends Context.Service<
@@ -173,6 +180,87 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
     readonly checkedAt: number;
   } | null>(null);
 
+  const authorityPath = env.T3_FORK_UPDATE_AUTHORITY_LOCK?.trim() || null;
+  const acquireWatchdogAuthority: Effect.Effect<WatchdogAuthorityLease, ServerForkUpdateError> =
+    authorityPath === null
+      ? Effect.succeed({ release: Effect.void })
+      : Effect.callback<WatchdogAuthorityLease, ServerForkUpdateError>((resume) => {
+          try {
+            const stat = NodeFS.lstatSync(authorityPath);
+            const parentStat = NodeFS.lstatSync(NodePath.dirname(authorityPath));
+            const productionPermissionsAreSafe =
+              authorityPath !== "/run/t3code-watchdog/authority.lock" ||
+              (stat.uid === 0 &&
+                (stat.mode & 0o777) === 0o660 &&
+                parentStat.uid === 0 &&
+                (parentStat.mode & 0o777) === 0o750);
+            if (
+              !parentStat.isDirectory() ||
+              parentStat.isSymbolicLink() ||
+              !stat.isFile() ||
+              stat.isSymbolicLink() ||
+              stat.nlink !== 1 ||
+              !productionPermissionsAreSafe
+            ) {
+              resume(Effect.fail(statusError("The watchdog authority lock is unsafe.")));
+              return;
+            }
+          } catch {
+            resume(Effect.fail(statusError("The watchdog authority lock is unavailable.")));
+            return;
+          }
+
+          const child = NodeChildProcess.spawn(
+            "/usr/bin/flock",
+            ["-x", authorityPath, "/bin/sh", "-c", 'printf "locked\\n"; cat >/dev/null'],
+            { stdio: ["pipe", "pipe", "pipe"] },
+          );
+          let settled = false;
+          let output = "";
+          const finishFailure = (reason: string) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            child.kill("SIGKILL");
+            resume(Effect.fail(statusError(reason)));
+          };
+          const timer = setTimeout(
+            () => finishFailure("Timed out acquiring watchdog restart authority."),
+            5_000,
+          );
+          child.once("error", () => finishFailure("Could not acquire watchdog restart authority."));
+          child.once("exit", (code) => {
+            if (!settled) {
+              finishFailure(
+                `Watchdog restart authority exited before acquisition (${String(code)}).`,
+              );
+            }
+          });
+          child.stdout.setEncoding("utf8");
+          child.stdout.on("data", (chunk: string) => {
+            if (settled) return;
+            output += chunk;
+            if (!output.includes("locked\n")) return;
+            settled = true;
+            clearTimeout(timer);
+            let released = false;
+            resume(
+              Effect.succeed({
+                release: Effect.sync(() => {
+                  if (released) return;
+                  released = true;
+                  child.stdin.end();
+                }),
+              }),
+            );
+          });
+
+          return Effect.sync(() => {
+            clearTimeout(timer);
+            if (!settled) child.kill("SIGKILL");
+          });
+        });
+
   const host: ForkUpdateHost = {
     hasActiveTurns:
       options?.host?.hasActiveTurns ??
@@ -206,6 +294,7 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
         child.on("error", () => undefined);
         child.unref();
       }),
+    acquireWatchdogAuthority: options?.host?.acquireWatchdogAuthority ?? acquireWatchdogAuthority,
   };
 
   const writeStatus = (status: ServerForkUpdateStatus) =>
@@ -327,7 +416,12 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
     if (alreadyRunning) {
       return yield* statusError("A fork update is already in progress.");
     }
-    const lockOwner = yield* acquireLock.pipe(Effect.onError(() => Ref.set(inFlight, false)));
+    const authorityLease = yield* host.acquireWatchdogAuthority.pipe(
+      Effect.onError(() => Ref.set(inFlight, false)),
+    );
+    const lockOwner = yield* acquireLock.pipe(
+      Effect.onError(() => Effect.all([Ref.set(inFlight, false), authorityLease.release])),
+    );
 
     const startedAt = yield* nowIso;
     let status: ServerForkUpdateStatus = {
@@ -337,7 +431,9 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
       startedAt,
     };
     yield* writeStatus(status).pipe(
-      Effect.onError(() => Effect.all([Ref.set(inFlight, false), releaseLock])),
+      Effect.onError(() =>
+        Effect.all([Ref.set(inFlight, false), releaseLock, authorityLease.release]),
+      ),
     );
     let originalCommit: string | null = null;
     let pushed = false;
@@ -716,6 +812,7 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
         Effect.gen(function* () {
           yield* Ref.set(inFlight, false);
           if (!activated) yield* releaseLock;
+          yield* authorityLease.release;
         }),
       ),
       Effect.forkDetach({ startImmediately: true }),

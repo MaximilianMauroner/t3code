@@ -58,6 +58,39 @@ export const providerRuntimeEventsTotal = Metric.counter("t3_provider_runtime_ev
   description: "Total canonical provider runtime events processed.",
 });
 
+export const ingestionWorkerDepth = Metric.gauge("t3_ingestion_worker_depth", {
+  description: "Current work items queued or active in a drainable ingestion worker.",
+});
+
+export const ingestionWorkerOldestAge = Metric.gauge("t3_ingestion_worker_oldest_age_ms", {
+  description: "Age in milliseconds of the oldest queued or active ingestion item.",
+});
+
+export const eventLoopDelay = Metric.histogram("t3_event_loop_delay_ms", {
+  description: "Sampled Node.js event-loop delay; export p50, p95, and p99 quantiles.",
+  boundaries: [5, 10, 25, 50, 100, 250, 500, 1_000, 2_000],
+});
+
+export const canonicalLoggerDuration = Metric.timer("t3_canonical_logger_duration", {
+  description: "Time spent serializing and submitting canonical provider log records.",
+});
+
+export const canonicalLoggerBytesTotal = Metric.counter("t3_canonical_logger_bytes_total", {
+  description: "UTF-8 bytes submitted to the canonical provider event logger.",
+});
+
+export const providerOutputBytesTotal = Metric.counter("t3_provider_output_bytes_total", {
+  description: "Provider output bytes observed per turn.",
+});
+
+export const providerOutputEventsTotal = Metric.counter("t3_provider_output_events_total", {
+  description: "Provider output events observed per turn.",
+});
+
+export const healthProbeDuration = Metric.timer("t3_health_probe_duration", {
+  description: "Dependency-light health probe latency.",
+});
+
 export const gitCommandsTotal = Metric.counter("t3_git_commands_total", {
   description: "Total git commands executed by the server runtime.",
 });

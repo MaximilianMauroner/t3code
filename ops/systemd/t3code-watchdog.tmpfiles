@@ -1,0 +1,7 @@
+d /run/t3code-watchdog 0750 root t3code-watchdog -
+f /run/t3code-watchdog/authority.lock 0660 root t3code-watchdog -
+f /run/t3code-watchdog/fork-checker.lock 0600 root root -
+f /run/t3code-watchdog/availability-checker.lock 0600 root root -
+f /run/t3code-watchdog/installer.lock 0600 root root -
+f /run/t3code-watchdog/active-turn-count 0640 codex t3code-watchdog -
+d /var/lib/t3code-watchdog 0700 root root -

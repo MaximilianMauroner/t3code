@@ -2,6 +2,7 @@ import { it } from "@effect/vitest";
 import { describe, expect } from "vite-plus/test";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as TestClock from "effect/testing/TestClock";
 
 import { makeDrainableWorker } from "./DrainableWorker.ts";
 
@@ -52,6 +53,29 @@ describe("makeDrainableWorker", () => {
 
         expect(processed).toEqual(["first", "second"]);
       }),
+    ),
+  );
+
+  it.effect("reports depth and oldest age without changing queue semantics", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const worker = yield* makeDrainableWorker((_item: string) =>
+          Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        );
+
+        yield* worker.enqueue("first");
+        yield* Deferred.await(started);
+        yield* worker.enqueue("second");
+        yield* TestClock.adjust("6 seconds");
+
+        expect(yield* worker.pressure).toEqual({ depth: 2, oldestAgeMs: 6_000 });
+
+        yield* Deferred.succeed(release, undefined);
+        yield* worker.drain;
+        expect(yield* worker.pressure).toEqual({ depth: 0, oldestAgeMs: 0 });
+      }).pipe(Effect.provide(TestClock.layer())),
     ),
   );
 });

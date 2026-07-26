@@ -204,6 +204,43 @@ describe("fork service bootstrap installer", () => {
     expect(installer).toContain("exit 1");
   });
 
+  it("quiesces both checker pairs before replacing watchdog assets", () => {
+    const trapIndex = installer.indexOf("trap exit_handler EXIT");
+    const forkStop = installer.indexOf("systemctl stop t3code-fork-healthcheck.service", trapIndex);
+    const availabilityStop = installer.indexOf(
+      "systemctl stop t3code-availability-healthcheck.service",
+      forkStop,
+    );
+    const linkSwitch = installer.indexOf('mv -Tf "$next_link" "$current_link"', trapIndex);
+    const firstAssetInstall = installer.indexOf(
+      'install -m 0644 "$script_dir/t3code.service.d/zz-fork-update.conf"',
+      trapIndex,
+    );
+    expect(forkStop).toBeGreaterThan(trapIndex);
+    expect(availabilityStop).toBeGreaterThan(forkStop);
+    expect(linkSwitch).toBeGreaterThan(availabilityStop);
+    expect(firstAssetInstall).toBeGreaterThan(linkSwitch);
+    expect(
+      NodeFS.readFileSync(NodePath.join(opsDir, "t3code.service.d/zz-fork-update.conf"), "utf8"),
+    ).toContain("T3_FORK_UPDATE_AUTHORITY_LOCK");
+    expect(installer).toContain("flock -n 8");
+    expect(installer).toContain("flock -x 9");
+    expect(installer.indexOf("flock -x 9")).toBeLessThan(
+      installer.indexOf('"$lock_helper" acquire'),
+    );
+  });
+
+  it("installs availability disabled with root-owned tmpfiles authority", () => {
+    const tmpfiles = NodeFS.readFileSync(NodePath.join(opsDir, "t3code-watchdog.tmpfiles"), "utf8");
+    expect(installer).toContain('install -m 0755 "$script_dir/t3code-availability-healthcheck"');
+    expect(installer).toContain('/usr/bin/systemd-tmpfiles --create "$tmpfiles_config"');
+    expect(installer).toContain(
+      '[ "$(systemctl is-enabled t3code-availability-healthcheck.timer 2>/dev/null || true)" = disabled ]',
+    );
+    expect(tmpfiles).toContain("f /run/t3code-watchdog/authority.lock 0660 root t3code-watchdog -");
+    expect(tmpfiles).toContain("d /run/t3code-watchdog 0750 root t3code-watchdog -");
+  });
+
   it("pins the package.json pnpm version through fixed offline Corepack", () => {
     const packageVersion = /"packageManager"\s*:\s*"pnpm@([^"]+)"/.exec(packageJson)?.[1];
     const installerVersion = /expected_pnpm_version="([^"]+)"/.exec(installer)?.[1];
@@ -434,9 +471,9 @@ describe("fork service bootstrap installer", () => {
     expect(watchIndex).toBeGreaterThan(readinessIndex);
     expect(timerIndex).toBeGreaterThan(watchIndex);
     expect(installer).toContain(
-      "systemctl daemon-reload || true\n  systemctl reset-failed t3code-fork-healthcheck.timer t3code-fork-healthcheck.service || true",
+      "systemctl daemon-reload || true\n  systemctl reset-failed t3code-fork-healthcheck.timer t3code-fork-healthcheck.service t3code-availability-healthcheck.timer t3code-availability-healthcheck.service || true",
     );
-    expect(installer.match(/systemctl reset-failed/g)).toHaveLength(2);
+    expect(installer.match(/systemctl reset-failed/g)).toHaveLength(3);
     expect(installer).not.toMatch(/reset-failed[^\n]*nightly/);
   });
 
@@ -576,6 +613,10 @@ describe("fork service bootstrap installer", () => {
         "health_lock_helper",
         "health_service",
         "health_timer",
+        "availability_script",
+        "availability_service",
+        "availability_timer",
+        "tmpfiles_config",
       ]) {
         NodeFS.writeFileSync(NodePath.join(backupDir, `${label}.absent`), "");
       }
@@ -622,8 +663,20 @@ describe("fork service bootstrap installer", () => {
           'health_lock_helper="$HARNESS_ROOT/health-lock-helper"',
           'health_service="$HARNESS_ROOT/health.service"',
           'health_timer="$HARNESS_ROOT/health.timer"',
+          'availability_script="$HARNESS_ROOT/availability-script"',
+          'availability_service="$HARNESS_ROOT/availability.service"',
+          'availability_timer="$HARNESS_ROOT/availability.timer"',
+          'tmpfiles_config="$HARNESS_ROOT/tmpfiles.conf"',
           "health_enabled=disabled",
           "health_active=inactive",
+          "health_service_active=inactive",
+          "health_service_enabled=static",
+          "health_service_failed=inactive",
+          "availability_enabled=disabled",
+          "availability_active=inactive",
+          "availability_service_active=inactive",
+          "availability_service_enabled=not-found",
+          "availability_service_failed=not-found",
           "service_active=inactive",
           'release_update_lock() { printf "%s\\n" released >"$LOCK_RELEASE"; }',
           'if rollback; then printf "%s\\n" 0 >"$ROLLBACK_STATUS";',
@@ -647,7 +700,7 @@ describe("fork service bootstrap installer", () => {
       expect(result.status).toBe(0);
       expect(NodeFS.readFileSync(rollbackStatus, "utf8").trim()).toBe("1");
       expect(result.stderr).toContain(
-        `Nightly updater rollback backup preserved at ${backupDir} for recovery.`,
+        `Watchdog rollback backup preserved at ${backupDir} for recovery.`,
       );
       expect(NodeFS.statSync(backupDir).mode & 0o777).toBe(0o700);
       expect(NodeFS.readFileSync(NodePath.join(backupDir, "nightly_timer"), "utf8")).toBe(
