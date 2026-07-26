@@ -24,6 +24,7 @@ import {
 import { createModelSelection } from "@t3tools/shared/model";
 import { assert, describe, it } from "@effect/vitest";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -37,6 +38,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
 import type { ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
+import type { ProviderLivenessSample } from "../Services/ProviderAdapter.ts";
 import { makeClaudeAdapter, type ClaudeAdapterLiveOptions } from "./ClaudeAdapter.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
@@ -156,6 +158,7 @@ function makeHarness(config?: {
   readonly baseDir?: string;
   readonly claudeConfig?: Partial<ClaudeSettings>;
   readonly instanceId?: ProviderInstanceId;
+  readonly beforeRuntimeEventEnqueue?: ClaudeAdapterLiveOptions["beforeRuntimeEventEnqueue"];
 }) {
   const query = new FakeClaudeQuery();
   let createInput:
@@ -171,6 +174,9 @@ function makeHarness(config?: {
       createInput = input;
       return query;
     },
+    ...(config?.beforeRuntimeEventEnqueue
+      ? { beforeRuntimeEventEnqueue: config.beforeRuntimeEventEnqueue }
+      : {}),
     ...(config?.nativeEventLogger
       ? {
           nativeEventLogger: config.nativeEventLogger,
@@ -268,6 +274,44 @@ const THREAD_ID = ThreadId.make("thread-claude-1");
 const RESUME_THREAD_ID = ThreadId.make("thread-claude-resume");
 
 describe("ClaudeAdapterLive", () => {
+  it.effect("holds a liveness marker behind a paused lifecycle enqueue", () => {
+    const mutationObserved = Effect.runSync(Deferred.make<void>());
+    const allowEnqueue = Effect.runSync(Deferred.make<void>());
+    const harness = makeHarness({
+      beforeRuntimeEventEnqueue: (event) =>
+        event.type === "session.started"
+          ? Deferred.succeed(mutationObserved, undefined).pipe(
+              Effect.andThen(Deferred.await(allowEnqueue)),
+            )
+          : Effect.void,
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const startFiber = yield* adapter
+        .startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(mutationObserved);
+
+      const acknowledged = yield* Deferred.make<ProviderLivenessSample>();
+      const markerFiber = yield* adapter
+        .requestLivenessSample?.(THREAD_ID, "claude-race-marker", acknowledged)
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.isUndefined(markerFiber.pollUnsafe());
+
+      yield* Deferred.succeed(allowEnqueue, undefined);
+      yield* Fiber.join(startFiber);
+      yield* Fiber.join(markerFiber);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("returns validation error for non-claude provider on startSession", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

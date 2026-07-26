@@ -2,6 +2,7 @@ import * as NodeAssert from "node:assert/strict";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -26,6 +27,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import type { OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
+import type { ProviderLivenessSample } from "../Services/ProviderAdapter.ts";
 import {
   OpenCodeRuntime,
   OpenCodeRuntimeError,
@@ -281,6 +283,43 @@ const advanceTestClock = (ms: number) =>
   TestClock.adjust(`${ms} millis`).pipe(Effect.andThen(Effect.yieldNow));
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
+  it.effect("holds a liveness marker behind a paused lifecycle enqueue", () =>
+    Effect.gen(function* () {
+      const mutationObserved = yield* Deferred.make<void>();
+      const allowEnqueue = yield* Deferred.make<void>();
+      const adapter = yield* makeOpenCodeAdapter(openCodeAdapterTestSettings, {
+        beforeRuntimeEventEnqueue: (event) =>
+          event.type === "session.started"
+            ? Deferred.succeed(mutationObserved, undefined).pipe(
+                Effect.andThen(Deferred.await(allowEnqueue)),
+              )
+            : Effect.void,
+      });
+      const threadId = asThreadId("thread-opencode-marker-race");
+      const startFiber = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(mutationObserved);
+
+      const acknowledged = yield* Deferred.make<ProviderLivenessSample>();
+      NodeAssert.ok(adapter.requestLivenessSample);
+      const markerFiber = yield* adapter
+        .requestLivenessSample(threadId, "opencode-race-marker", acknowledged)
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      NodeAssert.equal(markerFiber.pollUnsafe(), undefined);
+
+      yield* Deferred.succeed(allowEnqueue, undefined);
+      yield* Fiber.join(startFiber);
+      yield* Fiber.join(markerFiber);
+      yield* adapter.stopAll();
+    }),
+  );
+
   it.effect("reuses a configured OpenCode server URL instead of spawning a local server", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

@@ -26,6 +26,7 @@ import {
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
+import type { ProviderLivenessSample } from "../Services/ProviderAdapter.ts";
 import { grokPromptSettlementBelongsToContext, makeGrokAdapter } from "./GrokAdapter.ts";
 const decodeGrokSettings = Schema.decodeSync(GrokSettings);
 
@@ -123,6 +124,45 @@ it("requires a settlement to match the live Grok turn", () => {
 });
 
 it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
+  it.effect("holds a liveness marker behind a paused lifecycle enqueue", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* Effect.promise(() => makeMockGrokWrapper());
+      const mutationObserved = yield* Deferred.make<void>();
+      const allowEnqueue = yield* Deferred.make<void>();
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        beforeRuntimeEventEnqueue: (event) =>
+          event.type === "session.started"
+            ? Deferred.succeed(mutationObserved, undefined).pipe(
+                Effect.andThen(Deferred.await(allowEnqueue)),
+              )
+            : Effect.void,
+      });
+      const threadId = ThreadId.make("grok-marker-race");
+      const startFiber = yield* adapter
+        .startSession({
+          threadId,
+          provider: ProviderDriverKind.make("grok"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(mutationObserved);
+
+      const acknowledged = yield* Deferred.make<ProviderLivenessSample>();
+      assert.exists(adapter.requestLivenessSample);
+      const markerFiber = yield* adapter
+        .requestLivenessSample(threadId, "grok-race-marker", acknowledged)
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.equal(markerFiber.pollUnsafe(), undefined);
+
+      yield* Deferred.succeed(allowEnqueue, undefined);
+      yield* Fiber.join(startFiber);
+      yield* Fiber.join(markerFiber);
+      yield* adapter.stopAll();
+    }),
+  );
+
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-mock-thread");
