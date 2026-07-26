@@ -55,6 +55,7 @@ import {
   OrchestrationGetTurnDiffError,
   OrchestrationGetTurnDiffInput,
   OrchestrationReplayEventsError,
+  OrchestrationNotReadyError,
   OrchestrationReplayEventsInput,
   OrchestrationRpcSchemas,
 } from "./orchestration.ts";
@@ -628,7 +629,11 @@ export const WsOrchestrationDispatchCommandRpc = Rpc.make(
   {
     payload: ClientOrchestrationCommand,
     success: OrchestrationRpcSchemas.dispatchCommand.output,
-    error: Schema.Union([OrchestrationDispatchCommandError, EnvironmentAuthorizationError]),
+    error: Schema.Union([
+      OrchestrationDispatchCommandError,
+      OrchestrationNotReadyError,
+      EnvironmentAuthorizationError,
+    ]),
   },
 );
 

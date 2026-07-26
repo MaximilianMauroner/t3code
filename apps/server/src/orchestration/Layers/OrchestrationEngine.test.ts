@@ -24,11 +24,15 @@ import { describe, expect, it } from "vite-plus/test";
 import { PersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
+import { OrchestrationReactorDeliveriesLive } from "../../persistence/Layers/OrchestrationReactorDeliveries.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
   OrchestrationEventStore,
   type OrchestrationEventStoreShape,
 } from "../../persistence/Services/OrchestrationEventStore.ts";
+import { OrchestrationReactorDeliveries } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
@@ -72,6 +76,8 @@ async function createOrchestrationSystem(
       Layer.provide(maintenanceGateLayer),
     ),
     OrchestrationProjectionSnapshotQueryLive,
+    OrchestrationReactorDeliveriesLive,
+    ProjectionTurnRepositoryLive,
   ).pipe(
     Layer.provide(OrchestrationEventStoreLive),
     Layer.provide(OrchestrationCommandReceiptRepositoryLive),
@@ -86,9 +92,13 @@ async function createOrchestrationSystem(
   const maintenanceGate = await runtime.runPromise(
     Effect.service(UpdateMaintenanceGate.UpdateMaintenanceGate),
   );
+  const deliveries = await runtime.runPromise(Effect.service(OrchestrationReactorDeliveries));
+  const turns = await runtime.runPromise(Effect.service(ProjectionTurnRepository));
   return {
     engine,
     maintenanceGate,
+    deliveries,
+    turns,
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
     dispose: () => runtime.dispose(),
@@ -111,6 +121,306 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
+  it("atomically cancels an absent-session pending start and preserves its message", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-pending-recovery");
+    const threadId = ThreadId.make("thread-pending-recovery");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-pending-project"),
+        projectId,
+        title: "Pending recovery",
+        workspaceRoot: "/tmp/project-pending-recovery",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-pending-thread"),
+        threadId,
+        projectId,
+        title: "Pending recovery",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-pending-start"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-pending"),
+          role: "user",
+          text: "preserve me",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: now(),
+      }),
+    );
+    const pending = (await system.run(system.deliveries.listPendingOrdered()))[0]!;
+    const recovery = {
+      type: "thread.session.interrupt-if-active" as const,
+      commandId: CommandId.make("recovery-pending-boot-2"),
+      threadId,
+      target: {
+        kind: "pendingStart" as const,
+        pendingMessageId: asMessageId("message-pending"),
+        deliveryId: pending.deliveryId,
+        sourceEventId: pending.sourceEventId,
+        expectedSession: { kind: "absent" as const },
+      },
+      reason: "server-restarted" as const,
+      interruptionCode: "server_restart" as const,
+      serverBootId: "boot-2",
+      detectedAt: "2026-01-01T00:00:03.000Z",
+      createdAt: "2026-01-01T00:00:03.000Z",
+    };
+    const first = await system.run(system.engine.dispatchInternal(recovery));
+    const duplicate = await system.run(system.engine.dispatchInternal(recovery));
+    expect(duplicate.sequence).toBe(first.sequence);
+    expect(
+      Option.getOrThrow(await system.run(system.deliveries.getById(pending.deliveryId))).status,
+    ).toBe("cancelled");
+    const snapshot = await system.readModel();
+    const thread = snapshot.threads.find((candidate) => candidate.id === threadId)!;
+    expect(thread.messages.map((message) => message.id)).toEqual(["message-pending"]);
+    expect(thread.latestTurn).toBeNull();
+    expect(thread.session).toBeNull();
+    expect(
+      thread.activities.filter((activity) => activity.kind === "session.start.interrupted"),
+    ).toHaveLength(1);
+    await system.dispose();
+  });
+
+  it("persists concrete interruption evidence across later session writes and snapshots", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-concrete-recovery");
+    const threadId = ThreadId.make("thread-concrete-recovery");
+    const turnId = asTurnId("turn-concrete-recovery");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-concrete-project"),
+        projectId,
+        title: "Concrete recovery",
+        workspaceRoot: "/tmp/project-concrete-recovery",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-concrete-thread"),
+        threadId,
+        projectId,
+        title: "Concrete recovery",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-concrete-start"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-concrete"),
+          role: "user",
+          text: "preserve retry source",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: now(),
+      }),
+    );
+    const runningAt = "2026-01-01T00:00:01.000Z";
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-concrete-running"),
+        threadId,
+        session: {
+          threadId,
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "full-access",
+          activeTurnId: turnId,
+          lastError: null,
+          updatedAt: runningAt,
+        },
+        createdAt: runningAt,
+      }),
+    );
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.session.interrupt-if-active",
+        commandId: CommandId.make("recovery-concrete-boot-2"),
+        threadId,
+        target: {
+          kind: "turn",
+          turnId,
+          retrySourceMessageId: asMessageId("message-concrete"),
+          expectedSession: {
+            kind: "present",
+            status: "running",
+            activeTurnId: turnId,
+            updatedAt: runningAt,
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+          },
+        },
+        reason: "server-restarted",
+        interruptionCode: "server_restart",
+        serverBootId: "boot-2",
+        detectedAt: "2026-01-01T00:00:03.000Z",
+        executionLastObservedAt: "2026-01-01T00:00:02.000Z",
+        createdAt: "2026-01-01T00:00:03.000Z",
+      }),
+    );
+    expect(
+      Option.getOrThrow(await system.run(system.turns.getByTurnId({ threadId, turnId }))),
+    ).toMatchObject({
+      interruptionCode: "server_restart",
+      retrySourceMessageId: "message-concrete",
+    });
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-concrete-ready-late"),
+        threadId,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-01-01T00:00:04.000Z",
+        },
+        createdAt: "2026-01-01T00:00:04.000Z",
+      }),
+    );
+    expect(
+      Option.getOrThrow(await system.run(system.turns.getByTurnId({ threadId, turnId }))),
+    ).toMatchObject({
+      interruptionCode: "server_restart",
+      retrySourceMessageId: "message-concrete",
+    });
+    const snapshot = await system.readModel();
+    expect(
+      snapshot.threads.find((candidate) => candidate.id === threadId)?.latestTurn,
+    ).toMatchObject({
+      turnId,
+      state: "interrupted",
+      completedAt: "2026-01-01T00:00:02.000Z",
+      interruptionCode: "server_restart",
+      interruptionDetectedAt: "2026-01-01T00:00:03.000Z",
+      executionLastObservedAt: "2026-01-01T00:00:02.000Z",
+      interruptionTimestampFallback: false,
+      retrySourceMessageId: "message-concrete",
+    });
+    await system.dispose();
+  });
+
+  it("barrier covers delivery insertion and sealing rejects later dispatch", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-barrier");
+    const threadId = ThreadId.make("thread-barrier");
+    await system.run(
+      system.engine
+        .dispatchInternal({
+          type: "thread.session.set",
+          commandId: CommandId.make("unused-session-before-thread"),
+          threadId,
+          session: {
+            threadId,
+            status: "idle",
+            providerName: null,
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now(),
+          },
+          createdAt: now(),
+        })
+        .pipe(Effect.flip),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-barrier-project"),
+        projectId,
+        title: "Barrier",
+        workspaceRoot: "/tmp/project-barrier",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-barrier-thread"),
+        threadId,
+        projectId,
+        title: "Barrier",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    const start = await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-barrier-start"),
+        threadId,
+        message: {
+          messageId: asMessageId("msg-barrier"),
+          role: "user",
+          text: "hello",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: now(),
+      }),
+    );
+    const barrier = await system.run(system.engine.barrier);
+    expect(barrier.sequence).toBe(start.sequence);
+    const pending = await system.run(system.deliveries.listPendingOrdered());
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.deliveryKind).toBe("turn-start");
+
+    await system.run(system.engine.sealAndStop);
+    expect(await system.run(system.engine.isSealed)).toBe(true);
+    await expect(
+      system.run(
+        system.engine.dispatchExternal({
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-after-seal"),
+          threadId,
+        }),
+      ),
+    ).rejects.toMatchObject({ _tag: "orchestration_not_ready", phase: "sealed" });
+    await system.dispose();
+  });
   it("blocks turn dispatch while the shared update maintenance gate is held", async () => {
     const system = await createOrchestrationSystem();
     await system.run(system.maintenanceGate.acquire);

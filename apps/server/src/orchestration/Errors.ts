@@ -2,6 +2,7 @@ import * as SchemaIssue from "effect/SchemaIssue";
 import * as Schema from "effect/Schema";
 
 import type { ProjectionRepositoryError } from "../persistence/Errors.ts";
+import type { OrchestrationNotReadyError } from "@t3tools/contracts";
 
 export class OrchestrationCommandJsonParseError extends Schema.TaggedErrorClass<OrchestrationCommandJsonParseError>()(
   "OrchestrationCommandJsonParseError",
@@ -84,7 +85,8 @@ export type OrchestrationDispatchError =
   | OrchestrationCommandInvariantError
   | OrchestrationCommandPreviouslyRejectedError
   | OrchestrationProjectorDecodeError
-  | OrchestrationListenerCallbackError;
+  | OrchestrationListenerCallbackError
+  | OrchestrationNotReadyError;
 
 export type OrchestrationEngineError =
   | OrchestrationDispatchError

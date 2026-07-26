@@ -24,11 +24,12 @@ import {
   AuthWebSocketTicketResult,
   ServerAuthSessionMethod,
 } from "./auth.ts";
-import { AuthSessionId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { AuthSessionId, NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import {
   ClientOrchestrationCommand,
   DispatchResult,
+  OrchestrationNotReadyPhase,
   OrchestrationReadModel,
   OrchestrationShellSnapshot,
   OrchestrationThreadDetailSnapshot,
@@ -264,6 +265,24 @@ export class EnvironmentCloudEndpointUnavailableError extends Schema.TaggedError
     });
   }
 }
+
+export class EnvironmentOrchestrationNotReadyError extends Schema.TaggedErrorClass<EnvironmentOrchestrationNotReadyError>()(
+  "EnvironmentOrchestrationNotReadyError",
+  {
+    code: Schema.Literal("orchestration_not_ready"),
+    retryable: Schema.Boolean,
+    retryAfterMs: NonNegativeInt,
+    phase: OrchestrationNotReadyPhase,
+    traceId: TrimmedNonEmptyString,
+  },
+  { httpApiStatus: 503 },
+) {
+  [HttpServerRespondable.symbol]() {
+    return HttpServerResponse.schemaJson(EnvironmentOrchestrationNotReadyError)(this, {
+      status: 503,
+    });
+  }
+}
 const EnvironmentSessionCreationErrors = [
   EnvironmentAuthInvalidError,
   EnvironmentInternalError,
@@ -298,6 +317,7 @@ const EnvironmentOrchestrationThreadSnapshotErrors = [
 const EnvironmentOrchestrationDispatchErrors = [
   EnvironmentRequestInvalidError,
   EnvironmentScopeRequiredError,
+  EnvironmentOrchestrationNotReadyError,
   EnvironmentInternalError,
 ] as const;
 

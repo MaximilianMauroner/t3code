@@ -4,6 +4,7 @@ import {
   OrchestrationMessage,
   OrchestrationSession,
   OrchestrationThread,
+  type OrchestrationThreadActivity,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -29,6 +30,8 @@ import {
   ThreadUnsnoozedPayload,
   ThreadRevertedPayload,
   ThreadSessionSetPayload,
+  ThreadSessionInterruptedPayload,
+  ThreadSessionStartInterruptedPayload,
   ThreadTurnDiffCompletedPayload,
 } from "./Schemas.ts";
 
@@ -555,6 +558,74 @@ export function projectEvent(
                       completedAt: session.updatedAt,
                     }
                   : thread.latestTurn,
+            updatedAt: event.occurredAt,
+          }),
+        };
+      });
+
+    case "thread.session-interrupted":
+      return Effect.gen(function* () {
+        const payload = yield* decodeForEvent(
+          ThreadSessionInterruptedPayload,
+          event.payload,
+          event.type,
+          "payload",
+        );
+        const thread = nextBase.threads.find((entry) => entry.id === payload.threadId);
+        if (!thread || thread.latestTurn?.turnId !== payload.turnId) return nextBase;
+        const completedAt = payload.executionLastObservedAt ?? payload.detectedAt;
+        return {
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            latestTurn: {
+              ...thread.latestTurn,
+              state: "interrupted",
+              completedAt,
+              interruptionCode: payload.interruptionCode,
+              interruptionDetectedAt: payload.detectedAt,
+              executionLastObservedAt: payload.executionLastObservedAt ?? null,
+              interruptionTimestampFallback: payload.timestampFallback,
+              retrySourceMessageId: payload.retrySourceMessageId,
+            },
+            session:
+              thread.session === null
+                ? null
+                : {
+                    ...thread.session,
+                    status: "interrupted",
+                    activeTurnId: null,
+                    lastError: payload.interruptionCode,
+                    updatedAt: payload.detectedAt,
+                  },
+            updatedAt: event.occurredAt,
+          }),
+        };
+      });
+
+    case "thread.session-start-interrupted":
+      return Effect.gen(function* () {
+        const payload = yield* decodeForEvent(
+          ThreadSessionStartInterruptedPayload,
+          event.payload,
+          event.type,
+          "payload",
+        );
+        const thread = nextBase.threads.find((entry) => entry.id === payload.threadId);
+        if (!thread) return nextBase;
+        const activity = {
+          id: event.eventId,
+          tone: "error" as const,
+          kind: "session.start.interrupted",
+          summary: "Turn start was interrupted before a provider session was established.",
+          payload,
+          turnId: null,
+          sequence: event.sequence,
+          createdAt: payload.detectedAt,
+        } satisfies OrchestrationThreadActivity;
+        return {
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            activities: [...thread.activities, activity].slice(-500),
             updatedAt: event.occurredAt,
           }),
         };

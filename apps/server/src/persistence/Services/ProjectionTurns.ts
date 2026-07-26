@@ -48,6 +48,13 @@ export const ProjectionTurn = Schema.Struct({
   checkpointRef: Schema.NullOr(CheckpointRef),
   checkpointStatus: Schema.NullOr(OrchestrationCheckpointStatus),
   checkpointFiles: Schema.Array(OrchestrationCheckpointFile),
+  pendingDeliveryId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  pendingEventId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  interruptionCode: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  interruptionDetectedAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
+  executionLastObservedAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
+  interruptionTimestampFallback: Schema.optionalKey(Schema.Boolean),
+  retrySourceMessageId: Schema.optionalKey(Schema.NullOr(MessageId)),
 });
 export type ProjectionTurn = typeof ProjectionTurn.Type;
 
@@ -66,6 +73,13 @@ export const ProjectionTurnById = Schema.Struct({
   checkpointRef: Schema.NullOr(CheckpointRef),
   checkpointStatus: Schema.NullOr(OrchestrationCheckpointStatus),
   checkpointFiles: Schema.Array(OrchestrationCheckpointFile),
+  pendingDeliveryId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  pendingEventId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  interruptionCode: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  interruptionDetectedAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
+  executionLastObservedAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
+  interruptionTimestampFallback: Schema.optionalKey(Schema.Boolean),
+  retrySourceMessageId: Schema.optionalKey(Schema.NullOr(MessageId)),
 });
 export type ProjectionTurnById = typeof ProjectionTurnById.Type;
 
@@ -75,6 +89,8 @@ export const ProjectionPendingTurnStart = Schema.Struct({
   sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
   sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
   requestedAt: IsoDateTime,
+  pendingDeliveryId: Schema.optionalKey(Schema.String),
+  pendingEventId: Schema.optionalKey(Schema.String),
 });
 export type ProjectionPendingTurnStart = typeof ProjectionPendingTurnStart.Type;
 

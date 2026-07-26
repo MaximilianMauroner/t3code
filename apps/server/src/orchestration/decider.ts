@@ -142,6 +142,28 @@ function threadHasQueuedTurnStart(
   );
 }
 
+function sessionMatchesRecoveryExpectation(
+  session: OrchestrationReadModel["threads"][number]["session"],
+  expected: Extract<
+    Extract<
+      OrchestrationCommand,
+      { readonly type: "thread.session.interrupt-if-active" }
+    >["target"],
+    { readonly kind: "turn" | "pendingStart" }
+  >["expectedSession"],
+): boolean {
+  if (expected.kind === "absent") return session === null;
+  return (
+    session !== null &&
+    session.status === expected.status &&
+    session.activeTurnId === expected.activeTurnId &&
+    session.updatedAt === expected.updatedAt &&
+    session.providerName === expected.providerName &&
+    (expected.providerInstanceId === undefined ||
+      (session.providerInstanceId ?? null) === expected.providerInstanceId)
+  );
+}
+
 function withEventBase(
   input: Pick<OrchestrationCommand, "commandId"> & {
     readonly aggregateKind: OrchestrationEvent["aggregateKind"];
@@ -977,6 +999,87 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         },
       };
       return [unsettledEvent, sessionSetEvent];
+    }
+
+    case "thread.session.interrupt-if-active": {
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      if (!sessionMatchesRecoveryExpectation(thread.session, command.target.expectedSession)) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Recovery target no longer matches the projected session.",
+        });
+      }
+
+      if (command.target.kind === "turn") {
+        if (
+          command.target.expectedSession.kind !== "present" ||
+          command.target.expectedSession.activeTurnId !== command.target.turnId ||
+          thread.latestTurn?.turnId !== command.target.turnId ||
+          thread.latestTurn.state !== "running"
+        ) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: "Recovery turn is no longer active.",
+          });
+        }
+        const observedAt = command.executionLastObservedAt;
+        const startedAtMs = Date.parse(
+          thread.latestTurn.startedAt ?? thread.latestTurn.requestedAt,
+        );
+        const detectedAtMs = Date.parse(command.detectedAt);
+        const observedAtMs = observedAt === undefined ? Number.NaN : Date.parse(observedAt);
+        const observedIsEligible =
+          Number.isFinite(observedAtMs) &&
+          observedAtMs >= startedAtMs &&
+          observedAtMs <= detectedAtMs;
+        return {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.detectedAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.session-interrupted",
+          payload: {
+            threadId: command.threadId,
+            turnId: command.target.turnId,
+            interruptionCode: command.interruptionCode,
+            reason: command.reason,
+            detectedAt: command.detectedAt,
+            ...(observedIsEligible ? { executionLastObservedAt: observedAt } : {}),
+            timestampFallback: !observedIsEligible,
+            retrySourceMessageId: command.target.retrySourceMessageId,
+            serverBootId: command.serverBootId,
+          },
+        };
+      }
+
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.detectedAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.session-start-interrupted",
+        payload: {
+          threadId: command.threadId,
+          pendingMessageId: command.target.pendingMessageId,
+          deliveryId: command.target.deliveryId,
+          sourceEventId: command.target.sourceEventId,
+          interruptionCode: command.interruptionCode,
+          reason: command.reason,
+          detectedAt: command.detectedAt,
+          ...(command.executionLastObservedAt !== undefined
+            ? { executionLastObservedAt: command.executionLastObservedAt }
+            : {}),
+          serverBootId: command.serverBootId,
+        },
+      };
     }
 
     case "thread.message.assistant.delta": {

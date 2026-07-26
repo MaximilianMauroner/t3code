@@ -10,7 +10,12 @@
  *
  * @module OrchestrationEngineService
  */
-import type { OrchestrationCommand, OrchestrationEvent } from "@t3tools/contracts";
+import type {
+  DispatchableClientOrchestrationCommand,
+  InternalOrchestrationCommand,
+  OrchestrationCommand,
+  OrchestrationEvent,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
@@ -49,6 +54,22 @@ export interface OrchestrationEngineShape {
   readonly dispatch: (
     command: OrchestrationCommand,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  readonly dispatchExternal: (
+    command: DispatchableClientOrchestrationCommand,
+  ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  readonly dispatchInternal: (
+    command: InternalOrchestrationCommand,
+  ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  /** Resolves after all earlier envelopes have committed and planned deliveries are durable. */
+  readonly barrier: Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  /** Idempotently reject new work, stop the queue worker, and prohibit later publication. */
+  readonly sealAndStop: Effect.Effect<void, never, never>;
+
+  readonly isSealed: Effect.Effect<boolean, never, never>;
 
   /**
    * Stream persisted domain events in dispatch order.

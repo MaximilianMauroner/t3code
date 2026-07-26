@@ -1,10 +1,12 @@
 import type {
+  DispatchableClientOrchestrationCommand,
+  InternalOrchestrationCommand,
   OrchestrationEvent,
   OrchestrationReadModel,
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
-import { OrchestrationCommand } from "@t3tools/contracts";
+import { OrchestrationCommand, OrchestrationNotReadyError } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
@@ -18,6 +20,8 @@ import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Fiber from "effect/Fiber";
+import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -31,6 +35,8 @@ import {
 import { toPersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
+import { OrchestrationReactorDeliveries } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import { OrchestrationReactorDeliveriesLive } from "../../persistence/Layers/OrchestrationReactorDeliveries.ts";
 import {
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
@@ -46,17 +52,27 @@ import {
   type OrchestrationEngineShape,
 } from "../Services/OrchestrationEngine.ts";
 import { UpdateMaintenanceGate, type UpdateDispatchAcceptance } from "../UpdateMaintenanceGate.ts";
+import { planReactorDelivery } from "../reactorDeliveries.ts";
+import { ServerBootIdentity } from "../../serverBootId.ts";
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
 
 interface CommandEnvelope {
+  readonly _tag: "command";
   command: OrchestrationCommand;
   maintenanceAcceptance: UpdateDispatchAcceptance;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   startedAtMs: number;
 }
+
+interface BarrierEnvelope {
+  readonly _tag: "barrier";
+  readonly result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
+}
+
+type EngineEnvelope = CommandEnvelope | BarrierEnvelope;
 
 function commandToAggregateRef(command: OrchestrationCommand): {
   readonly aggregateKind: "project" | "thread";
@@ -86,12 +102,16 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const crypto = yield* Crypto.Crypto;
   const maintenanceGate = yield* UpdateMaintenanceGate;
+  const reactorDeliveries = yield* OrchestrationReactorDeliveries;
+  const serverBootId = (yield* ServerBootIdentity).id;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
 
-  const commandQueue = yield* Queue.unbounded<CommandEnvelope>();
+  const commandQueue = yield* Queue.unbounded<EngineEnvelope>();
   const eventPubSub = yield* PubSub.unbounded<OrchestrationEvent>();
+  const admissionLock = yield* Semaphore.make(1);
+  let sealed = false;
 
   const projectEventsOntoReadModel = (
     baseReadModel: OrchestrationReadModel,
@@ -124,7 +144,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       commandReadModel = yield* projectEventsOntoReadModel(commandReadModel, persistedEvents);
 
       for (const persistedEvent of persistedEvents) {
-        yield* PubSub.publish(eventPubSub, persistedEvent);
+        if (!sealed) yield* PubSub.publish(eventPubSub, persistedEvent);
       }
     });
 
@@ -180,9 +200,34 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                   let nextCommandReadModel = commandReadModel;
 
                   for (const nextEvent of eventBases) {
+                    if (
+                      envelope.command.type === "thread.session.interrupt-if-active" &&
+                      envelope.command.target.kind === "pendingStart"
+                    ) {
+                      const delivery = yield* reactorDeliveries.getById(
+                        envelope.command.target.deliveryId,
+                      );
+                      if (
+                        Option.isNone(delivery) ||
+                        delivery.value.sourceEventId !== envelope.command.target.sourceEventId ||
+                        delivery.value.threadId !== envelope.command.threadId ||
+                        (delivery.value.status !== "pending" &&
+                          delivery.value.status !== "delivering")
+                      ) {
+                        return yield* new OrchestrationCommandInvariantError({
+                          commandType: envelope.command.type,
+                          detail:
+                            "Recovery start delivery no longer matches pending durable state.",
+                        });
+                      }
+                    }
                     const savedEvent = yield* eventStore.append(nextEvent);
                     nextCommandReadModel = yield* projectEvent(nextCommandReadModel, savedEvent);
                     yield* projectionPipeline.projectEvent(savedEvent);
+                    const plannedDelivery = planReactorDelivery(savedEvent, serverBootId);
+                    if (plannedDelivery !== null) {
+                      yield* reactorDeliveries.insert(plannedDelivery);
+                    }
                     committedEvents.push(savedEvent);
                   }
 
@@ -226,7 +271,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         );
 
         for (const [index, event] of committedCommand.committedEvents.entries()) {
-          yield* PubSub.publish(eventPubSub, event);
+          if (!sealed) yield* PubSub.publish(eventPubSub, event);
           if (index === 0) {
             yield* Metric.update(
               Metric.withAttributes(
@@ -288,7 +333,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               ),
             );
 
-            if (isOrchestrationCommandInvariantError(error)) {
+            if (
+              isOrchestrationCommandInvariantError(error) &&
+              envelope.command.type !== "thread.session.interrupt-if-active"
+            ) {
               yield* commandReceiptRepository
                 .upsert({
                   commandId: envelope.command.commandId,
@@ -312,8 +360,16 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   yield* projectionPipeline.bootstrap;
   commandReadModel = yield* projectionSnapshotQuery.getCommandReadModel();
 
-  const worker = Effect.forever(Queue.take(commandQueue).pipe(Effect.flatMap(processEnvelope)));
-  yield* Effect.forkScoped(worker);
+  const worker = Effect.forever(
+    Queue.take(commandQueue).pipe(
+      Effect.flatMap((envelope) =>
+        envelope._tag === "command"
+          ? processEnvelope(envelope)
+          : Deferred.succeed(envelope.result, { sequence: commandReadModel.snapshotSequence }),
+      ),
+    ),
+  );
+  const workerFiber = yield* Effect.forkScoped(worker);
   yield* Effect.logDebug("orchestration engine started").pipe(
     Effect.annotateLogs({ sequence: commandReadModel.snapshotSequence }),
   );
@@ -321,22 +377,70 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive, limit) =>
     eventStore.readFromSequence(fromSequenceExclusive, limit);
 
-  const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
+  const enqueueCommand = (command: OrchestrationCommand) =>
+    admissionLock.withPermits(1)(
+      Effect.gen(function* () {
+        if (sealed) {
+          return yield* new OrchestrationNotReadyError({
+            message: "Orchestration engine is sealed.",
+            retryable: false,
+            retryAfterMs: 0,
+            phase: "sealed",
+          });
+        }
+        const maintenanceAcceptance = yield* maintenanceGate.ensureDispatchAllowed(command);
+        const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
+        yield* Queue.offer(commandQueue, {
+          _tag: "command",
+          command,
+          maintenanceAcceptance,
+          result,
+          startedAtMs: yield* Clock.currentTimeMillis,
+        });
+        return yield* Deferred.await(result);
+      }),
+    );
+
+  const dispatch: OrchestrationEngineShape["dispatch"] = enqueueCommand;
+  const dispatchExternal: OrchestrationEngineShape["dispatchExternal"] = (
+    command: DispatchableClientOrchestrationCommand,
+  ) => enqueueCommand(command);
+  const dispatchInternal: OrchestrationEngineShape["dispatchInternal"] = (
+    command: InternalOrchestrationCommand,
+  ) => enqueueCommand(command);
+  const barrier: OrchestrationEngineShape["barrier"] = admissionLock.withPermits(1)(
     Effect.gen(function* () {
-      const maintenanceAcceptance = yield* maintenanceGate.ensureDispatchAllowed(command);
+      if (sealed) {
+        return yield* new OrchestrationNotReadyError({
+          message: "Orchestration engine is sealed.",
+          retryable: false,
+          retryAfterMs: 0,
+          phase: "sealed",
+        });
+      }
       const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
-      yield* Queue.offer(commandQueue, {
-        command,
-        maintenanceAcceptance,
-        result,
-        startedAtMs: yield* Clock.currentTimeMillis,
-      });
+      yield* Queue.offer(commandQueue, { _tag: "barrier", result });
       return yield* Deferred.await(result);
-    });
+    }),
+  );
+  const sealAndStop: OrchestrationEngineShape["sealAndStop"] = admissionLock.withPermits(1)(
+    Effect.gen(function* () {
+      if (sealed) return;
+      sealed = true;
+      yield* Queue.shutdown(commandQueue);
+      yield* Fiber.interrupt(workerFiber).pipe(Effect.ignore);
+      yield* PubSub.shutdown(eventPubSub);
+    }),
+  );
 
   return {
     readEvents,
     dispatch,
+    dispatchExternal,
+    dispatchInternal,
+    barrier,
+    sealAndStop,
+    isSealed: Effect.sync(() => sealed),
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (wsServer, ProviderRuntimeIngestion, CheckpointReactor, etc.)
     // each independently receive all domain events.
@@ -351,7 +455,11 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   } satisfies OrchestrationEngineShape;
 });
 
-export const OrchestrationEngineLive = Layer.effect(
+export const OrchestrationEngineCoreLive = Layer.effect(
   OrchestrationEngineService,
   makeOrchestrationEngine,
+).pipe(Layer.provide(OrchestrationReactorDeliveriesLive));
+
+export const OrchestrationEngineLive = OrchestrationEngineCoreLive.pipe(
+  Layer.provide(ServerBootIdentity.layer),
 );

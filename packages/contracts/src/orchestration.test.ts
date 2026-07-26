@@ -23,6 +23,9 @@ import {
   ThreadCreatedPayload,
   ThreadTurnDiff,
   ThreadTurnStartRequestedPayload,
+  OrchestrationSubscribeThreadInput,
+  OrchestrationReplayEventsInput,
+  ThreadSessionInterruptIfActiveCommand,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
@@ -53,6 +56,9 @@ const decodeThreadCreatedPayload = Schema.decodeUnknownEffect(ThreadCreatedPaylo
 const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
+const decodeRecoveryCommand = Schema.decodeUnknownEffect(ThreadSessionInterruptIfActiveCommand);
+const decodeSubscribeThreadInput = Schema.decodeUnknownEffect(OrchestrationSubscribeThreadInput);
+const decodeReplayEventsInput = Schema.decodeUnknownEffect(OrchestrationReplayEventsInput);
 
 it.effect("parses turn diff input when fromTurnCount <= toTurnCount", () =>
   Effect.gen(function* () {
@@ -63,6 +69,63 @@ it.effect("parses turn diff input when fromTurnCount <= toTurnCount", () =>
     });
     assert.strictEqual(parsed.fromTurnCount, 1);
     assert.strictEqual(parsed.toTurnCount, 2);
+  }),
+);
+
+it.effect("decodes recovery contracts while preserving legacy optionality", () =>
+  Effect.gen(function* () {
+    const historicTurn = yield* decodeOrchestrationLatestTurn({
+      turnId: "turn-1",
+      state: "interrupted",
+      requestedAt: "2026-07-26T00:00:00.000Z",
+      startedAt: null,
+      completedAt: "2026-07-26T00:00:01.000Z",
+      assistantMessageId: null,
+    });
+    assert.strictEqual(historicTurn.interruptionCode, undefined);
+    const recoveredTurn = yield* decodeOrchestrationLatestTurn({
+      turnId: "turn-1",
+      state: "interrupted",
+      requestedAt: "2026-07-26T00:00:00.000Z",
+      startedAt: "2026-07-26T00:00:00.000Z",
+      completedAt: "2026-07-26T00:00:01.000Z",
+      assistantMessageId: null,
+      interruptionCode: "server_restart",
+      interruptionDetectedAt: "2026-07-26T00:00:02.000Z",
+      executionLastObservedAt: "2026-07-26T00:00:01.000Z",
+      interruptionTimestampFallback: false,
+      retrySourceMessageId: "message-1",
+    });
+    assert.strictEqual(recoveredTurn.interruptionCode, "server_restart");
+    assert.strictEqual(recoveredTurn.retrySourceMessageId, "message-1");
+
+    const command = yield* decodeRecoveryCommand({
+      type: "thread.session.interrupt-if-active",
+      commandId: "recovery-1",
+      threadId: "thread-1",
+      target: {
+        kind: "pendingStart",
+        pendingMessageId: "message-1",
+        deliveryId: "delivery-1",
+        sourceEventId: "event-1",
+        expectedSession: { kind: "absent" },
+      },
+      reason: "server-restarted",
+      interruptionCode: "server_restart",
+      serverBootId: "boot-2",
+      detectedAt: "2026-07-26T00:00:02.000Z",
+      createdAt: "2026-07-26T00:00:02.000Z",
+    });
+    assert.strictEqual(command.target.kind, "pendingStart");
+
+    const subscribe = yield* decodeSubscribeThreadInput({
+      threadId: "thread-1",
+    });
+    const replay = yield* decodeReplayEventsInput({
+      fromSequenceExclusive: 0,
+    });
+    assert.strictEqual(subscribe.threadRecoveryEventsV1, undefined);
+    assert.strictEqual(replay.threadRecoveryEventsV1, undefined);
   }),
 );
 

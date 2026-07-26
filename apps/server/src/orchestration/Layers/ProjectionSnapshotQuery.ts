@@ -103,6 +103,11 @@ const ProjectionLatestTurnDbRowSchema = Schema.Struct({
   assistantMessageId: Schema.NullOr(MessageId),
   sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
   sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
+  interruptionCode: Schema.NullOr(Schema.String),
+  interruptionDetectedAt: Schema.NullOr(IsoDateTime),
+  executionLastObservedAt: Schema.NullOr(IsoDateTime),
+  interruptionTimestampFallback: Schema.Number,
+  retrySourceMessageId: Schema.NullOr(MessageId),
 });
 const ProjectionStateDbRowSchema = ProjectionState;
 const ProjectionCountsRowSchema = Schema.Struct({
@@ -205,6 +210,15 @@ function mapLatestTurn(
             threadId: row.sourceProposedPlanThreadId,
             planId: row.sourceProposedPlanId,
           },
+        }
+      : {}),
+    ...(row.interruptionCode !== null || row.interruptionDetectedAt !== null
+      ? {
+          interruptionCode: row.interruptionCode,
+          interruptionDetectedAt: row.interruptionDetectedAt,
+          executionLastObservedAt: row.executionLastObservedAt,
+          interruptionTimestampFallback: row.interruptionTimestampFallback === 1,
+          retrySourceMessageId: row.retrySourceMessageId,
         }
       : {}),
   };
@@ -585,7 +599,12 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           turns.completed_at AS "completedAt",
           turns.assistant_message_id AS "assistantMessageId",
           turns.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          turns.source_proposed_plan_id AS "sourceProposedPlanId"
+          turns.source_proposed_plan_id AS "sourceProposedPlanId",
+          turns.interruption_code AS "interruptionCode",
+          turns.interruption_detected_at AS "interruptionDetectedAt",
+          turns.execution_last_observed_at AS "executionLastObservedAt",
+          turns.interruption_timestamp_fallback AS "interruptionTimestampFallback",
+          turns.retry_source_message_id AS "retrySourceMessageId"
         FROM projection_threads threads
         JOIN projection_turns turns
           ON turns.thread_id = threads.thread_id
@@ -609,7 +628,12 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           turns.completed_at AS "completedAt",
           turns.assistant_message_id AS "assistantMessageId",
           turns.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          turns.source_proposed_plan_id AS "sourceProposedPlanId"
+          turns.source_proposed_plan_id AS "sourceProposedPlanId",
+          turns.interruption_code AS "interruptionCode",
+          turns.interruption_detected_at AS "interruptionDetectedAt",
+          turns.execution_last_observed_at AS "executionLastObservedAt",
+          turns.interruption_timestamp_fallback AS "interruptionTimestampFallback",
+          turns.retry_source_message_id AS "retrySourceMessageId"
         FROM projection_threads threads
         JOIN projection_turns turns
           ON turns.thread_id = threads.thread_id
@@ -635,7 +659,12 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           turns.completed_at AS "completedAt",
           turns.assistant_message_id AS "assistantMessageId",
           turns.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          turns.source_proposed_plan_id AS "sourceProposedPlanId"
+          turns.source_proposed_plan_id AS "sourceProposedPlanId",
+          turns.interruption_code AS "interruptionCode",
+          turns.interruption_detected_at AS "interruptionDetectedAt",
+          turns.execution_last_observed_at AS "executionLastObservedAt",
+          turns.interruption_timestamp_fallback AS "interruptionTimestampFallback",
+          turns.retry_source_message_id AS "retrySourceMessageId"
         FROM projection_threads threads
         JOIN projection_turns turns
           ON turns.thread_id = threads.thread_id
@@ -1126,7 +1155,12 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           turns.completed_at AS "completedAt",
           turns.assistant_message_id AS "assistantMessageId",
           turns.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          turns.source_proposed_plan_id AS "sourceProposedPlanId"
+          turns.source_proposed_plan_id AS "sourceProposedPlanId",
+          turns.interruption_code AS "interruptionCode",
+          turns.interruption_detected_at AS "interruptionDetectedAt",
+          turns.execution_last_observed_at AS "executionLastObservedAt",
+          turns.interruption_timestamp_fallback AS "interruptionTimestampFallback",
+          turns.retry_source_message_id AS "retrySourceMessageId"
         FROM projection_threads threads
         JOIN projection_turns turns
           ON turns.thread_id = threads.thread_id
@@ -1375,29 +1409,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 if (latestTurnByThread.has(row.threadId)) {
                   continue;
                 }
-                latestTurnByThread.set(row.threadId, {
-                  turnId: row.turnId,
-                  state:
-                    row.state === "error"
-                      ? "error"
-                      : row.state === "interrupted"
-                        ? "interrupted"
-                        : row.state === "completed"
-                          ? "completed"
-                          : "running",
-                  requestedAt: row.requestedAt,
-                  startedAt: row.startedAt,
-                  completedAt: row.completedAt,
-                  assistantMessageId: row.assistantMessageId,
-                  ...(row.sourceProposedPlanThreadId !== null && row.sourceProposedPlanId !== null
-                    ? {
-                        sourceProposedPlan: {
-                          threadId: row.sourceProposedPlanThreadId,
-                          planId: row.sourceProposedPlanId,
-                        },
-                      }
-                    : {}),
-                });
+                latestTurnByThread.set(row.threadId, mapLatestTurn(row));
               }
 
               for (const row of sessionRows) {

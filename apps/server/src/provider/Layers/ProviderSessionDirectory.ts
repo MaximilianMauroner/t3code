@@ -77,6 +77,7 @@ function toRuntimeBinding(
           status: runtime.status,
           resumeCursor: runtime.resumeCursor,
           runtimePayload: runtime.runtimePayload,
+          serverBootId: runtime.serverBootId ?? null,
           lastSeenAt: runtime.lastSeenAt,
         }) satisfies ProviderRuntimeBindingWithMetadata,
     ),
@@ -144,6 +145,7 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
           existingRuntime?.runtimePayload ?? null,
           binding.runtimePayload,
         ),
+        serverBootId: binding.serverBootId ?? existingRuntime?.serverBootId ?? null,
       })
       .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.upsert:upsert")));
   });
