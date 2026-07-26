@@ -50,6 +50,7 @@ import Migration0034 from "./Migrations/034_ProjectionThreadsSnoozed.ts";
 import Migration0035 from "./Migrations/035_OrchestrationRecovery.ts";
 import Migration0036 from "./Migrations/036_OrchestrationReactorDeliveryLeases.ts";
 import Migration0037 from "./Migrations/037_OrchestrationReactorDeliveryRetrySchedule.ts";
+import Migration0038 from "./Migrations/038_OrchestrationReactorDeliveryClaimOwnership.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -99,6 +100,7 @@ export const migrationEntries = [
   [35, "OrchestrationRecovery", Migration0035],
   [36, "OrchestrationReactorDeliveryLeases", Migration0036],
   [37, "OrchestrationReactorDeliveryRetrySchedule", Migration0037],
+  [38, "OrchestrationReactorDeliveryClaimOwnership", Migration0038],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

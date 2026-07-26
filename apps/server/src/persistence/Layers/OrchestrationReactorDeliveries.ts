@@ -37,6 +37,11 @@ const ClaimedTerminalInput = Schema.Struct({
   expectedClaimToken: TrimmedNonEmptyString,
   at: IsoDateTime,
 });
+const ExecutionStartedInput = Schema.Struct({
+  deliveryId: Schema.String,
+  expectedClaimToken: TrimmedNonEmptyString,
+  startedAt: IsoDateTime,
+});
 const PendingTerminalInput = Schema.Struct({
   deliveryId: Schema.String,
   at: IsoDateTime,
@@ -61,8 +66,9 @@ const selectFields = `
   command_id AS "commandId", status, attempts, last_error AS "lastError",
   last_failed_at AS "lastFailedAt", created_at AS "createdAt",
   next_attempt_at AS "nextAttemptAt",
-  claim_token AS "claimToken", claimed_at AS "claimedAt",
+  claim_token AS "claimToken", claim_boot_id AS "claimBootId", claimed_at AS "claimedAt",
   lease_expires_at AS "leaseExpiresAt", delivered_at AS "deliveredAt",
+  execution_started_at AS "executionStartedAt",
   cancelled_at AS "cancelledAt", dead_lettered_at AS "deadLetteredAt"
 `;
 const globalOrder = `
@@ -103,13 +109,15 @@ const make = Effect.gen(function* () {
         delivery_id, source_sequence, source_event_id, thread_id, reactor,
         delivery_kind, replay_policy, source_boot_id, payload_json, command_id,
         status, attempts, last_error, last_failed_at, next_attempt_at, created_at, claim_token,
-        claimed_at, lease_expires_at, delivered_at, cancelled_at, dead_lettered_at
+        claim_boot_id, claimed_at, lease_expires_at, execution_started_at,
+        delivered_at, cancelled_at, dead_lettered_at
       ) VALUES (
         ${row.deliveryId}, ${row.sourceSequence}, ${row.sourceEventId}, ${row.threadId},
         ${row.reactor}, ${row.deliveryKind}, ${row.replayPolicy}, ${row.sourceBootId},
         ${row.payload}, ${row.commandId}, ${row.status ?? "pending"}, ${row.attempts ?? 0},
         ${row.lastError ?? null}, ${row.lastFailedAt ?? null}, ${row.nextAttemptAt ?? null}, ${row.createdAt},
-        ${row.claimToken ?? null}, ${row.claimedAt ?? null}, ${row.leaseExpiresAt ?? null},
+        ${row.claimToken ?? null}, ${row.claimBootId ?? null}, ${row.claimedAt ?? null},
+        ${row.leaseExpiresAt ?? null}, ${row.executionStartedAt ?? null},
         ${row.deliveredAt ?? null}, ${row.cancelledAt ?? null}, ${row.deadLetteredAt ?? null}
       ) ON CONFLICT(delivery_id) DO NOTHING
     `,
@@ -153,7 +161,7 @@ const make = Effect.gen(function* () {
     execute: ({ deliveryId, claimToken, currentBootId, claimedAt, leaseExpiresAt, reactor }) =>
       sql.unsafe(
         `UPDATE orchestration_reactor_deliveries
-         SET status = 'delivering', claim_token = ?, claimed_at = ?, lease_expires_at = ?,
+         SET status = 'delivering', claim_token = ?, claim_boot_id = ?, claimed_at = ?, lease_expires_at = ?,
              attempts = attempts + 1, next_attempt_at = NULL
          WHERE delivery_id = ?
            AND reactor = COALESCE(?, reactor)
@@ -165,12 +173,14 @@ const make = Effect.gen(function* () {
            AND (
              (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
              OR (status = 'delivering' AND (
-               source_boot_id <> ? OR lease_expires_at IS NULL OR lease_expires_at <= ?
+               claim_boot_id IS NULL OR claim_boot_id <> ?
+               OR lease_expires_at IS NULL OR lease_expires_at <= ?
              ))
            )
          RETURNING ${selectFields}`,
         [
           claimToken,
+          currentBootId,
           claimedAt,
           leaseExpiresAt,
           deliveryId,
@@ -181,12 +191,23 @@ const make = Effect.gen(function* () {
         ],
       ),
   });
+  const updateExecutionStarted = SqlSchema.findOneOption({
+    Request: ExecutionStartedInput,
+    Result: UpdatedDelivery,
+    execute: ({ deliveryId, expectedClaimToken, startedAt }) => sql`
+      UPDATE orchestration_reactor_deliveries
+      SET execution_started_at = COALESCE(execution_started_at, ${startedAt})
+      WHERE delivery_id = ${deliveryId} AND status = 'delivering'
+        AND claim_token = ${expectedClaimToken}
+      RETURNING delivery_id AS "deliveryId"
+    `,
+  });
   const updateDelivered = SqlSchema.findOneOption({
     Request: ClaimedTerminalInput,
     Result: UpdatedDelivery,
     execute: ({ deliveryId, expectedClaimToken, at }) => sql`
       UPDATE orchestration_reactor_deliveries
-      SET status = 'delivered', delivered_at = ${at}, claim_token = NULL,
+      SET status = 'delivered', delivered_at = ${at}, claim_token = NULL, claim_boot_id = NULL,
           claimed_at = NULL, lease_expires_at = NULL
       WHERE delivery_id = ${deliveryId} AND status = 'delivering'
         AND claim_token = ${expectedClaimToken}
@@ -208,7 +229,7 @@ const make = Effect.gen(function* () {
     Result: UpdatedDelivery,
     execute: ({ deliveryId, expectedClaimToken, at }) => sql`
       UPDATE orchestration_reactor_deliveries
-      SET status = 'cancelled', cancelled_at = ${at}, claim_token = NULL,
+      SET status = 'cancelled', cancelled_at = ${at}, claim_token = NULL, claim_boot_id = NULL,
           claimed_at = NULL, lease_expires_at = NULL
       WHERE delivery_id = ${deliveryId} AND status = 'delivering'
         AND claim_token = ${expectedClaimToken}
@@ -231,7 +252,8 @@ const make = Effect.gen(function* () {
           last_error = ${lastError}, last_failed_at = ${failedAt},
           dead_lettered_at = CASE WHEN attempts >= ${maxAttempts} THEN ${failedAt} ELSE NULL END,
           next_attempt_at = CASE WHEN attempts >= ${maxAttempts} THEN NULL ELSE ${nextAttemptAt} END,
-          claim_token = NULL, claimed_at = NULL, lease_expires_at = NULL
+          claim_token = NULL, claim_boot_id = NULL, claimed_at = NULL, lease_expires_at = NULL,
+          execution_started_at = NULL
       WHERE delivery_id = ${deliveryId} AND status = 'delivering'
         AND claim_token = ${expectedClaimToken}
       RETURNING status
@@ -287,7 +309,7 @@ const make = Effect.gen(function* () {
                 if (next.status === "dead-letter") return Effect.succeed(Option.none());
                 if (
                   next.status === "delivering" &&
-                  next.sourceBootId === input.currentBootId &&
+                  next.claimBootId === input.currentBootId &&
                   next.leaseExpiresAt !== null &&
                   next.leaseExpiresAt > input.claimedAt
                 ) {
@@ -314,6 +336,15 @@ const make = Effect.gen(function* () {
     updateDelivered({ deliveryId, expectedClaimToken, at: deliveredAt }).pipe(
       Effect.map(Option.isSome),
       Effect.mapError(mapError("OrchestrationReactorDeliveries.markDelivered")),
+    );
+  const markExecutionStarted: OrchestrationReactorDeliveriesShape["markExecutionStarted"] = (
+    deliveryId,
+    expectedClaimToken,
+    startedAt,
+  ) =>
+    updateExecutionStarted({ deliveryId, expectedClaimToken, startedAt }).pipe(
+      Effect.map(Option.isSome),
+      Effect.mapError(mapError("OrchestrationReactorDeliveries.markExecutionStarted")),
     );
   const markCancelled: OrchestrationReactorDeliveriesShape["markCancelled"] = (
     deliveryId,
@@ -354,6 +385,7 @@ const make = Effect.gen(function* () {
     listUnresolvedOrdered,
     inspectReadiness,
     claimNext,
+    markExecutionStarted,
     markDelivered,
     markCancelled,
     recordFailure,

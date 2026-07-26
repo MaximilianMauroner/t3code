@@ -43,7 +43,7 @@ function deliveryDescriptor(event: OrchestrationEvent): {
       return {
         reactor: "provider-command",
         kind: "runtime-mode-change",
-        replayPolicy: "replay-idempotent",
+        replayPolicy: "cancel-with-recovery",
       };
     case "thread.turn-start-requested":
       return {

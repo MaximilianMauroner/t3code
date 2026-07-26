@@ -36,8 +36,10 @@ export const OrchestrationReactorDelivery = Schema.Struct({
   nextAttemptAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
   createdAt: IsoDateTime,
   claimToken: Schema.NullOr(TrimmedNonEmptyString),
+  claimBootId: Schema.NullOr(TrimmedNonEmptyString),
   claimedAt: Schema.NullOr(IsoDateTime),
   leaseExpiresAt: Schema.NullOr(IsoDateTime),
+  executionStartedAt: Schema.NullOr(IsoDateTime),
   deliveredAt: Schema.NullOr(IsoDateTime),
   cancelledAt: Schema.NullOr(IsoDateTime),
   deadLetteredAt: Schema.NullOr(IsoDateTime),
@@ -52,8 +54,10 @@ export const NewOrchestrationReactorDelivery = OrchestrationReactorDelivery.mapF
     lastFailedAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
     nextAttemptAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
     claimToken: Schema.optionalKey(Schema.NullOr(TrimmedNonEmptyString)),
+    claimBootId: Schema.optionalKey(Schema.NullOr(TrimmedNonEmptyString)),
     claimedAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
     leaseExpiresAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
+    executionStartedAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
     deliveredAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
     cancelledAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
     deadLetteredAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
@@ -63,7 +67,7 @@ export type NewOrchestrationReactorDelivery = typeof NewOrchestrationReactorDeli
 
 export interface OrchestrationReactorDeliveryClaimInput {
   readonly claimToken: string;
-  /** The boot taking the claim. Prior-boot claims are never allowed to retain a lease. */
+  /** The boot taking the claim. Claims owned by another boot never retain a lease. */
   readonly currentBootId: string;
   readonly claimedAt: string;
   readonly leaseExpiresAt: string;
@@ -116,6 +120,11 @@ export interface OrchestrationReactorDeliveriesShape {
   readonly claimNext: (
     input: OrchestrationReactorDeliveryClaimInput,
   ) => Effect.Effect<Option.Option<OrchestrationReactorDelivery>, ProjectionRepositoryError>;
+  readonly markExecutionStarted: (
+    deliveryId: string,
+    expectedClaimToken: string,
+    startedAt: string,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
   readonly markDelivered: (
     deliveryId: string,
     expectedClaimToken: string,

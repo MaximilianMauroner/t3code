@@ -53,6 +53,7 @@ it.layer(testLayer)("OrchestrationReactorDeliveries", (it) => {
       expect(firstClaim).toMatchObject({
         deliveryId: "earlier",
         claimToken: "claim-earlier-1",
+        claimBootId: "boot-1",
         attempts: 1,
       });
 
@@ -176,17 +177,28 @@ it.layer(testLayer)("OrchestrationReactorDeliveries", (it) => {
       const crashedClaim = Option.getOrThrow(
         yield* repository.claimNext({
           claimToken: "claim-before-crash",
-          currentBootId: "boot-1",
+          currentBootId: "claim-owner-boot",
           claimedAt: "2026-07-26T00:00:18.000Z",
           leaseExpiresAt: "2026-07-26T01:00:18.000Z",
         }),
       );
-      expect(crashedClaim.status).toBe("delivering");
+      expect(crashedClaim).toMatchObject({
+        status: "delivering",
+        sourceBootId: "boot-1",
+        claimBootId: "claim-owner-boot",
+      });
+      expect(
+        yield* repository.markExecutionStarted(
+          "crash-after-claim",
+          "claim-before-crash",
+          "2026-07-26T00:00:18.500Z",
+        ),
+      ).toBe(true);
 
       const restartClaim = Option.getOrThrow(
         yield* repository.claimNext({
           claimToken: "claim-after-restart",
-          currentBootId: "boot-2",
+          currentBootId: "restart-boot",
           claimedAt: "2026-07-26T00:00:19.000Z",
           leaseExpiresAt: "2026-07-26T00:05:19.000Z",
         }),
@@ -194,8 +206,18 @@ it.layer(testLayer)("OrchestrationReactorDeliveries", (it) => {
       expect(restartClaim).toMatchObject({
         deliveryId: "crash-after-claim",
         claimToken: "claim-after-restart",
+        sourceBootId: "boot-1",
+        claimBootId: "restart-boot",
+        executionStartedAt: "2026-07-26T00:00:18.500Z",
         attempts: 2,
       });
+      expect(
+        yield* repository.markExecutionStarted(
+          "crash-after-claim",
+          "claim-before-crash",
+          "2026-07-26T00:00:19.500Z",
+        ),
+      ).toBe(false);
       expect(
         yield* repository.markDelivered(
           "crash-after-claim",
@@ -208,6 +230,36 @@ it.layer(testLayer)("OrchestrationReactorDeliveries", (it) => {
           "crash-after-claim",
           "claim-after-restart",
           "2026-07-26T00:00:20.000Z",
+        ),
+      ).toBe(true);
+
+      yield* repository.insert({
+        ...makeDelivery("legacy-ownerless-claim", 14),
+        status: "delivering",
+        attempts: 1,
+        claimToken: "legacy-claim",
+        claimBootId: null,
+        claimedAt: "2026-07-26T00:00:20.000Z",
+        leaseExpiresAt: "2026-07-26T01:00:20.000Z",
+      });
+      const legacyReclaimed = Option.getOrThrow(
+        yield* repository.claimNext({
+          claimToken: "legacy-reclaimed",
+          currentBootId: "boot-2",
+          claimedAt: "2026-07-26T00:00:21.000Z",
+          leaseExpiresAt: "2026-07-26T00:05:21.000Z",
+        }),
+      );
+      expect(legacyReclaimed).toMatchObject({
+        deliveryId: "legacy-ownerless-claim",
+        claimBootId: "boot-2",
+        claimToken: "legacy-reclaimed",
+      });
+      expect(
+        yield* repository.markCancelled(
+          "legacy-ownerless-claim",
+          "2026-07-26T00:00:22.000Z",
+          "legacy-reclaimed",
         ),
       ).toBe(true);
 

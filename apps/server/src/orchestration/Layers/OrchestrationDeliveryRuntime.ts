@@ -67,7 +67,7 @@ const make = Effect.gen(function* () {
   const drainLock = yield* Semaphore.make(1);
   const liveSourceEventIds = new Set<string>();
 
-  const appendCheckpointCancellationEvidence = Effect.fn("appendCheckpointCancellationEvidence")(
+  const appendNonReplayCancellationEvidence = Effect.fn("appendNonReplayCancellationEvidence")(
     function* (delivery: OrchestrationReactorDelivery, detail: string, createdAt: string) {
       yield* engine.dispatchInternal({
         type: "thread.activity.append",
@@ -76,10 +76,11 @@ const make = Effect.gen(function* () {
         activity: {
           id: EventId.make(`delivery:${delivery.deliveryId}:recovery-evidence`),
           tone: "error",
-          kind: "checkpoint.revert.failed",
-          summary: "Checkpoint revert recovery cancelled",
+          kind: "orchestration.delivery.execution-uncertain",
+          summary: "External action replay suppressed",
           payload: {
             deliveryId: delivery.deliveryId,
+            deliveryKind: delivery.deliveryKind,
             detail,
           },
           turnId: null,
@@ -89,6 +90,45 @@ const make = Effect.gen(function* () {
       });
     },
   );
+
+  const validateClaimed = Effect.fn("validateClaimed")(function* (
+    delivery: OrchestrationReactorDelivery,
+  ) {
+    const event = yield* decodeOrchestrationEvent(delivery.payload);
+    const valid =
+      (delivery.deliveryKind === "runtime-mode-change" &&
+        delivery.reactor === "provider-command" &&
+        event.type === "thread.runtime-mode-set") ||
+      (delivery.deliveryKind === "turn-start" &&
+        delivery.reactor === "provider-command" &&
+        event.type === "thread.turn-start-requested") ||
+      (delivery.deliveryKind === "turn-interrupt" &&
+        delivery.reactor === "provider-command" &&
+        event.type === "thread.turn-interrupt-requested") ||
+      (delivery.deliveryKind === "approval-response" &&
+        delivery.reactor === "provider-command" &&
+        event.type === "thread.approval-response-requested") ||
+      (delivery.deliveryKind === "user-input-response" &&
+        delivery.reactor === "provider-command" &&
+        event.type === "thread.user-input-response-requested") ||
+      (delivery.deliveryKind === "session-stop" &&
+        delivery.reactor === "provider-command" &&
+        event.type === "thread.session-stop-requested") ||
+      (delivery.deliveryKind === "archive-cleanup" &&
+        delivery.reactor === "archive-cleanup" &&
+        event.type === "thread.archived") ||
+      (delivery.deliveryKind === "checkpoint-revert" &&
+        delivery.reactor === "checkpoint" &&
+        event.type === "thread.checkpoint-revert-requested") ||
+      (delivery.deliveryKind === "thread-delete" &&
+        delivery.reactor === "thread-deletion" &&
+        event.type === "thread.deleted");
+    if (!valid) {
+      return yield* Effect.die(
+        `delivery ${delivery.deliveryId} payload/target does not match ${delivery.deliveryKind}`,
+      );
+    }
+  });
 
   const dispatchClaimed = Effect.fn("dispatchClaimed")(function* (
     delivery: OrchestrationReactorDelivery,
@@ -136,7 +176,7 @@ const make = Effect.gen(function* () {
     const event = yield* decodeOrchestrationEvent(delivery.payload);
     if (delivery.deliveryKind === "checkpoint-revert") {
       const detectedAt = DateTime.formatIso(yield* DateTime.now);
-      yield* appendCheckpointCancellationEvidence(
+      yield* appendNonReplayCancellationEvidence(
         delivery,
         "The server restarted while checkpoint rollback completion was uncertain; replay was suppressed to prevent duplicate provider rollback.",
         detectedAt,
@@ -163,6 +203,7 @@ const make = Effect.gen(function* () {
         expectedSession,
       };
     } else if (
+      delivery.deliveryKind !== "runtime-mode-change" &&
       expectedSession.kind === "present" &&
       expectedSession.activeTurnId !== null &&
       thread.latestTurn?.state === "running" &&
@@ -175,7 +216,15 @@ const make = Effect.gen(function* () {
         expectedSession,
       };
     }
-    if (target === null) return "cancelled" as const;
+    if (target === null) {
+      const detectedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* appendNonReplayCancellationEvidence(
+        delivery,
+        "The server restarted before this external action reached a durable terminal result; replay was suppressed.",
+        detectedAt,
+      );
+      return "cancelled" as const;
+    }
 
     const detectedAt = DateTime.formatIso(yield* DateTime.now);
     yield* engine
@@ -206,17 +255,48 @@ const make = Effect.gen(function* () {
 
   const processClaimed = Effect.fn("processClaimed")(function* (
     delivery: OrchestrationReactorDelivery,
+    noteExecutionMayHaveStarted: () => void,
   ) {
     const claimToken = delivery.claimToken;
     if (claimToken === null) {
       return yield* Effect.die(`claimed delivery ${delivery.deliveryId} has no claim token`);
     }
-    const resolution =
+    const shouldCancelPriorExecution =
       delivery.replayPolicy === "cancel-with-recovery" &&
       delivery.sourceBootId !== bootId &&
-      !liveSourceEventIds.has(delivery.sourceEventId)
-        ? yield* cancelPriorBootExecution(delivery)
-        : yield* dispatchClaimed(delivery);
+      !liveSourceEventIds.has(delivery.sourceEventId);
+    const hasUncertainExecution =
+      delivery.replayPolicy === "cancel-with-recovery" && delivery.executionStartedAt !== null;
+    let resolution: "delivered" | "cancelled";
+    if (shouldCancelPriorExecution) {
+      resolution = yield* cancelPriorBootExecution(delivery);
+    } else if (hasUncertainExecution) {
+      noteExecutionMayHaveStarted();
+      const detectedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* appendNonReplayCancellationEvidence(
+        delivery,
+        "A previous claim reached the external-execution boundary but did not persist a terminal result; replay was suppressed.",
+        detectedAt,
+      );
+      resolution = "cancelled";
+    } else {
+      yield* validateClaimed(delivery);
+      if (delivery.replayPolicy === "cancel-with-recovery") {
+        const startedAt = DateTime.formatIso(yield* DateTime.now);
+        const marked = yield* deliveries.markExecutionStarted(
+          delivery.deliveryId,
+          claimToken,
+          startedAt,
+        );
+        if (!marked) {
+          return yield* Effect.die(
+            `delivery claim was lost before execution could be durably marked`,
+          );
+        }
+        noteExecutionMayHaveStarted();
+      }
+      resolution = yield* dispatchClaimed(delivery);
+    }
     const completedAt = DateTime.formatIso(yield* DateTime.now);
     const transitioned =
       resolution === "delivered"
@@ -242,20 +322,20 @@ const make = Effect.gen(function* () {
     });
     if (Option.isNone(claimed)) return false;
 
-    const succeeded = yield* processClaimed(claimed.value).pipe(
+    let executionMayHaveStarted = claimed.value.executionStartedAt !== null;
+    const succeeded = yield* processClaimed(claimed.value, () => {
+      executionMayHaveStarted = true;
+    }).pipe(
       Effect.as(true),
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause);
         return Effect.gen(function* () {
           const failedAtValue = yield* DateTime.now;
           const failedAt = DateTime.formatIso(failedAtValue);
-          if (
-            claimed.value.deliveryKind === "checkpoint-revert" &&
-            claimed.value.replayPolicy === "cancel-with-recovery"
-          ) {
-            yield* appendCheckpointCancellationEvidence(
+          if (claimed.value.replayPolicy === "cancel-with-recovery" && executionMayHaveStarted) {
+            yield* appendNonReplayCancellationEvidence(
               claimed.value,
-              `Checkpoint rollback failed with uncertain external state; replay was suppressed. ${Cause.pretty(cause)}`,
+              `External execution may have succeeded before durable completion failed; replay was suppressed. ${Cause.pretty(cause)}`,
               failedAt,
             );
             const cancelled = yield* deliveries.markCancelled(
@@ -265,7 +345,7 @@ const make = Effect.gen(function* () {
             );
             if (!cancelled) {
               return yield* Effect.die(
-                `checkpoint delivery claim was lost before cancellation could be retained`,
+                `non-replay delivery claim was lost before cancellation could be retained`,
               );
             }
             return false;

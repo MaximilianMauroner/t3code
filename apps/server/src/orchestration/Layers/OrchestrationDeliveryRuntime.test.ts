@@ -27,6 +27,7 @@ import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
   NewOrchestrationReactorDelivery,
   OrchestrationReactorDeliveries,
+  type OrchestrationReactorDeliveriesShape,
 } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 import { ServerBootIdentity } from "../../serverBootId.ts";
 import { planReactorDelivery } from "../reactorDeliveries.ts";
@@ -167,10 +168,19 @@ describe("OrchestrationDeliveryRuntime", () => {
     readonly dispatchInternal?: OrchestrationEngineService["Service"]["dispatchInternal"];
     readonly closeExternalAdmission?: OrchestrationEngineService["Service"]["closeExternalAdmission"];
     readonly thread?: ReturnType<typeof absentSessionThread>;
+    readonly transformRepository?: (
+      repository: OrchestrationReactorDeliveriesShape,
+    ) => OrchestrationReactorDeliveriesShape;
   }) {
-    const repositoryLayer = OrchestrationReactorDeliveriesLive.pipe(
+    const baseRepositoryLayer = OrchestrationReactorDeliveriesLive.pipe(
       Layer.provide(SqlitePersistenceMemory),
     );
+    const repositoryLayer = input.transformRepository
+      ? Layer.effect(
+          OrchestrationReactorDeliveries,
+          Effect.map(OrchestrationReactorDeliveries, input.transformRepository),
+        ).pipe(Layer.provide(baseRepositoryLayer))
+      : baseRepositoryLayer;
     const layer = OrchestrationDeliveryRuntimeLive.pipe(
       Layer.provideMerge(repositoryLayer),
       Layer.provideMerge(
@@ -489,6 +499,99 @@ describe("OrchestrationDeliveryRuntime", () => {
 
       expect(checkpointDeliver).toHaveBeenCalledTimes(1);
       expect(status).toBe("cancelled");
+    }),
+  );
+
+  effectIt.effect(
+    "suppresses replay when an external effect succeeds but its terminal row update fails",
+    () =>
+      Effect.gen(function* () {
+        const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+          Effect.succeed("delivered" as const),
+        );
+        const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
+          () => Effect.succeed({ sequence: 2 }),
+        );
+        let failTerminalUpdate = true;
+        const delivery = deliveryFor(turnStartEvent(1, "terminal-update-failure"), "current-boot");
+        const result = yield* Effect.gen(function* () {
+          const repository = yield* OrchestrationReactorDeliveries;
+          const runtime = yield* OrchestrationDeliveryRuntime;
+          yield* repository.insert(delivery);
+          yield* runtime.recoverStartup;
+          return {
+            row: Option.getOrThrow(yield* repository.getById(delivery.deliveryId)),
+            readiness: yield* runtime.inspectReadiness,
+          };
+        }).pipe(
+          Effect.provide(
+            createLayer({
+              providerDeliver,
+              dispatchInternal,
+              transformRepository: (repository) => ({
+                ...repository,
+                markDelivered: (...args) => {
+                  if (failTerminalUpdate) {
+                    failTerminalUpdate = false;
+                    return Effect.die("injected terminal update failure");
+                  }
+                  return repository.markDelivered(...args);
+                },
+              }),
+            }),
+          ),
+        );
+
+        expect(providerDeliver).toHaveBeenCalledTimes(1);
+        expect(dispatchInternal).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "thread.activity.append",
+            commandId: CommandId.make(`delivery:${delivery.deliveryId}:recovery-evidence`),
+          }),
+        );
+        expect(result.row).toMatchObject({
+          status: "cancelled",
+          executionStartedAt: expect.any(String),
+        });
+        expect(result.readiness.counts.total).toBe(0);
+      }),
+  );
+
+  effectIt.effect("retries a provably pre-execution marker failure during startup", () =>
+    Effect.gen(function* () {
+      const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+        Effect.succeed("delivered" as const),
+      );
+      let failMarker = true;
+      const delivery = deliveryFor(turnStartEvent(1, "pre-execution-failure"), "current-boot");
+      const readiness = yield* Effect.gen(function* () {
+        const repository = yield* OrchestrationReactorDeliveries;
+        const runtime = yield* OrchestrationDeliveryRuntime;
+        yield* repository.insert(delivery);
+        const recovery = yield* runtime.recoverStartup.pipe(Effect.forkChild);
+        yield* TestClock.adjust("1 second");
+        yield* Fiber.join(recovery);
+        return yield* runtime.inspectReadiness;
+      }).pipe(
+        Effect.provide(
+          createLayer({
+            providerDeliver,
+            transformRepository: (repository) => ({
+              ...repository,
+              markExecutionStarted: (...args) => {
+                if (failMarker) {
+                  failMarker = false;
+                  return Effect.die("injected pre-execution marker failure");
+                }
+                return repository.markExecutionStarted(...args);
+              },
+            }),
+          }),
+        ),
+      );
+
+      expect(providerDeliver).toHaveBeenCalledTimes(1);
+      expect(readiness.counts.total).toBe(0);
     }),
   );
 
