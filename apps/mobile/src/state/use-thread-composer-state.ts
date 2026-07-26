@@ -38,6 +38,8 @@ import {
 import { setPendingConnectionError } from "../state/use-remote-environment-registry";
 import { useSelectedThreadDetail } from "../state/use-thread-detail";
 import { useThreadSelection } from "../state/use-thread-selection";
+import type { ThreadRecoveryRetryInput } from "../features/threads/ThreadRecoveryNotice";
+import { resolveThreadRecoveryPresentation } from "../features/threads/threadRecoveryPresentation";
 import { enqueueThreadOutboxMessage } from "./thread-outbox";
 import { useThreadOutboxMessages } from "./use-thread-outbox";
 
@@ -91,6 +93,13 @@ export function useThreadComposerState() {
   );
   const selectedThreadFeed = useMemo(
     () => (selectedThreadDetail ? buildThreadFeed(selectedThreadDetail) : []),
+    [selectedThreadDetail],
+  );
+  const recoveryPresentation = useMemo(
+    () =>
+      selectedThreadDetail === null
+        ? null
+        : resolveThreadRecoveryPresentation(selectedThreadDetail),
     [selectedThreadDetail],
   );
 
@@ -170,6 +179,40 @@ export function useThreadComposerState() {
       return null;
     }
   }, [selectedThreadDetail, selectedThreadShell]);
+
+  const onRetryInterruptedTurn = useCallback(
+    async (input: ThreadRecoveryRetryInput): Promise<boolean> => {
+      if (!selectedThreadShell) {
+        return false;
+      }
+      const thread = selectedThreadDetail ?? selectedThreadShell;
+      const metadata = makeQueuedMessageMetadata();
+      try {
+        await enqueueThreadOutboxMessage({
+          environmentId: selectedThreadShell.environmentId,
+          threadId: selectedThreadShell.id,
+          messageId: MessageId.make(metadata.messageId),
+          commandId: CommandId.make(metadata.commandId),
+          text: input.text,
+          attachments: input.attachments,
+          modelSelection: thread.modelSelection,
+          runtimeMode: thread.runtimeMode,
+          interactionMode: thread.interactionMode,
+          ...(input.sourceProposedPlan === undefined
+            ? {}
+            : { sourceProposedPlan: input.sourceProposedPlan }),
+          createdAt: metadata.createdAt,
+        });
+        return true;
+      } catch (error) {
+        setPendingConnectionError(
+          error instanceof Error ? error.message : "Failed to save the recovery retry.",
+        );
+        return false;
+      }
+    },
+    [selectedThreadDetail, selectedThreadShell],
+  );
 
   const onChangeDraftMessage = useCallback(
     (value: string) => {
@@ -293,6 +336,7 @@ export function useThreadComposerState() {
     selectedThreadFeed,
     selectedThreadQueueCount,
     activeWorkStartedAt,
+    recoveryPresentation,
     draftMessage,
     draftAttachments,
     modelSelection,
@@ -305,6 +349,7 @@ export function useThreadComposerState() {
     onNativePasteImages,
     onRemoveDraftImage,
     onSendMessage,
+    onRetryInterruptedTurn,
     onUpdateModelSelection,
     onUpdateRuntimeMode,
     onUpdateInteractionMode,
