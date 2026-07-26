@@ -151,3 +151,54 @@ it.effect(
       expect(next.threads[0]?.updatedAt).toBe(STARTED);
     }),
 );
+
+it.effect("interrupts only the exact present session for a pending-start recovery", () =>
+  Effect.gen(function* () {
+    const base = model();
+    const thread = base.threads[0]!;
+    const starting = {
+      ...thread.session!,
+      status: "starting" as const,
+      activeTurnId: null,
+    };
+    const pending = { ...base, threads: [{ ...thread, latestTurn: null, session: starting }] };
+    const payload = {
+      threadId: "thread-1",
+      pendingMessageId: "message-1",
+      deliveryId: "delivery-1",
+      sourceEventId: "source-event-1",
+      interruptionCode: "server_restart",
+      reason: "server-restarted",
+      detectedAt: DETECTED,
+      serverBootId: "boot-2",
+      expectedSession: {
+        kind: "present" as const,
+        status: "starting" as const,
+        activeTurnId: null,
+        updatedAt: STARTED,
+        providerName: "codex",
+        providerInstanceId: "codex",
+      },
+    };
+    const recovered = yield* projectEvent(
+      pending,
+      event("thread.session-start-interrupted", payload),
+    );
+    expect(recovered.threads[0]?.session).toMatchObject({
+      status: "interrupted",
+      activeTurnId: null,
+      lastError: "server_restart",
+    });
+    expect(recovered.threads[0]?.updatedAt).toBe(STARTED);
+
+    const mismatched = yield* projectEvent(
+      {
+        ...pending,
+        threads: [{ ...pending.threads[0]!, session: { ...starting, updatedAt: DETECTED } }],
+      },
+      event("thread.session-start-interrupted", payload),
+    );
+    expect(mismatched.threads[0]?.session?.status).toBe("starting");
+    expect(mismatched.threads[0]?.activities[0]?.kind).toBe("session.start.interrupted");
+  }),
+);

@@ -612,6 +612,18 @@ export function projectEvent(
         );
         const thread = nextBase.threads.find((entry) => entry.id === payload.threadId);
         if (!thread) return nextBase;
+        const expected = payload.expectedSession;
+        const sessionMatchesExpected =
+          expected?.kind === "present" &&
+          thread.session !== null &&
+          thread.session.status === expected.status &&
+          thread.session.activeTurnId === expected.activeTurnId &&
+          thread.session.updatedAt === expected.updatedAt &&
+          thread.session.providerName === expected.providerName &&
+          (expected.providerInstanceId === undefined ||
+            (thread.session.providerInstanceId ?? null) === expected.providerInstanceId);
+        const sessionMatchesLegacyStarting =
+          expected === undefined && thread.session?.status === "starting";
         const activity = {
           id: event.eventId,
           tone: "error" as const,
@@ -625,6 +637,16 @@ export function projectEvent(
         return {
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
+            session:
+              sessionMatchesExpected || sessionMatchesLegacyStarting
+                ? {
+                    ...thread.session,
+                    status: "interrupted",
+                    activeTurnId: null,
+                    lastError: payload.interruptionCode,
+                    updatedAt: payload.detectedAt,
+                  }
+                : thread.session,
             activities: [...thread.activities, activity].slice(-500),
             updatedAt: thread.updatedAt,
           }),

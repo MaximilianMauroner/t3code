@@ -434,7 +434,7 @@ export function applyThreadDetailEvent(
             interruptionTimestampFallback: event.payload.timestampFallback,
             retrySourceMessageId: event.payload.retrySourceMessageId,
           },
-          updatedAt: event.occurredAt,
+          updatedAt: thread.updatedAt,
         },
       };
     }
@@ -464,12 +464,24 @@ export function applyThreadDetailEvent(
       const activities = hasActivity
         ? thread.activities
         : pipe(thread.activities, Arr.append(activity), Arr.sort(activityOrder));
+      const expected = event.payload.expectedSession;
+      const sessionMatchesExpected =
+        expected?.kind === "present" &&
+        thread.session !== null &&
+        thread.session.status === expected.status &&
+        thread.session.activeTurnId === expected.activeTurnId &&
+        thread.session.updatedAt === expected.updatedAt &&
+        thread.session.providerName === expected.providerName &&
+        (expected.providerInstanceId === undefined ||
+          (thread.session.providerInstanceId ?? null) === expected.providerInstanceId);
+      const sessionMatchesLegacyStarting =
+        expected === undefined && thread.session?.status === "starting";
       return {
         kind: "updated",
         thread: {
           ...thread,
           session:
-            pendingMessageExists && thread.session?.status === "starting"
+            pendingMessageExists && (sessionMatchesExpected || sessionMatchesLegacyStarting)
               ? {
                   ...thread.session,
                   status: "interrupted",
@@ -478,7 +490,7 @@ export function applyThreadDetailEvent(
                 }
               : thread.session,
           activities,
-          updatedAt: event.occurredAt,
+          updatedAt: thread.updatedAt,
         },
       };
     }

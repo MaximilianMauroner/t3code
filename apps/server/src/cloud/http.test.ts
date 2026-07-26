@@ -1,9 +1,13 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Duration from "effect/Duration";
+import * as Fiber from "effect/Fiber";
+import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Tracer from "effect/Tracer";
+import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpServerRequest } from "effect/unstable/http";
 
 import { RelayClientTracer } from "@t3tools/shared/relayTracing";
@@ -17,6 +21,7 @@ import {
   isSupportedLinkProviderKind,
   linkProofScopes,
   reconcileDesiredCloudLink,
+  withHealthProbeMetrics,
 } from "./http.ts";
 import * as ManagedEndpointRuntime from "./ManagedEndpointRuntime.ts";
 import { traceAuthenticatedRelayRequest, traceRelayRequest } from "./traceRelayRequest.ts";
@@ -33,6 +38,30 @@ const storeFailure = (tag: "AlreadyExists" | "PermissionDenied") =>
   });
 
 const unusedSecretStoreOperation = () => Effect.die("unused secret-store operation");
+
+describe("health probe metrics", () => {
+  it.effect("times the dependency-light health path with a bounded probe label", () =>
+    Effect.gen(function* () {
+      const duration = Duration.millis(25);
+      const fiber = yield* Effect.sleep(duration).pipe(withHealthProbeMetrics, Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(duration);
+      yield* Fiber.join(fiber);
+
+      const snapshots = yield* Metric.snapshot;
+      const sample = snapshots.find(
+        (entry) =>
+          entry.type === "Histogram" &&
+          entry.id === "t3_health_probe_duration" &&
+          entry.attributes?.probe === "cloud-environment",
+      );
+      expect(sample?.type).toBe("Histogram");
+      if (sample?.type !== "Histogram") return;
+      expect(sample.state.count).toBe(1);
+      expect(sample.state.sum).toBe(25);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+});
 
 function makeSecretStore(
   create: ServerSecretStore.ServerSecretStore["Service"]["create"],

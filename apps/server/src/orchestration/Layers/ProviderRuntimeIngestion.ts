@@ -733,6 +733,29 @@ export interface ProviderRuntimeIngestionLiveOptions {
   ) => Effect.Effect<void, unknown>;
 }
 
+export function latestEligibleProviderExitObservation(
+  observedAt: ReadonlyArray<string>,
+  startedAt: string,
+  detectedAt: string,
+): string | undefined {
+  const startedAtMs = Date.parse(startedAt);
+  const detectedAtMs = Date.parse(detectedAt);
+  let latest: { readonly value: string; readonly time: number } | undefined;
+  for (const candidate of observedAt) {
+    const time = Date.parse(candidate);
+    if (
+      !Number.isFinite(time) ||
+      time < startedAtMs ||
+      time > detectedAtMs ||
+      (latest !== undefined && time <= latest.time)
+    ) {
+      continue;
+    }
+    latest = { value: candidate, time };
+  }
+  return latest?.value;
+}
+
 const makeProviderRuntimeIngestion = Effect.fn("makeProviderRuntimeIngestion")(function* (
   options: ProviderRuntimeIngestionLiveOptions = {},
 ) {
@@ -1419,6 +1442,26 @@ const makeProviderRuntimeIngestion = Effect.fn("makeProviderRuntimeIngestion")(f
                 }
               : undefined;
         if (target !== undefined) {
+          const readRecoveryEvidence = projectionSnapshotQuery.getTurnRecoveryEvidence;
+          const executionLastObservedAt =
+            target.kind === "turn" && readRecoveryEvidence !== undefined
+              ? yield* readRecoveryEvidence(thread.id, target.turnId).pipe(
+                  Effect.map(({ observedAt }) =>
+                    latestEligibleProviderExitObservation(
+                      observedAt,
+                      thread.latestTurn?.startedAt ?? thread.latestTurn?.requestedAt ?? now,
+                      now,
+                    ),
+                  ),
+                  Effect.catchCause((cause) =>
+                    Effect.logWarning("failed to read persisted provider exit evidence", {
+                      threadId: thread.id,
+                      turnId: target.turnId,
+                      cause,
+                    }).pipe(Effect.as(undefined)),
+                  ),
+                )
+              : undefined;
           yield* orchestrationEngine
             .dispatchInternal({
               type: "thread.session.interrupt-if-active",
@@ -1434,7 +1477,7 @@ const makeProviderRuntimeIngestion = Effect.fn("makeProviderRuntimeIngestion")(f
               interruptionCode: "provider_exit",
               serverBootId,
               detectedAt: now,
-              executionLastObservedAt: now,
+              ...(executionLastObservedAt !== undefined ? { executionLastObservedAt } : {}),
               createdAt: now,
             })
             .pipe(
@@ -2006,7 +2049,7 @@ const makeProviderRuntimeIngestion = Effect.fn("makeProviderRuntimeIngestion")(f
 
   return {
     start,
-    drain: worker.drain,
+    drain: worker.drain.pipe(Effect.andThen(recordWorkerPressure)),
     closeProviderIngress: Effect.gen(function* () {
       if (providerService.closeIngestionSource !== undefined) {
         yield* providerService.closeIngestionSource;

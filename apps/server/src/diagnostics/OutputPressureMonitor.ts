@@ -55,7 +55,7 @@ export interface OutputPressureMonitorOptions {
 }
 
 export type OutputPressureWorkerSource =
-  | "provider-runtime"
+  | "provider-runtime-ingestion"
   | "provider-command"
   | "checkpoint"
   | "orchestration-delivery";

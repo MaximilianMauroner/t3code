@@ -2532,6 +2532,182 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-pending-turn-terminal-test-
   },
 );
 
+it.layer(makeProjectionPipelinePrefixedTestLayer("t3-pending-recovery-session-test-"))(
+  "OrchestrationProjectionPipeline pending-start recovery",
+  (it) => {
+    it.effect(
+      "interrupts only an exactly matched present session and never creates an absent one",
+      () =>
+        Effect.gen(function* () {
+          const projectionPipeline = yield* OrchestrationProjectionPipeline;
+          const eventStore = yield* OrchestrationEventStore;
+          const sql = yield* SqlClient.SqlClient;
+          const startedAt = "2026-07-26T00:00:01.000Z";
+          const detectedAt = "2026-07-26T00:00:03.000Z";
+
+          const appendPendingThread = Effect.fn("appendPendingThread")(function* (
+            suffix: "matched" | "mismatched" | "absent",
+          ) {
+            const threadId = ThreadId.make(`thread-pending-${suffix}`);
+            const sourceEventId = EventId.make(`evt-pending-${suffix}`);
+            yield* eventStore.append({
+              type: "thread.created",
+              eventId: EventId.make(`evt-created-${suffix}`),
+              aggregateKind: "thread",
+              aggregateId: threadId,
+              occurredAt: startedAt,
+              commandId: CommandId.make(`cmd-created-${suffix}`),
+              causationEventId: null,
+              correlationId: CorrelationId.make(`cmd-created-${suffix}`),
+              metadata: {},
+              payload: {
+                threadId,
+                projectId: ProjectId.make("project-pending-recovery"),
+                title: `Pending ${suffix}`,
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("codex"),
+                  model: "gpt-5-codex",
+                },
+                runtimeMode: "full-access",
+                branch: null,
+                worktreePath: null,
+                createdAt: startedAt,
+                updatedAt: startedAt,
+              },
+            });
+            yield* eventStore.append({
+              type: "thread.turn-start-requested",
+              eventId: sourceEventId,
+              aggregateKind: "thread",
+              aggregateId: threadId,
+              occurredAt: startedAt,
+              commandId: CommandId.make(`cmd-pending-${suffix}`),
+              causationEventId: null,
+              correlationId: CorrelationId.make(`cmd-pending-${suffix}`),
+              metadata: {},
+              payload: {
+                threadId,
+                messageId: MessageId.make(`message-pending-${suffix}`),
+                runtimeMode: "full-access",
+                createdAt: startedAt,
+              },
+            });
+            if (suffix !== "absent") {
+              yield* eventStore.append({
+                type: "thread.session-set",
+                eventId: EventId.make(`evt-session-${suffix}`),
+                aggregateKind: "thread",
+                aggregateId: threadId,
+                occurredAt: startedAt,
+                commandId: CommandId.make(`cmd-session-${suffix}`),
+                causationEventId: null,
+                correlationId: CorrelationId.make(`cmd-session-${suffix}`),
+                metadata: {},
+                payload: {
+                  threadId,
+                  session: {
+                    threadId,
+                    status: "starting",
+                    providerName: "codex",
+                    providerInstanceId: ProviderInstanceId.make("codex"),
+                    runtimeMode: "full-access",
+                    activeTurnId: null,
+                    lastError: null,
+                    updatedAt: startedAt,
+                  },
+                },
+              });
+            }
+            yield* eventStore.append({
+              type: "thread.session-start-interrupted",
+              eventId: EventId.make(`evt-recovery-${suffix}`),
+              aggregateKind: "thread",
+              aggregateId: threadId,
+              occurredAt: detectedAt,
+              commandId: CommandId.make(`cmd-recovery-${suffix}`),
+              causationEventId: null,
+              correlationId: CorrelationId.make(`cmd-recovery-${suffix}`),
+              metadata: {},
+              payload: {
+                threadId,
+                pendingMessageId: MessageId.make(`message-pending-${suffix}`),
+                deliveryId: `orchestration:${sourceEventId}:turn-start`,
+                sourceEventId,
+                interruptionCode: "server_restart",
+                reason: "server-restarted",
+                detectedAt,
+                expectedSession:
+                  suffix === "absent"
+                    ? { kind: "absent" }
+                    : {
+                        kind: "present",
+                        status: "starting",
+                        activeTurnId: null,
+                        updatedAt: suffix === "matched" ? startedAt : detectedAt,
+                        providerName: "codex",
+                        providerInstanceId: ProviderInstanceId.make("codex"),
+                      },
+                serverBootId: "boot-recovery",
+              },
+            });
+          });
+
+          yield* appendPendingThread("matched");
+          yield* appendPendingThread("mismatched");
+          yield* appendPendingThread("absent");
+          yield* projectionPipeline.bootstrap;
+
+          const sessions = yield* sql<{
+            readonly threadId: string;
+            readonly status: string;
+            readonly updatedAt: string;
+          }>`
+          SELECT thread_id AS "threadId", status, updated_at AS "updatedAt"
+          FROM projection_thread_sessions
+          WHERE thread_id LIKE 'thread-pending-%'
+          ORDER BY thread_id
+        `;
+          assert.deepEqual(sessions, [
+            {
+              threadId: "thread-pending-matched",
+              status: "interrupted",
+              updatedAt: detectedAt,
+            },
+            {
+              threadId: "thread-pending-mismatched",
+              status: "starting",
+              updatedAt: startedAt,
+            },
+          ]);
+
+          const pendingRows = yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count
+          FROM projection_turns
+          WHERE thread_id LIKE 'thread-pending-%'
+            AND turn_id IS NULL
+            AND state = 'pending'
+        `;
+          assert.deepEqual(pendingRows, [{ count: 0 }]);
+
+          const threads = yield* sql<{
+            readonly threadId: string;
+            readonly updatedAt: string;
+          }>`
+          SELECT thread_id AS "threadId", updated_at AS "updatedAt"
+          FROM projection_threads
+          WHERE thread_id LIKE 'thread-pending-%'
+          ORDER BY thread_id
+        `;
+          assert.deepEqual(threads, [
+            { threadId: "thread-pending-absent", updatedAt: startedAt },
+            { threadId: "thread-pending-matched", updatedAt: startedAt },
+            { threadId: "thread-pending-mismatched", updatedAt: startedAt },
+          ]);
+        }),
+    );
+  },
+);
+
 it.effect("restores pending turn-start metadata across projection pipeline restart", () =>
   Effect.gen(function* () {
     const { dbPath } = yield* ServerConfig;

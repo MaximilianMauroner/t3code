@@ -1127,6 +1127,32 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             updatedAt: event.payload.detectedAt,
           });
         }
+        return;
+      }
+      if (event.type === "thread.session-start-interrupted") {
+        const existing = yield* projectionThreadSessionRepository.getByThreadId({
+          threadId: event.payload.threadId,
+        });
+        if (Option.isNone(existing)) return;
+        const expected = event.payload.expectedSession;
+        const matchesExpected =
+          expected?.kind === "present" &&
+          existing.value.status === expected.status &&
+          existing.value.activeTurnId === expected.activeTurnId &&
+          existing.value.updatedAt === expected.updatedAt &&
+          existing.value.providerName === expected.providerName &&
+          (expected.providerInstanceId === undefined ||
+            existing.value.providerInstanceId === expected.providerInstanceId);
+        const matchesLegacyStartingSession =
+          expected === undefined && existing.value.status === "starting";
+        if (!matchesExpected && !matchesLegacyStartingSession) return;
+        yield* projectionThreadSessionRepository.upsert({
+          ...existing.value,
+          status: "interrupted",
+          activeTurnId: null,
+          lastError: event.payload.interruptionCode,
+          updatedAt: event.payload.detectedAt,
+        });
       }
     });
 

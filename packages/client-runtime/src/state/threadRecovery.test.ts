@@ -88,7 +88,10 @@ const baseThread: OrchestrationThread = {
   },
 };
 
-function recoveryEvent(): OrchestrationEvent {
+function recoveryEvent(): Extract<
+  OrchestrationEvent,
+  { readonly type: "thread.session-interrupted" }
+> {
   return {
     sequence: 42,
     eventId: EventId.make("event-recovery"),
@@ -138,6 +141,7 @@ describe("thread recovery events", () => {
       retrySourceMessageId: SOURCE_MESSAGE_ID,
     });
     expect(recovered.messages).toEqual(baseThread.messages);
+    expect(recovered.updatedAt).toBe(baseThread.updatedAt);
     expect(updated(applyThreadDetailEvent(recovered, recoveryEvent()))).toEqual(recovered);
   });
 
@@ -148,6 +152,26 @@ describe("thread recovery events", () => {
       session: { ...baseThread.session!, activeTurnId: TurnId.make("turn-2") },
     };
     expect(applyThreadDetailEvent(newer, recoveryEvent())).toEqual({ kind: "unchanged" });
+  });
+
+  it("copies fallback interruption evidence without changing ordinary recency", () => {
+    const event = recoveryEvent();
+    const recovered = updated(
+      applyThreadDetailEvent(baseThread, {
+        ...event,
+        payload: {
+          ...event.payload,
+          executionLastObservedAt: undefined,
+          timestampFallback: true,
+        },
+      }),
+    );
+    expect(recovered.latestTurn).toMatchObject({
+      completedAt: DETECTED_AT,
+      executionLastObservedAt: null,
+      interruptionTimestampFallback: true,
+    });
+    expect(recovered.updatedAt).toBe(baseThread.updatedAt);
   });
 
   it("clears only a matching pending start and records evidence without fabricating a turn", () => {
@@ -180,6 +204,13 @@ describe("thread recovery events", () => {
         interruptionCode: "server_restart",
         reason: "server-restarted",
         detectedAt: DETECTED_AT,
+        expectedSession: {
+          kind: "present",
+          status: "starting",
+          activeTurnId: null,
+          updatedAt: baseThread.session!.updatedAt,
+          providerName: "codex",
+        },
         serverBootId: "boot-2",
       },
     };
@@ -189,6 +220,7 @@ describe("thread recovery events", () => {
     expect(recovered.latestTurn).toBeNull();
     expect(recovered.messages).toEqual(pendingThread.messages);
     expect(recovered.activities).toHaveLength(1);
+    expect(recovered.updatedAt).toBe(pendingThread.updatedAt);
     expect(updated(applyThreadDetailEvent(recovered, event))).toEqual(recovered);
 
     const nonMatching = updated(
@@ -302,6 +334,7 @@ describe("thread recovery helpers", () => {
       interruptionDetectedAt: DETECTED_AT,
       retrySourceMessageId: SOURCE_MESSAGE_ID,
     });
+    expect(roundTrip.thread.updatedAt).toBe(baseThread.updatedAt);
 
     const historic = decodeThreadSnapshot({
       snapshotSequence: 1,

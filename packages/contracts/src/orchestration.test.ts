@@ -26,6 +26,7 @@ import {
   OrchestrationSubscribeThreadInput,
   OrchestrationReplayEventsInput,
   ThreadSessionInterruptIfActiveCommand,
+  ThreadSessionStartInterruptedPayload,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
@@ -57,6 +58,9 @@ const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationComma
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
 const decodeRecoveryCommand = Schema.decodeUnknownEffect(ThreadSessionInterruptIfActiveCommand);
+const decodeSessionStartInterruptedPayload = Schema.decodeUnknownEffect(
+  ThreadSessionStartInterruptedPayload,
+);
 const decodeSubscribeThreadInput = Schema.decodeUnknownEffect(OrchestrationSubscribeThreadInput);
 const decodeReplayEventsInput = Schema.decodeUnknownEffect(OrchestrationReplayEventsInput);
 
@@ -117,6 +121,24 @@ it.effect("decodes recovery contracts while preserving legacy optionality", () =
       createdAt: "2026-07-26T00:00:02.000Z",
     });
     assert.strictEqual(command.target.kind, "pendingStart");
+
+    const historicPendingRecovery = yield* decodeSessionStartInterruptedPayload({
+      threadId: "thread-1",
+      pendingMessageId: "message-1",
+      deliveryId: "delivery-1",
+      sourceEventId: "event-1",
+      interruptionCode: "server_restart",
+      reason: "server-restarted",
+      detectedAt: "2026-07-26T00:00:02.000Z",
+      serverBootId: "boot-2",
+    });
+    assert.strictEqual(historicPendingRecovery.expectedSession, undefined);
+
+    const currentPendingRecovery = yield* decodeSessionStartInterruptedPayload({
+      ...historicPendingRecovery,
+      expectedSession: { kind: "absent" },
+    });
+    assert.deepStrictEqual(currentPendingRecovery.expectedSession, { kind: "absent" });
 
     const subscribe = yield* decodeSubscribeThreadInput({
       threadId: "thread-1",

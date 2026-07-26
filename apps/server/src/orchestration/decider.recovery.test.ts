@@ -6,6 +6,7 @@ import {
   ProviderInstanceId,
   ThreadId,
   ThreadSessionInterruptedPayload,
+  ThreadSessionStartInterruptedPayload,
   TurnId,
   type OrchestrationReadModel,
 } from "@t3tools/contracts";
@@ -21,6 +22,9 @@ const UPDATED = "2026-07-26T00:00:01.000Z";
 const OBSERVED = "2026-07-26T00:00:02.000Z";
 const DETECTED = "2026-07-26T00:00:03.000Z";
 const decodeInterruptedPayload = Schema.decodeUnknownEffect(ThreadSessionInterruptedPayload);
+const decodeStartInterruptedPayload = Schema.decodeUnknownEffect(
+  ThreadSessionStartInterruptedPayload,
+);
 
 function readModel(): OrchestrationReadModel {
   return {
@@ -113,6 +117,42 @@ it.layer(NodeServices.layer)("recovery decider", (it) => {
     }),
   );
 
+  it.effect("marks recovery time as a fallback when persisted evidence is unavailable", () =>
+    Effect.gen(function* () {
+      const event = yield* decideOrchestrationCommand({
+        readModel: readModel(),
+        command: {
+          type: "thread.session.interrupt-if-active",
+          commandId: CommandId.make("recovery-no-evidence"),
+          threadId: ThreadId.make("thread-1"),
+          target: {
+            kind: "turn",
+            turnId: TurnId.make("turn-1"),
+            retrySourceMessageId: null,
+            expectedSession: {
+              kind: "present",
+              status: "running",
+              activeTurnId: TurnId.make("turn-1"),
+              updatedAt: UPDATED,
+              providerName: "codex",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+            },
+          },
+          reason: "provider-exited",
+          interruptionCode: "provider_exit",
+          serverBootId: "boot-2",
+          detectedAt: DETECTED,
+          createdAt: DETECTED,
+        },
+      });
+      if ("type" in event && event.type === "thread.session-interrupted" && "payload" in event) {
+        const payload = yield* decodeInterruptedPayload(event.payload);
+        expect(payload.executionLastObservedAt).toBeUndefined();
+        expect(payload.timestampFallback).toBe(true);
+      }
+    }),
+  );
+
   it.effect("rejects changed session equality predicates without an event", () =>
     Effect.gen(function* () {
       const error = yield* decideOrchestrationCommand({
@@ -173,7 +213,13 @@ it.layer(NodeServices.layer)("recovery decider", (it) => {
         },
       });
       expect("type" in event).toBe(true);
-      if ("type" in event) expect(event.type).toBe("thread.session-start-interrupted");
+      if ("type" in event) {
+        expect(event.type).toBe("thread.session-start-interrupted");
+        if (event.type === "thread.session-start-interrupted" && "payload" in event) {
+          const payload = yield* decodeStartInterruptedPayload(event.payload);
+          expect(payload.expectedSession).toEqual({ kind: "absent" });
+        }
+      }
     }),
   );
 
@@ -213,6 +259,21 @@ it.layer(NodeServices.layer)("recovery decider", (it) => {
         },
       });
       expect("type" in event && event.type).toBe("thread.session-start-interrupted");
+      if (
+        "type" in event &&
+        event.type === "thread.session-start-interrupted" &&
+        "payload" in event
+      ) {
+        const payload = yield* decodeStartInterruptedPayload(event.payload);
+        expect(payload.expectedSession).toEqual({
+          kind: "present",
+          status: "running",
+          activeTurnId: "turn-1",
+          updatedAt: UPDATED,
+          providerName: "codex",
+          providerInstanceId: "codex",
+        });
+      }
     }),
   );
 });

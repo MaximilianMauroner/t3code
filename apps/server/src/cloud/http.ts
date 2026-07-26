@@ -72,6 +72,7 @@ import { readCliDesiredLinkMode, setCliDesiredCloudLink } from "./CliState.ts";
 import * as CliTokenManager from "./CliTokenManager.ts";
 import { getOrCreateEnvironmentKeyPairFromSecretStore } from "./environmentKeys.ts";
 import { traceRelayRequest } from "./traceRelayRequest.ts";
+import { healthProbeDuration, withMetrics } from "../observability/Metrics.ts";
 
 const CLOUD_MINT_NONCE_PREFIX = "cloud-mint-nonce-";
 const CLOUD_MINT_JTI_PREFIX = "cloud-mint-jti-";
@@ -84,6 +85,16 @@ const CLOUD_CREDENTIAL_RESPONSE_HEADERS = {
   "cache-control": "no-store",
   pragma: "no-cache",
 } as const;
+
+export const withHealthProbeMetrics = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  effect.pipe(
+    withMetrics({
+      timer: healthProbeDuration,
+      attributes: { probe: "cloud-environment" },
+    }),
+  );
 
 const appendCloudCredentialResponseHeaders = HttpEffect.appendPreResponseHandler(
   (_request, response) =>
@@ -954,7 +965,9 @@ export const connectHttpApiLayer = HttpApiBuilder.group(
       .handle("linkState", () => cloudLinkStateHandler(dependencies))
       .handle("unlink", () => cloudUnlinkHandler(dependencies))
       .handle("preferences", ({ payload }) => cloudPreferencesHandler(dependencies, payload))
-      .handle("health", ({ payload }) => cloudEnvironmentHealthHandler(dependencies, payload))
+      .handle("health", ({ payload }) =>
+        withHealthProbeMetrics(cloudEnvironmentHealthHandler(dependencies, payload)),
+      )
       .handle("mintCredential", ({ payload }) => cloudMintCredentialHandler(dependencies, payload))
       .handle("t3MintCredential", ({ payload }) =>
         traceRelayRequest(cloudMintCredentialHandler(dependencies, payload)),

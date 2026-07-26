@@ -28,6 +28,7 @@ import * as Exit from "effect/Exit";
 import * as Deferred from "effect/Deferred";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
+import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
@@ -54,6 +55,7 @@ import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
 import {
   ProviderRuntimeIngestionLive,
+  latestEligibleProviderExitObservation,
   makeProviderRuntimeIngestionLive,
   type ProviderRuntimeIngestionLiveOptions,
 } from "./ProviderRuntimeIngestion.ts";
@@ -225,6 +227,27 @@ async function waitForThread(
 }
 
 describe("ProviderRuntimeIngestion", () => {
+  it("selects only the latest persisted provider-exit observation within the turn window", () => {
+    expect(
+      latestEligibleProviderExitObservation(
+        [
+          "2026-01-01T00:00:00.000Z",
+          "2026-01-01T00:00:01.500Z",
+          "2026-01-01T00:00:03.000Z",
+          "not-a-date",
+        ],
+        "2026-01-01T00:00:01.000Z",
+        "2026-01-01T00:00:02.000Z",
+      ),
+    ).toBe("2026-01-01T00:00:01.500Z");
+    expect(
+      latestEligibleProviderExitObservation(
+        ["2026-01-01T00:00:00.000Z", "2026-01-01T00:00:03.000Z"],
+        "2026-01-01T00:00:01.000Z",
+        "2026-01-01T00:00:02.000Z",
+      ),
+    ).toBeUndefined();
+  });
   let runtime: ManagedRuntime.ManagedRuntime<
     OrchestrationEngineService | ProviderRuntimeIngestionService | ProjectionSnapshotQuery,
     unknown
@@ -281,7 +304,7 @@ describe("ProviderRuntimeIngestion", () => {
       Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
       Layer.provideMerge(makeTestServerSettingsLayer(options?.serverSettings)),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
-      Layer.provideMerge(OutputPressureMonitor.disabledLayer),
+      Layer.provideMerge(OutputPressureMonitor.layerWithOptions({ enabled: false })),
       Layer.provideMerge(ServerBootIdentity.layer),
       Layer.provideMerge(NodeServices.layer),
     );
@@ -405,6 +428,33 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBe("turn failed");
   });
 
+  it("publishes bounded provider-runtime-ingestion worker pressure", async () => {
+    const harness = await createHarness();
+    harness.emit({
+      type: "session.state.changed",
+      eventId: asEventId("evt-worker-pressure"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      payload: { state: "ready" },
+    });
+    await harness.drain();
+
+    const snapshots = await Effect.runPromise(Metric.snapshot);
+    const depth = snapshots.find(
+      (sample) =>
+        sample.id === "t3_ingestion_worker_depth" &&
+        sample.attributes?.worker === "provider-runtime-ingestion",
+    );
+    const oldestAge = snapshots.find(
+      (sample) =>
+        sample.id === "t3_ingestion_worker_oldest_age_ms" &&
+        sample.attributes?.worker === "provider-runtime-ingestion",
+    );
+    expect(depth?.state).toEqual({ value: 0 });
+    expect(oldestAge?.state).toEqual({ value: 0 });
+  });
+
   it("does not acknowledge a barrier until a failed lifecycle prefix retries successfully", async () => {
     const allowProjection = Effect.runSync(Ref.make(false));
     const attempts = Effect.runSync(Ref.make(0));
@@ -523,7 +573,8 @@ describe("ProviderRuntimeIngestion", () => {
       turnId,
       interruptionCode: "provider_exit",
       interruptionDetectedAt: detectedAt,
-      executionLastObservedAt: detectedAt,
+      executionLastObservedAt: startedAt,
+      interruptionTimestampFallback: false,
       retrySourceMessageId: messageId,
     });
     expect(interrupted.session?.status).toBe("interrupted");

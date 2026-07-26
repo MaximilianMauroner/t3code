@@ -1208,6 +1208,7 @@ export const ThreadSessionStartInterruptedPayload = Schema.Struct({
   reason: OrchestrationRecoveryReason,
   detectedAt: IsoDateTime,
   executionLastObservedAt: Schema.optional(IsoDateTime),
+  expectedSession: Schema.optional(OrchestrationExpectedSession),
   serverBootId: TrimmedNonEmptyString,
 });
 

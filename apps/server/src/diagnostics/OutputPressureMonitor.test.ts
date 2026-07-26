@@ -24,7 +24,7 @@ describe("OutputPressureMonitor", () => {
     Effect.scoped(
       Effect.gen(function* () {
         const monitor = yield* OutputPressureMonitor.make({ enabled: false });
-        yield* monitor.recordWorkerPressure("provider-runtime", {
+        yield* monitor.recordWorkerPressure("provider-runtime-ingestion", {
           depth: 7,
           oldestAgeMs: 6_500,
         });
@@ -33,12 +33,12 @@ describe("OutputPressureMonitor", () => {
         const depth = snapshots.find(
           (sample) =>
             sample.id === "t3_ingestion_worker_depth" &&
-            sample.attributes?.worker === "provider-runtime",
+            sample.attributes?.worker === "provider-runtime-ingestion",
         );
         const age = snapshots.find(
           (sample) =>
             sample.id === "t3_ingestion_worker_oldest_age_ms" &&
-            sample.attributes?.worker === "provider-runtime",
+            sample.attributes?.worker === "provider-runtime-ingestion",
         );
         assert.deepEqual(depth?.state, { value: 7 });
         assert.deepEqual(age?.state, { value: 6_500 });
