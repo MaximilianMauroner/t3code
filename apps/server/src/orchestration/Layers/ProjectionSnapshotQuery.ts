@@ -55,6 +55,7 @@ import {
   ProjectionSnapshotQuery,
   type ProjectionFullThreadDiffContext,
   type ProjectionSnapshotCounts,
+  type ProjectionTurnRecoveryEvidence,
   type ProjectionThreadCheckpointContext,
   type ProjectionSnapshotQueryShape,
 } from "../Services/ProjectionSnapshotQuery.ts";
@@ -212,13 +213,15 @@ function mapLatestTurn(
           },
         }
       : {}),
+    ...(row.retrySourceMessageId !== null
+      ? { retrySourceMessageId: row.retrySourceMessageId }
+      : {}),
     ...(row.interruptionCode !== null || row.interruptionDetectedAt !== null
       ? {
           interruptionCode: row.interruptionCode,
           interruptionDetectedAt: row.interruptionDetectedAt,
           executionLastObservedAt: row.executionLastObservedAt,
           interruptionTimestampFallback: row.interruptionTimestampFallback === 1,
-          retrySourceMessageId: row.retrySourceMessageId,
         }
       : {}),
   };
@@ -2366,6 +2369,40 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         ),
       );
 
+  const getTurnRecoveryEvidence: NonNullable<
+    ProjectionSnapshotQueryShape["getTurnRecoveryEvidence"]
+  > = (threadId, turnId) =>
+    Effect.all([
+      listThreadMessageRowsByThread({ threadId }),
+      listThreadActivityRowsByThread({ threadId }),
+      getLatestTurnRowByThread({ threadId }),
+      getThreadSessionRowByThread({ threadId }),
+    ]).pipe(
+      Effect.map(([messages, activities, latestTurn, session]) => {
+        const observedAt: string[] = [];
+        for (const message of messages) {
+          if (message.turnId === turnId) observedAt.push(message.updatedAt);
+        }
+        for (const activity of activities) {
+          if (activity.turnId === turnId) observedAt.push(activity.createdAt);
+        }
+        if (Option.isSome(latestTurn) && latestTurn.value.turnId === turnId) {
+          observedAt.push(latestTurn.value.requestedAt);
+          if (latestTurn.value.startedAt !== null) observedAt.push(latestTurn.value.startedAt);
+          if (latestTurn.value.completedAt !== null) observedAt.push(latestTurn.value.completedAt);
+        }
+        if (Option.isSome(session) && session.value.activeTurnId === turnId) {
+          observedAt.push(session.value.updatedAt);
+        }
+        return { observedAt } satisfies ProjectionTurnRecoveryEvidence;
+      }),
+      Effect.mapError((error) =>
+        isPersistenceError(error)
+          ? error
+          : toPersistenceSqlError("ProjectionSnapshotQuery.getTurnRecoveryEvidence:query")(error),
+      ),
+    );
+
   return {
     getCommandReadModel,
     getSnapshot,
@@ -2381,6 +2418,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getThreadShellById,
     getThreadDetailById,
     getThreadDetailSnapshot,
+    getTurnRecoveryEvidence,
   } satisfies ProjectionSnapshotQueryShape;
 });
 

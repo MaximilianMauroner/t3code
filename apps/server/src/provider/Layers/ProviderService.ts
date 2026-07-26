@@ -28,12 +28,14 @@ import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
@@ -51,6 +53,8 @@ import { type ProviderAdapterError, ProviderValidationError } from "../Errors.ts
 import {
   isProviderLivenessMarker,
   type ProviderAdapterShape,
+  type ProviderIngestionBarrier,
+  type ProviderIngestionOutput,
   type ProviderLivenessMarker,
 } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
@@ -219,7 +223,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
-  const ingestionPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent | ProviderLivenessMarker>();
+  const ingestionPubSub = yield* PubSub.unbounded<ProviderIngestionOutput>();
+  const ingestionSourceScope = yield* Scope.make("sequential");
+  yield* Effect.addFinalizer(() =>
+    Scope.close(ingestionSourceScope, Exit.void).pipe(Effect.ignore),
+  );
+  const ingestionSourceClosed = yield* Ref.make(false);
+  const ingestionSourceCloseAcknowledged = yield* Deferred.make<void>();
   const startTokens = yield* SynchronizedRef.make(new Map<string, ReadonlySet<number>>());
   const nextStartToken = yield* Ref.make(0);
   const nextMarker = yield* Ref.make(0);
@@ -385,8 +395,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               provider: adapter.provider,
             },
             event,
-          ),
-        ).pipe(Effect.forkScoped);
+          ).pipe(Effect.uninterruptible),
+        ).pipe(Effect.forkScoped, Scope.provide(ingestionSourceScope));
       }
     }
     yield* Ref.set(subscribedAdapters, next);
@@ -397,7 +407,24 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   yield* Stream.runForEach(
     Stream.fromSubscription(instanceChanges),
     () => reconcileInstanceSubscriptions,
-  ).pipe(Effect.forkScoped);
+  ).pipe(Effect.forkScoped, Scope.provide(ingestionSourceScope));
+
+  const closeIngestionSource: NonNullable<ProviderServiceMethod<"closeIngestionSource">> =
+    Effect.gen(function* () {
+      const shouldClose = yield* Ref.modify(ingestionSourceClosed, (closed) =>
+        closed ? ([false, true] as const) : ([true, true] as const),
+      );
+      if (shouldClose) {
+        yield* Scope.close(ingestionSourceScope, Exit.void);
+        const barrier = {
+          _tag: "ProviderIngestionBarrier",
+          barrierId: `provider-source-close:${yield* Ref.updateAndGet(nextMarker, (value) => value + 1)}`,
+          acknowledged: ingestionSourceCloseAcknowledged,
+        } satisfies ProviderIngestionBarrier;
+        yield* PubSub.publish(ingestionPubSub, barrier);
+      }
+      yield* Deferred.await(ingestionSourceCloseAcknowledged);
+    });
 
   const recoverSessionForThread = Effect.fn("recoverSessionForThread")(function* (input: {
     readonly binding: ProviderSessionDirectory.ProviderRuntimeBinding;
@@ -1018,7 +1045,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const getInstanceInfo: ProviderServiceMethod<"getInstanceInfo"> = (instanceId) =>
     registry.getInstanceInfo(instanceId);
 
-  const inspectTarget: ProviderServiceMethod<"inspectTarget"> = Effect.fn(
+  const inspectTarget: NonNullable<ProviderServiceMethod<"inspectTarget">> = Effect.fn(
     "ProviderService.inspectTarget",
   )(function* (input) {
     const key = startTokenKey(input.providerInstanceId, input.threadId);
@@ -1172,9 +1199,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     get streamEvents(): ProviderServiceMethod<"streamEvents"> {
       return Stream.fromPubSub(runtimeEventPubSub);
     },
-    get streamIngestion(): ProviderServiceMethod<"streamIngestion"> {
+    get streamIngestion(): NonNullable<ProviderServiceMethod<"streamIngestion">> {
       return Stream.fromPubSub(ingestionPubSub);
     },
+    closeIngestionSource,
   } satisfies ProviderService.ProviderService["Service"];
 });
 

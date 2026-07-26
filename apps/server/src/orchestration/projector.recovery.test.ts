@@ -117,6 +117,7 @@ it.effect("projects concrete interruption evidence onto exactly the active turn"
       retrySourceMessageId: "message-1",
     });
     expect(next.threads[0]?.session?.status).toBe("interrupted");
+    expect(next.threads[0]?.updatedAt).toBe(STARTED);
   }),
 );
 
@@ -147,5 +148,6 @@ it.effect(
       expect(next.threads[0]?.latestTurn).toBeNull();
       expect(next.threads[0]?.session).toBeNull();
       expect(next.threads[0]?.activities[0]?.kind).toBe("session.start.interrupted");
+      expect(next.threads[0]?.updatedAt).toBe(STARTED);
     }),
 );

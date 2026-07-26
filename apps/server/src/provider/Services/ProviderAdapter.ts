@@ -56,12 +56,26 @@ export interface ProviderLivenessMarker {
   readonly acknowledged: Deferred.Deferred<ProviderLivenessSample>;
 }
 
+/** ProviderService-owned fence appended after every admitted adapter output. */
+export interface ProviderIngestionBarrier {
+  readonly _tag: "ProviderIngestionBarrier";
+  readonly barrierId: string;
+  readonly acknowledged: Deferred.Deferred<void>;
+}
+
 export type ProviderAdapterOutput = ProviderRuntimeEvent | ProviderLivenessMarker;
+export type ProviderIngestionOutput = ProviderAdapterOutput | ProviderIngestionBarrier;
 
 export function isProviderLivenessMarker(
-  output: ProviderAdapterOutput,
+  output: ProviderIngestionOutput,
 ): output is ProviderLivenessMarker {
   return "_tag" in output && output._tag === "ProviderLivenessMarker";
+}
+
+export function isProviderIngestionBarrier(
+  output: ProviderIngestionOutput,
+): output is ProviderIngestionBarrier {
+  return "_tag" in output && output._tag === "ProviderIngestionBarrier";
 }
 
 export function isProviderRuntimeEvent(

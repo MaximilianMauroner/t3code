@@ -101,6 +101,20 @@ interface CodexAdapterSessionContext {
   stopped: boolean;
 }
 
+function isProviderAdapterError(error: unknown): error is ProviderAdapterError {
+  if (typeof error !== "object" || error === null || !("_tag" in error)) return false;
+  switch (error._tag) {
+    case "ProviderAdapterValidationError":
+    case "ProviderAdapterSessionNotFoundError":
+    case "ProviderAdapterSessionClosedError":
+    case "ProviderAdapterRequestError":
+    case "ProviderAdapterProcessError":
+      return true;
+    default:
+      return false;
+  }
+}
+
 function mapCodexRuntimeError(
   threadId: ThreadId,
   method: string,
@@ -1550,6 +1564,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
         return started;
       }),
+    ).pipe(
+      Effect.mapError((cause) =>
+        isProviderAdapterError(cause)
+          ? cause
+          : new ProviderAdapterProcessError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+              detail: "Failed to manage the Codex session lifecycle.",
+              cause,
+            }),
+      ),
     );
 
   const resolveAttachment = Effect.fn("resolveAttachment")(function* (
@@ -1762,7 +1787,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         return;
       }
       yield* stopSessionTransition(session);
-    });
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId,
+            detail: "Failed to stop the Codex session.",
+            cause,
+          }),
+      ),
+    );
 
   const listSessions: CodexAdapterShape["listSessions"] = () =>
     Effect.forEach(
@@ -1779,28 +1814,62 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     markerId,
     acknowledged,
   ) =>
-    transitions.withTarget(
-      threadId,
-      Effect.gen(function* () {
-        const context = sessions.get(threadId);
-        const session = context && !context.stopped ? context.observedSession : undefined;
-        yield* Queue.offer(runtimeEventQueue, {
-          _tag: "ProviderLivenessMarker",
-          markerId,
-          threadId,
-          sample: session ? { state: "present", threadId, session } : { state: "absent", threadId },
-          acknowledged,
-        });
-      }),
-    );
+    transitions
+      .withTarget(
+        threadId,
+        Effect.gen(function* () {
+          const context = sessions.get(threadId);
+          const session = context && !context.stopped ? context.observedSession : undefined;
+          yield* Queue.offer(runtimeEventQueue, {
+            _tag: "ProviderLivenessMarker",
+            markerId,
+            threadId,
+            sample: session
+              ? { state: "present", threadId, session }
+              : { state: "absent", threadId },
+            acknowledged,
+          });
+        }),
+      )
+      .pipe(Effect.orDie);
 
   const stopAll: CodexAdapterShape["stopAll"] = () =>
     Effect.gen(function* () {
-      yield* Effect.forEach(Array.from(startEpochs.keys()), invalidateStart, { discard: true });
-      yield* Effect.forEach(Array.from(sessions.values()), stopSessionTransition, {
-        concurrency: 1,
-        discard: true,
-      });
+      yield* Effect.forEach(
+        Array.from(startEpochs.keys()),
+        (threadId) =>
+          invalidateStart(threadId).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId,
+                  detail: "Failed to invalidate the Codex session start.",
+                  cause,
+                }),
+            ),
+          ),
+        { discard: true },
+      );
+      yield* Effect.forEach(
+        Array.from(sessions.values()),
+        (session) =>
+          stopSessionTransition(session).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId: session.threadId,
+                  detail: "Failed to stop the Codex session.",
+                  cause,
+                }),
+            ),
+          ),
+        {
+          concurrency: 1,
+          discard: true,
+        },
+      );
     });
 
   yield* Effect.acquireRelease(Effect.void, () =>

@@ -597,7 +597,7 @@ export function projectEvent(
                     lastError: payload.interruptionCode,
                     updatedAt: payload.detectedAt,
                   },
-            updatedAt: event.occurredAt,
+            updatedAt: thread.updatedAt,
           }),
         };
       });
@@ -626,7 +626,7 @@ export function projectEvent(
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
             activities: [...thread.activities, activity].slice(-500),
-            updatedAt: event.occurredAt,
+            updatedAt: thread.updatedAt,
           }),
         };
       });

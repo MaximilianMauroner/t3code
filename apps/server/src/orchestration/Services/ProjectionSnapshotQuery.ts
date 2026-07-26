@@ -18,6 +18,7 @@ import type {
   OrchestrationThreadShell,
   ProjectId,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Option from "effect/Option";
@@ -49,6 +50,10 @@ export interface ProjectionFullThreadDiffContext {
   readonly worktreePath: string | null;
   readonly latestCheckpointTurnCount: number;
   readonly toCheckpointRef: CheckpointRef | null;
+}
+
+export interface ProjectionTurnRecoveryEvidence {
+  readonly observedAt: ReadonlyArray<string>;
 }
 
 /**
@@ -168,6 +173,12 @@ export interface ProjectionSnapshotQueryShape {
   readonly getThreadDetailSnapshot: (
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>, ProjectionRepositoryError>;
+
+  /** Persisted activity timestamps for one recovery target, including hidden threads. */
+  readonly getTurnRecoveryEvidence?: (
+    threadId: ThreadId,
+    turnId: TurnId,
+  ) => Effect.Effect<ProjectionTurnRecoveryEvidence, ProjectionRepositoryError>;
 }
 
 /**

@@ -45,9 +45,11 @@ import {
 } from "../Errors.ts";
 import {
   isProviderLivenessMarker,
+  isProviderIngestionBarrier,
   isProviderRuntimeEvent,
   type ProviderAdapterOutput,
   type ProviderAdapterShape,
+  type ProviderIngestionBarrier,
   type ProviderLivenessMarker,
 } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
@@ -1575,6 +1577,34 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
         NodeFS.rmSync(tempDir, { recursive: true, force: true });
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+});
+
+const sourceClosure = makeProviderServiceLayer();
+sourceClosure.layer("ProviderServiceLive source closure", (it) => {
+  it.effect("closes adapter admission before awaiting the final ingestion barrier", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const ingestion = provider.streamIngestion;
+      const closeIngestionSource = provider.closeIngestionSource;
+      assert.exists(ingestion);
+      assert.exists(closeIngestionSource);
+      if (ingestion === undefined || closeIngestionSource === undefined) return;
+
+      const barrierSeen = yield* Deferred.make<ProviderIngestionBarrier>();
+      const consumer = yield* Stream.runForEach(ingestion, (output) =>
+        isProviderIngestionBarrier(output)
+          ? Deferred.succeed(barrierSeen, output).pipe(Effect.asVoid)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      const closing = yield* closeIngestionSource.pipe(Effect.forkChild);
+      const barrier = yield* Deferred.await(barrierSeen);
+      assert.equal(closing.pollUnsafe(), undefined);
+      yield* Deferred.succeed(barrier.acknowledged, undefined);
+      yield* Fiber.join(closing);
+      yield* Fiber.interrupt(consumer);
+    }),
   );
 });
 

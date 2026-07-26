@@ -297,9 +297,14 @@ describe("ClaudeAdapterLive", () => {
       yield* Deferred.await(mutationObserved);
 
       const acknowledged = yield* Deferred.make<ProviderLivenessSample>();
-      const markerFiber = yield* adapter
-        .requestLivenessSample?.(THREAD_ID, "claude-race-marker", acknowledged)
-        .pipe(Effect.forkChild);
+      const requestLivenessSample = adapter.requestLivenessSample;
+      assert.exists(requestLivenessSample);
+      if (requestLivenessSample === undefined) return;
+      const markerFiber = yield* requestLivenessSample(
+        THREAD_ID,
+        "claude-race-marker",
+        acknowledged,
+      ).pipe(Effect.forkChild);
       yield* Effect.yieldNow;
       assert.isUndefined(markerFiber.pollUnsafe());
 

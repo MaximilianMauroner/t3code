@@ -30,7 +30,7 @@ import type * as Stream from "effect/Stream";
 
 import type { ProviderServiceError } from "../Errors.ts";
 import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
-import type { ProviderLivenessSample } from "./ProviderAdapter.ts";
+import type { ProviderIngestionOutput, ProviderLivenessSample } from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 
 /**
@@ -123,9 +123,14 @@ export interface ProviderServiceShape {
   readonly streamEvents: Stream.Stream<ProviderRuntimeEvent>;
 
   /** Ordered runtime events plus internal liveness markers for ingestion only. */
-  readonly streamIngestion?: Stream.Stream<
-    ProviderRuntimeEvent | import("./ProviderAdapter.ts").ProviderLivenessMarker
-  >;
+  readonly streamIngestion?: Stream.Stream<ProviderIngestionOutput>;
+
+  /**
+   * Stop all adapter output pumps, then append and await a final ingestion
+   * barrier. Resolution proves every output admitted before closure has been
+   * durably handled by ProviderRuntimeIngestion.
+   */
+  readonly closeIngestionSource?: Effect.Effect<void>;
 }
 
 /**

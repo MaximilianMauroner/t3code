@@ -17,11 +17,13 @@ import * as Schema from "effect/Schema";
 
 import { OrchestrationReactorDeliveries } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
 import type { ProviderLivenessSample } from "../../provider/Services/ProviderAdapter.ts";
 import { ServerBootIdentity } from "../../serverBootId.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
   OrphanTurnReconciler,
+  type OrphanTurnStartupResult,
   type OrphanTurnReconcilerShape,
 } from "../Services/OrphanTurnReconciler.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -37,6 +39,8 @@ export interface RecoveryCandidate {
   readonly providerInstanceId: ProviderInstanceId;
   readonly target: OrchestrationRecoveryTarget;
   readonly equalityKey: string;
+  readonly bindingServerBootId: string | null;
+  readonly turnStartedAt: string | null;
 }
 
 interface MismatchObservation {
@@ -82,12 +86,11 @@ function equalityKey(target: OrchestrationRecoveryTarget): string {
     : `pending:${target.pendingMessageId}:${target.deliveryId}:${target.sourceEventId}:${sessionKey}`;
 }
 
-function concreteCandidate(thread: OrchestrationThread): RecoveryCandidate | undefined {
-  if (
-    thread.latestTurn?.state !== "running" ||
-    thread.session === null ||
-    thread.session.activeTurnId !== thread.latestTurn.turnId
-  ) {
+export function recoveryCandidateForThread(
+  thread: OrchestrationThread,
+  bindingServerBootId: string | null = null,
+): RecoveryCandidate | undefined {
+  if (thread.latestTurn?.state !== "running") {
     return undefined;
   }
   const target: OrchestrationRecoveryTarget = {
@@ -101,7 +104,38 @@ function concreteCandidate(thread: OrchestrationThread): RecoveryCandidate | und
     providerInstanceId: providerInstanceFor(thread),
     target,
     equalityKey: equalityKey(target),
+    bindingServerBootId,
+    turnStartedAt: thread.latestTurn.startedAt ?? thread.latestTurn.requestedAt,
   };
+}
+
+export function isPriorBootRecoveryCandidate(
+  candidate: RecoveryCandidate,
+  serverBootId: string,
+): boolean {
+  return candidate.bindingServerBootId !== serverBootId;
+}
+
+export function latestEligibleRecoveryObservation(
+  candidate: RecoveryCandidate,
+  observedAt: ReadonlyArray<string>,
+  detectedAt: string,
+): string | undefined {
+  const startedAtMs =
+    candidate.turnStartedAt === null
+      ? Number.NEGATIVE_INFINITY
+      : Date.parse(candidate.turnStartedAt);
+  const detectedAtMs = Date.parse(detectedAt);
+  return observedAt
+    .filter((value) => {
+      const timestamp = Date.parse(value);
+      return Number.isFinite(timestamp) && timestamp >= startedAtMs && timestamp <= detectedAtMs;
+    })
+    .toSorted((left, right) => right.localeCompare(left))[0];
+}
+
+export function startupReconciliationResult(candidateCount: number): OrphanTurnStartupResult {
+  return candidateCount === 0 ? { status: "settled" } : { status: "unresolved", candidateCount };
 }
 
 export function isRecoveryCandidateMatch(
@@ -127,6 +161,7 @@ export function isRecoveryCandidateMatch(
 
 const make = Effect.gen(function* () {
   const providerService = yield* ProviderService;
+  const sessionDirectory = yield* ProviderSessionDirectory;
   const snapshots = yield* ProjectionSnapshotQuery;
   const deliveries = yield* OrchestrationReactorDeliveries;
   const engine = yield* OrchestrationEngineService;
@@ -135,15 +170,24 @@ const make = Effect.gen(function* () {
   const running = yield* Ref.make(false);
 
   const collectCandidates = Effect.fn("OrphanTurnReconciler.collectCandidates")(function* () {
-    const [readModel, pendingDeliveries] = yield* Effect.all([
+    const [readModel, pendingDeliveries, bindings] = yield* Effect.all([
       snapshots.getCommandReadModel(),
       deliveries.listPendingOrdered(),
+      sessionDirectory.listBindings(),
     ]);
+    const bindingBootIdByThread = new Map(
+      bindings.map((binding) => [binding.threadId, binding.serverBootId ?? null] as const),
+    );
     const byThread = new Map(readModel.threads.map((thread) => [thread.id, thread] as const));
     const candidates = new Map<ThreadId, RecoveryCandidate>();
     for (const thread of readModel.threads) {
-      const candidate = concreteCandidate(thread);
-      if (candidate !== undefined) candidates.set(thread.id, candidate);
+      const candidate = recoveryCandidateForThread(
+        thread,
+        bindingBootIdByThread.get(thread.id) ?? null,
+      );
+      if (candidate !== undefined) {
+        candidates.set(thread.id, candidate);
+      }
     }
     for (const delivery of pendingDeliveries) {
       if (delivery.deliveryKind !== "turn-start" || !isOrchestrationEvent(delivery.payload)) {
@@ -167,6 +211,8 @@ const make = Effect.gen(function* () {
         providerInstanceId: providerInstanceFor(thread),
         target,
         equalityKey: equalityKey(target),
+        bindingServerBootId: bindingBootIdByThread.get(delivery.threadId) ?? null,
+        turnStartedAt: null,
       });
     }
     return [...candidates.values()];
@@ -175,9 +221,24 @@ const make = Effect.gen(function* () {
   const dispatchRecovery = Effect.fn("OrphanTurnReconciler.dispatchRecovery")(function* (
     candidate: RecoveryCandidate,
     reason: "server-restarted" | "provider-state-mismatch" | "shutdown",
-    executionLastObservedAt?: string,
   ) {
     const detectedAt = DateTime.formatIso(yield* DateTime.now);
+    const readRecoveryEvidence = snapshots.getTurnRecoveryEvidence;
+    const executionLastObservedAt =
+      candidate.target.kind === "turn" && readRecoveryEvidence !== undefined
+        ? yield* readRecoveryEvidence(candidate.threadId, candidate.target.turnId).pipe(
+            Effect.map(({ observedAt }) =>
+              latestEligibleRecoveryObservation(candidate, observedAt, detectedAt),
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("failed to read persisted recovery evidence", {
+                threadId: candidate.threadId,
+                turnId: candidate.target.kind === "turn" ? candidate.target.turnId : undefined,
+                cause,
+              }).pipe(Effect.as(undefined)),
+            ),
+          )
+        : undefined;
     const interruptionCode =
       reason === "server-restarted"
         ? "server_restart"
@@ -255,11 +316,7 @@ const make = Effect.gen(function* () {
       return;
     }
     if (nowMs - current.firstObservedAtMs < MISMATCH_GRACE_MS) return;
-    yield* dispatchRecovery(
-      candidate,
-      current.reason,
-      sample.state === "present" ? sample.session.updatedAt : undefined,
-    );
+    yield* dispatchRecovery(candidate, current.reason);
     yield* Ref.update(observations, (all) => {
       const next = new Map(all);
       next.delete(candidate.threadId);
@@ -281,10 +338,17 @@ const make = Effect.gen(function* () {
         observations,
         (current) => new Map([...current].filter(([threadId]) => liveIds.has(threadId))),
       );
-      yield* Effect.forEach(candidates, (candidate) => observe(candidate, reason), {
-        concurrency: "unbounded",
-        discard: true,
-      });
+      yield* Effect.forEach(
+        candidates,
+        (candidate) =>
+          reason === "server-restarted" && isPriorBootRecoveryCandidate(candidate, serverBootId)
+            ? dispatchRecovery(candidate, reason)
+            : observe(candidate, reason),
+        {
+          concurrency: "unbounded",
+          discard: true,
+        },
+      );
     }).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("orphan turn reconciliation sweep failed", { cause }),
@@ -306,8 +370,10 @@ const make = Effect.gen(function* () {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       if (attempt > 0) yield* Effect.sleep(SWEEP_INTERVAL);
       yield* runSweep("server-restarted");
-      if ((yield* collectCandidates()).length === 0) return;
+      const result = startupReconciliationResult((yield* collectCandidates()).length);
+      if (result.status === "settled") return result;
     }
+    return startupReconciliationResult((yield* collectCandidates()).length);
   });
   const snapshotAndInterrupt: OrphanTurnReconcilerShape["snapshotAndInterrupt"] = () =>
     collectCandidates().pipe(
