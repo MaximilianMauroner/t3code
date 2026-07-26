@@ -178,18 +178,30 @@ it.layer(testLayer)("OrchestrationReactorDeliveries", (it) => {
           "2026-07-26T00:00:20.500Z",
           "first failure",
           2,
+          "2026-07-26T00:00:21.500Z",
         ),
-      ).toBe(true);
+      ).toEqual(Option.some("pending"));
       expect(Option.getOrThrow(yield* repository.getById("poison"))).toMatchObject({
         status: "pending",
         attempts: 1,
         lastError: "first failure",
         lastFailedAt: "2026-07-26T00:00:20.500Z",
+        nextAttemptAt: "2026-07-26T00:00:21.500Z",
       });
+
+      expect(
+        Option.isNone(
+          yield* repository.claimNext({
+            claimToken: "claim-poison-too-soon",
+            claimedAt: "2026-07-26T00:00:21.000Z",
+            leaseExpiresAt: "2026-07-26T00:00:22.000Z",
+          }),
+        ),
+      ).toBe(true);
 
       yield* repository.claimNext({
         claimToken: "claim-poison-2",
-        claimedAt: "2026-07-26T00:00:21.000Z",
+        claimedAt: "2026-07-26T00:00:21.500Z",
         leaseExpiresAt: "2026-07-26T00:00:22.000Z",
       });
       expect(
@@ -199,8 +211,9 @@ it.layer(testLayer)("OrchestrationReactorDeliveries", (it) => {
           "2026-07-26T00:00:21.500Z",
           "second failure",
           2,
+          "2026-07-26T00:00:26.500Z",
         ),
-      ).toBe(true);
+      ).toEqual(Option.some("dead-letter"));
       expect(Option.getOrThrow(yield* repository.getById("poison"))).toMatchObject({
         status: "dead-letter",
         attempts: 2,

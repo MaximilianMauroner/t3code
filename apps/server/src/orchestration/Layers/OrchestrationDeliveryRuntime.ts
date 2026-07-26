@@ -13,6 +13,11 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as Metric from "effect/Metric";
+import {
+  metricAttributes,
+  orchestrationDeliveryAttemptsTotal,
+} from "../../observability/Metrics.ts";
 
 import { OrchestrationReactorDeliveries } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
@@ -30,7 +35,8 @@ import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 
 const MAX_DELIVERY_ATTEMPTS = 3;
 const CLAIM_LEASE_MINUTES = 5;
-const decodeOrchestrationEvent = Schema.decodeEffect(OrchestrationEvent);
+const RETRY_BACKOFF_MILLIS = [1_000, 5_000, 30_000] as const;
+const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 
 function expectedSessionFrom(session: OrchestrationSession): OrchestrationExpectedSession {
   return {
@@ -61,6 +67,7 @@ const make = Effect.gen(function* () {
     delivery: OrchestrationReactorDelivery,
   ) {
     switch (delivery.deliveryKind) {
+      case "runtime-mode-change":
       case "turn-start":
       case "turn-interrupt":
       case "approval-response":
@@ -203,22 +210,50 @@ const make = Effect.gen(function* () {
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause);
         return Effect.gen(function* () {
-          const failedAt = DateTime.formatIso(yield* DateTime.now);
+          const failedAtValue = yield* DateTime.now;
+          const failedAt = DateTime.formatIso(failedAtValue);
+          const backoffMs =
+            RETRY_BACKOFF_MILLIS[
+              Math.min(claimed.value.attempts - 1, RETRY_BACKOFF_MILLIS.length - 1)
+            ] ?? 30_000;
           const retained = yield* deliveries.recordFailure(
             claimed.value.deliveryId,
             claimToken,
             failedAt,
             Cause.pretty(cause),
             MAX_DELIVERY_ATTEMPTS,
+            DateTime.formatIso(DateTime.add(failedAtValue, { milliseconds: backoffMs })),
           );
-          if (!retained) {
+          if (Option.isNone(retained)) {
             return yield* Effect.die(`delivery claim was lost before failure could be retained`);
+          }
+          const outcome = retained.value === "dead-letter" ? "dead-letter" : "retry-scheduled";
+          yield* Metric.update(
+            Metric.withAttributes(
+              orchestrationDeliveryAttemptsTotal,
+              metricAttributes({ deliveryKind: claimed.value.deliveryKind, outcome }),
+            ),
+            1,
+          );
+          yield* Effect.logWarning("durable orchestration delivery failed", {
+            deliveryId: claimed.value.deliveryId,
+            deliveryKind: claimed.value.deliveryKind,
+            attempt: claimed.value.attempts,
+            outcome,
+            nextAttemptAt:
+              retained.value === "dead-letter"
+                ? null
+                : DateTime.formatIso(DateTime.add(failedAtValue, { milliseconds: backoffMs })),
+            cause: Cause.pretty(cause),
+          });
+          if (retained.value === "dead-letter" && claimed.value.sourceBootId === bootId) {
+            yield* engine.closeExternalAdmission;
           }
           return false;
         });
       }),
     );
-    return succeeded || claimed.value.attempts < MAX_DELIVERY_ATTEMPTS;
+    return succeeded;
   });
 
   const drainUnlocked: Effect.Effect<void, unknown> = Effect.gen(function* () {

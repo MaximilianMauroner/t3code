@@ -42,6 +42,13 @@ export const orchestrationEventsProcessedTotal = Metric.counter(
   },
 );
 
+export const orchestrationDeliveryAttemptsTotal = Metric.counter(
+  "t3_orchestration_delivery_attempts_total",
+  {
+    description: "Durable orchestration delivery outcomes with bounded kind and outcome labels.",
+  },
+);
+
 export const providerSessionsTotal = Metric.counter("t3_provider_sessions_total", {
   description: "Total provider session lifecycle operations.",
 });

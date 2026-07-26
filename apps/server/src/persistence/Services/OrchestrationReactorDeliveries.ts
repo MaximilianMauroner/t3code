@@ -32,6 +32,8 @@ export const OrchestrationReactorDelivery = Schema.Struct({
   attempts: NonNegativeInt,
   lastError: Schema.NullOr(Schema.String),
   lastFailedAt: Schema.NullOr(IsoDateTime),
+  // Optional while decoding historical/test rows created before migration 037.
+  nextAttemptAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
   createdAt: IsoDateTime,
   claimToken: Schema.NullOr(TrimmedNonEmptyString),
   claimedAt: Schema.NullOr(IsoDateTime),
@@ -48,6 +50,7 @@ export const NewOrchestrationReactorDelivery = OrchestrationReactorDelivery.mapF
     attempts: Schema.optionalKey(NonNegativeInt),
     lastError: Schema.optionalKey(Schema.NullOr(Schema.String)),
     lastFailedAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
+    nextAttemptAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
     claimToken: Schema.optionalKey(Schema.NullOr(TrimmedNonEmptyString)),
     claimedAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
     leaseExpiresAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
@@ -127,7 +130,8 @@ export interface OrchestrationReactorDeliveriesShape {
     failedAt: string,
     lastError: string,
     maxAttempts: number,
-  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+    nextAttemptAt?: string,
+  ) => Effect.Effect<Option.Option<"pending" | "dead-letter">, ProjectionRepositoryError>;
 }
 
 export class OrchestrationReactorDeliveries extends Context.Service<

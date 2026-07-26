@@ -13,7 +13,7 @@ import {
 import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
-const decodeOrchestrationEvent = Schema.decodeEffect(OrchestrationEvent);
+const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 
 export const logCleanupCauseUnlessInterrupted = <R, E>({
   effect,

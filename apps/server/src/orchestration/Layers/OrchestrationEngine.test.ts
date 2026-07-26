@@ -56,6 +56,7 @@ const asCheckpointRef = (value: string): CheckpointRef => CheckpointRef.make(val
 async function createOrchestrationSystem(
   gateService: UpdateMaintenanceGateService | null = null,
   projectionPipelineService: OrchestrationProjectionPipelineShape | null = null,
+  openAdmission = true,
 ) {
   const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-orchestration-engine-test-",
@@ -88,6 +89,7 @@ async function createOrchestrationSystem(
   );
   const runtime = ManagedRuntime.make(orchestrationLayer);
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
+  if (openAdmission) await runtime.runPromise(engine.openExternalAdmission);
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
   const maintenanceGate = await runtime.runPromise(
     Effect.service(UpdateMaintenanceGate.UpdateMaintenanceGate),
@@ -121,6 +123,83 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
+  it("starts with authoritative hot admission closed and preserves explicit pure commands", async () => {
+    const system = await createOrchestrationSystem(null, null, false);
+    const projectId = asProjectId("project-admission-gate");
+    const threadId = ThreadId.make("thread-admission-gate");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-admission-project"),
+        projectId,
+        title: "Admission gate",
+        workspaceRoot: "/tmp/project-admission-gate",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-admission-thread"),
+        threadId,
+        projectId,
+        title: "Admission gate",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    const start = {
+      type: "thread.turn.start" as const,
+      commandId: CommandId.make("cmd-admission-start"),
+      threadId,
+      message: {
+        messageId: asMessageId("message-admission"),
+        role: "user" as const,
+        text: "start",
+        attachments: [],
+      },
+      runtimeMode: "approval-required" as const,
+      interactionMode: "default" as const,
+      createdAt: now(),
+    };
+    await expect(system.run(system.engine.dispatchExternal(start))).rejects.toMatchObject({
+      _tag: "orchestration_not_ready",
+      phase: "quiescing",
+    });
+    await system.run(system.engine.openExternalAdmission);
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("cmd-admission-runtime-mode"),
+        threadId,
+        runtimeMode: "approval-required",
+        createdAt: now(),
+      }),
+    );
+    expect(
+      (await system.run(system.deliveries.listPendingOrdered())).map(
+        (delivery) => delivery.deliveryKind,
+      ),
+    ).toContain("runtime-mode-change");
+    await expect(system.run(system.engine.dispatchExternal(start))).resolves.toEqual({
+      sequence: expect.any(Number),
+    });
+    await system.run(system.engine.closeExternalAdmission);
+    await expect(
+      system.run(
+        system.engine.dispatchExternal({
+          ...start,
+          commandId: CommandId.make("cmd-admission-start-after-poison"),
+        }),
+      ),
+    ).rejects.toMatchObject({ _tag: "orchestration_not_ready" });
+    await system.dispose();
+  });
+
   it("atomically cancels an absent-session pending start and preserves its message", async () => {
     const system = await createOrchestrationSystem();
     const projectId = asProjectId("project-pending-recovery");
@@ -439,6 +518,91 @@ describe("OrchestrationEngine", () => {
     ).rejects.toMatchObject({ _tag: "orchestration_not_ready", phase: "sealed" });
     await system.dispose();
   });
+
+  it("forced sealing retains committed delivery work without publishing after the seal", async () => {
+    const projectionEntered = Deferred.makeUnsafe<void>();
+    const allowProjection = Deferred.makeUnsafe<void>();
+    const pipeline: OrchestrationProjectionPipelineShape = {
+      bootstrap: Effect.void,
+      projectEvent: (event) =>
+        event.type === "thread.turn-start-requested"
+          ? Deferred.succeed(projectionEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(allowProjection)),
+            )
+          : Effect.void,
+    };
+    const system = await createOrchestrationSystem(null, pipeline);
+    const projectId = asProjectId("project-forced-seal");
+    const threadId = ThreadId.make("thread-forced-seal");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-forced-seal-project"),
+        projectId,
+        title: "Forced seal",
+        workspaceRoot: "/tmp/project-forced-seal",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-forced-seal-thread"),
+        threadId,
+        projectId,
+        title: "Forced seal",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+
+    const published: OrchestrationEvent[] = [];
+    await system.run(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* Stream.runForEach(system.engine.streamDomainEvents, (event) =>
+            Effect.sync(() => {
+              published.push(event);
+            }),
+          ).pipe(Effect.forkScoped);
+          const dispatchFiber = yield* system.engine
+            .dispatchExternal({
+              type: "thread.turn.start",
+              commandId: CommandId.make("cmd-forced-seal-start"),
+              threadId,
+              message: {
+                messageId: asMessageId("message-forced-seal"),
+                role: "user",
+                text: "retain this",
+                attachments: [],
+              },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              createdAt: now(),
+            })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(projectionEntered);
+          const sealFiber = yield* system.engine.sealAndStop.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          expect(yield* system.engine.isSealed).toBe(true);
+          yield* Deferred.succeed(allowProjection, undefined);
+          yield* Fiber.join(dispatchFiber);
+          yield* Fiber.join(sealFiber);
+        }),
+      ),
+    );
+
+    expect(published).toEqual([]);
+    const pending = await system.run(system.deliveries.listPendingOrdered());
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.deliveryKind).toBe("turn-start");
+    await system.dispose();
+  });
+
   it("blocks turn dispatch while the shared update maintenance gate is held", async () => {
     const system = await createOrchestrationSystem();
     await system.run(system.maintenanceGate.acquire);

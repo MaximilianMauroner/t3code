@@ -95,6 +95,26 @@ it.effect("an interrupted queued request is removed and never executes later", (
   ),
 );
 
+it.effect("closing admission expires queued startup work without executing it later", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const executionCount = yield* Ref.make(0);
+      const commandGate = yield* ServerRuntimeStartup.makeCommandGate;
+      const fiber = yield* commandGate
+        .enqueueCommand(Ref.update(executionCount, (count) => count + 1))
+        .pipe(Effect.forkScoped);
+
+      yield* Effect.yieldNow;
+      yield* commandGate.closeCommandAdmission;
+      const error = yield* Effect.flip(Fiber.join(fiber));
+      assert.equal(error._tag, "orchestration_not_ready");
+      yield* commandGate.signalCommandReady;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Ref.get(executionCount), 0);
+    }),
+  ),
+);
+
 it.effect("bounds the startup queue at one hundred pending requests", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -220,6 +240,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets returns existing project and threa
         dispatchExternal: () => Effect.die("unused"),
         dispatchInternal: () => Effect.die("unused"),
         closeExternalAdmission: Effect.void,
+        openExternalAdmission: Effect.void,
         barrier: Effect.succeed({ sequence: 0 }),
         sealAndStop: Effect.void,
         isSealed: Effect.succeed(false),
@@ -270,6 +291,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets creates a project and thread when 
         dispatchExternal: () => Effect.die("unused"),
         dispatchInternal: () => Effect.die("unused"),
         closeExternalAdmission: Effect.void,
+        openExternalAdmission: Effect.void,
         barrier: Effect.succeed({ sequence: 0 }),
         sealAndStop: Effect.void,
         isSealed: Effect.succeed(false),
@@ -326,6 +348,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets preserves typed UUID generation fa
         dispatchExternal: () => Effect.die("unused"),
         dispatchInternal: () => Effect.die("unused"),
         closeExternalAdmission: Effect.void,
+        openExternalAdmission: Effect.void,
         barrier: Effect.succeed({ sequence: 0 }),
         sealAndStop: Effect.void,
         isSealed: Effect.succeed(false),

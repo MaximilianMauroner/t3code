@@ -16,6 +16,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { it as effectIt } from "@effect/vitest";
 import { describe, expect, vi } from "vite-plus/test";
 
@@ -60,6 +61,14 @@ function sessionStopEvent(sequence: number, eventId: string) {
     ...eventBase(sequence, eventId),
     type: "thread.session-stop-requested",
     payload: { threadId, createdAt: now },
+  });
+}
+
+function runtimeModeEvent(sequence: number, eventId: string) {
+  return decodeEvent({
+    ...eventBase(sequence, eventId),
+    type: "thread.runtime-mode-set",
+    payload: { threadId, runtimeMode: "approval-required", updatedAt: now },
   });
 }
 
@@ -154,6 +163,7 @@ describe("OrchestrationDeliveryRuntime", () => {
     readonly providerDeliver: ProviderCommandReactor["Service"]["deliver"];
     readonly checkpointDeliver?: CheckpointReactor["Service"]["deliver"];
     readonly dispatchInternal?: OrchestrationEngineService["Service"]["dispatchInternal"];
+    readonly closeExternalAdmission?: OrchestrationEngineService["Service"]["closeExternalAdmission"];
     readonly thread?: ReturnType<typeof absentSessionThread>;
   }) {
     const repositoryLayer = OrchestrationReactorDeliveriesLive.pipe(
@@ -164,6 +174,7 @@ describe("OrchestrationDeliveryRuntime", () => {
       Layer.provideMerge(
         Layer.mock(OrchestrationEngineService)({
           dispatchInternal: input.dispatchInternal ?? (() => Effect.succeed({ sequence: 1 })),
+          closeExternalAdmission: input.closeExternalAdmission ?? Effect.void,
           streamDomainEvents: Stream.empty,
         }),
       ),
@@ -231,6 +242,28 @@ describe("OrchestrationDeliveryRuntime", () => {
     }),
   );
 
+  effectIt.effect("replays a committed runtime-mode delivery exactly once", () =>
+    Effect.gen(function* () {
+      const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+        Effect.succeed("delivered" as const),
+      );
+      const delivery = deliveryFor(runtimeModeEvent(1, "runtime-mode"), "current-boot");
+      const status = yield* Effect.gen(function* () {
+        const repository = yield* OrchestrationReactorDeliveries;
+        const runtime = yield* OrchestrationDeliveryRuntime;
+        yield* repository.insert(delivery);
+        yield* repository.insert(delivery);
+        yield* runtime.drain;
+        yield* runtime.drain;
+        return Option.getOrThrow(yield* repository.getById(delivery.deliveryId)).status;
+      }).pipe(Effect.provide(createLayer({ providerDeliver })));
+
+      expect(delivery.deliveryKind).toBe("runtime-mode-change");
+      expect(providerDeliver).toHaveBeenCalledTimes(1);
+      expect(status).toBe("delivered");
+    }),
+  );
+
   effectIt.effect(
     "retains a failed predecessor, dead-letters at the bound, and keeps readiness closed",
     () =>
@@ -245,6 +278,13 @@ describe("OrchestrationDeliveryRuntime", () => {
           const deliveryRuntime = yield* OrchestrationDeliveryRuntime;
           yield* repository.insert(poison);
           yield* repository.insert(follower);
+          yield* deliveryRuntime.drain;
+          yield* deliveryRuntime.drain;
+          expect(providerDeliver).toHaveBeenCalledTimes(1);
+          yield* TestClock.adjust("1 second");
+          yield* deliveryRuntime.drain;
+          expect(providerDeliver).toHaveBeenCalledTimes(2);
+          yield* TestClock.adjust("5 seconds");
           yield* deliveryRuntime.drain;
           return {
             readiness: yield* deliveryRuntime.inspectReadiness,
@@ -298,6 +338,36 @@ describe("OrchestrationDeliveryRuntime", () => {
         }),
       );
       expect(status).toBe("cancelled");
+    }),
+  );
+
+  effectIt.effect("closes hot admission immediately when same-boot work dead-letters", () =>
+    Effect.gen(function* () {
+      let closed = 0;
+      const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+        Effect.fail("poison"),
+      );
+      const delivery = deliveryFor(sessionStopEvent(1, "same-boot-poison"), "current-boot");
+      yield* Effect.gen(function* () {
+        const repository = yield* OrchestrationReactorDeliveries;
+        const runtime = yield* OrchestrationDeliveryRuntime;
+        yield* repository.insert(delivery);
+        yield* runtime.drain;
+        yield* TestClock.adjust("1 second");
+        yield* runtime.drain;
+        yield* TestClock.adjust("5 seconds");
+        yield* runtime.drain;
+      }).pipe(
+        Effect.provide(
+          createLayer({
+            providerDeliver,
+            closeExternalAdmission: Effect.sync(() => {
+              closed += 1;
+            }),
+          }),
+        ),
+      );
+      expect(closed).toBe(1);
     }),
   );
 

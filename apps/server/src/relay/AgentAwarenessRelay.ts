@@ -50,6 +50,7 @@ export class AgentAwarenessRelay extends Context.Service<
   {
     readonly publishThread: (threadId: ThreadId) => Effect.Effect<void>;
     readonly start: () => Effect.Effect<void, never, Scope.Scope>;
+    readonly drain: Effect.Effect<void>;
   }
 >()("t3/relay/AgentAwarenessRelay") {}
 
@@ -633,6 +634,7 @@ export const make = Effect.gen(function* () {
   return AgentAwarenessRelay.of({
     publishThread,
     start,
+    drain: worker.drain,
   });
 });
 

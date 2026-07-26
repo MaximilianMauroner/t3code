@@ -46,6 +46,10 @@ const FailureInput = Schema.Struct({
   failedAt: IsoDateTime,
   lastError: Schema.String,
   maxAttempts: PositiveInt,
+  nextAttemptAt: IsoDateTime,
+});
+const FailureResult = Schema.Struct({
+  status: Schema.Literals(["pending", "dead-letter"]),
 });
 
 const selectFields = `
@@ -55,6 +59,7 @@ const selectFields = `
   source_boot_id AS "sourceBootId", payload_json AS "payload",
   command_id AS "commandId", status, attempts, last_error AS "lastError",
   last_failed_at AS "lastFailedAt", created_at AS "createdAt",
+  next_attempt_at AS "nextAttemptAt",
   claim_token AS "claimToken", claimed_at AS "claimedAt",
   lease_expires_at AS "leaseExpiresAt", delivered_at AS "deliveredAt",
   cancelled_at AS "cancelledAt", dead_lettered_at AS "deadLetteredAt"
@@ -96,13 +101,13 @@ const make = Effect.gen(function* () {
       INSERT INTO orchestration_reactor_deliveries (
         delivery_id, source_sequence, source_event_id, thread_id, reactor,
         delivery_kind, replay_policy, source_boot_id, payload_json, command_id,
-        status, attempts, last_error, last_failed_at, created_at, claim_token,
+        status, attempts, last_error, last_failed_at, next_attempt_at, created_at, claim_token,
         claimed_at, lease_expires_at, delivered_at, cancelled_at, dead_lettered_at
       ) VALUES (
         ${row.deliveryId}, ${row.sourceSequence}, ${row.sourceEventId}, ${row.threadId},
         ${row.reactor}, ${row.deliveryKind}, ${row.replayPolicy}, ${row.sourceBootId},
         ${row.payload}, ${row.commandId}, ${row.status ?? "pending"}, ${row.attempts ?? 0},
-        ${row.lastError ?? null}, ${row.lastFailedAt ?? null}, ${row.createdAt},
+        ${row.lastError ?? null}, ${row.lastFailedAt ?? null}, ${row.nextAttemptAt ?? null}, ${row.createdAt},
         ${row.claimToken ?? null}, ${row.claimedAt ?? null}, ${row.leaseExpiresAt ?? null},
         ${row.deliveredAt ?? null}, ${row.cancelledAt ?? null}, ${row.deadLetteredAt ?? null}
       ) ON CONFLICT(delivery_id) DO NOTHING
@@ -148,7 +153,7 @@ const make = Effect.gen(function* () {
       sql.unsafe(
         `UPDATE orchestration_reactor_deliveries
          SET status = 'delivering', claim_token = ?, claimed_at = ?, lease_expires_at = ?,
-             attempts = attempts + 1
+             attempts = attempts + 1, next_attempt_at = NULL
          WHERE delivery_id = ?
            AND reactor = COALESCE(?, reactor)
            AND delivery_id = (
@@ -157,11 +162,11 @@ const make = Effect.gen(function* () {
              ORDER BY ${globalOrder} LIMIT 1
            )
            AND (
-             status = 'pending'
+             (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
              OR (status = 'delivering' AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
            )
          RETURNING ${selectFields}`,
-        [claimToken, claimedAt, leaseExpiresAt, deliveryId, reactor, claimedAt],
+        [claimToken, claimedAt, leaseExpiresAt, deliveryId, reactor, claimedAt, claimedAt],
       ),
   });
   const updateDelivered = SqlSchema.findOneOption({
@@ -200,16 +205,24 @@ const make = Effect.gen(function* () {
   });
   const updateFailure = SqlSchema.findOneOption({
     Request: FailureInput,
-    Result: UpdatedDelivery,
-    execute: ({ deliveryId, expectedClaimToken, failedAt, lastError, maxAttempts }) => sql`
+    Result: FailureResult,
+    execute: ({
+      deliveryId,
+      expectedClaimToken,
+      failedAt,
+      lastError,
+      maxAttempts,
+      nextAttemptAt,
+    }) => sql`
       UPDATE orchestration_reactor_deliveries
       SET status = CASE WHEN attempts >= ${maxAttempts} THEN 'dead-letter' ELSE 'pending' END,
           last_error = ${lastError}, last_failed_at = ${failedAt},
           dead_lettered_at = CASE WHEN attempts >= ${maxAttempts} THEN ${failedAt} ELSE NULL END,
+          next_attempt_at = CASE WHEN attempts >= ${maxAttempts} THEN NULL ELSE ${nextAttemptAt} END,
           claim_token = NULL, claimed_at = NULL, lease_expires_at = NULL
       WHERE delivery_id = ${deliveryId} AND status = 'delivering'
         AND claim_token = ${expectedClaimToken}
-      RETURNING delivery_id AS "deliveryId"
+      RETURNING status
     `,
   });
 
@@ -307,9 +320,17 @@ const make = Effect.gen(function* () {
     failedAt,
     lastError,
     maxAttempts,
+    nextAttemptAt,
   ) =>
-    updateFailure({ deliveryId, expectedClaimToken, failedAt, lastError, maxAttempts }).pipe(
-      Effect.map(Option.isSome),
+    updateFailure({
+      deliveryId,
+      expectedClaimToken,
+      failedAt,
+      lastError,
+      maxAttempts,
+      nextAttemptAt: nextAttemptAt ?? failedAt,
+    }).pipe(
+      Effect.map(Option.map((result) => result.status)),
       Effect.mapError(mapError("OrchestrationReactorDeliveries.recordFailure")),
     );
 

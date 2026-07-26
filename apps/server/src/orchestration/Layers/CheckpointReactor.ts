@@ -39,7 +39,7 @@ import type { OrchestrationReactorDelivery } from "../../persistence/Services/Or
 import * as Schema from "effect/Schema";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
-const decodeOrchestrationEvent = Schema.decodeEffect(OrchestrationEvent);
+const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 
 type ReactorInput =
   | {

@@ -1041,7 +1041,7 @@ const makeWsRpcLayer = (
 
             yield* runSetupProgram();
 
-            return yield* orchestrationEngine.dispatch(finalTurnStartCommand);
+            return yield* orchestrationEngine.dispatchExternal(finalTurnStartCommand);
           });
 
           return yield* bootstrapProgram.pipe(

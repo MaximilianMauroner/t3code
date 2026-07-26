@@ -31,6 +31,7 @@ import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSna
 import * as OrchestrationReactor from "./orchestration/Services/OrchestrationReactor.ts";
 import * as OrchestrationDeliveryRuntime from "./orchestration/Services/OrchestrationDeliveryRuntime.ts";
 import * as OrphanTurnReconciler from "./orchestration/Services/OrphanTurnReconciler.ts";
+import * as ProviderRuntimeIngestion from "./orchestration/Services/ProviderRuntimeIngestion.ts";
 import * as ShutdownCoordinator from "./orchestration/Services/ShutdownCoordinator.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerSettings from "./serverSettings.ts";
@@ -111,6 +112,7 @@ const settleQueuedCommand = <A, E>(deferred: Deferred.Deferred<A, E>, exit: Exit
 
 export const makeCommandGate = Effect.gen(function* () {
   const commandReady = yield* Deferred.make<void, ServerRuntimeStartupError>();
+  const admissionClosed = yield* Deferred.make<void>();
   const commandQueue = yield* Queue.bounded<QueuedCommand>(100);
   const queuedCount = yield* Ref.make(0);
   const commandReadinessState = yield* Ref.make<CommandReadinessState>("pending");
@@ -153,15 +155,18 @@ export const makeCommandGate = Effect.gen(function* () {
         yield* Ref.set(commandReadinessState, error);
         yield* Deferred.fail(commandReady, error).pipe(Effect.orDie);
       }),
-    closeCommandAdmission: Ref.set(
-      commandReadinessState,
-      new OrchestrationNotReadyError({
-        message: "Orchestration is shutting down.",
-        retryable: true,
-        retryAfterMs: 1_000,
-        phase: "quiescing",
-      }),
-    ),
+    closeCommandAdmission: Effect.gen(function* () {
+      yield* Ref.set(
+        commandReadinessState,
+        new OrchestrationNotReadyError({
+          message: "Orchestration is shutting down.",
+          retryable: true,
+          retryAfterMs: 1_000,
+          phase: "quiescing",
+        }),
+      );
+      yield* Deferred.succeed(admissionClosed, undefined);
+    }),
     enqueueCommand: <A, E>(effect: Effect.Effect<A, E>, identity?: CommandRequestIdentity) =>
       Effect.gen(function* () {
         const readinessState = yield* Ref.get(commandReadinessState);
@@ -196,7 +201,21 @@ export const makeCommandGate = Effect.gen(function* () {
             if (yield* Ref.get(cancelled)) return;
             const exit = yield* Effect.exit(
               Effect.gen(function* () {
-                yield* Deferred.await(commandReady);
+                yield* Effect.raceFirst(
+                  Deferred.await(commandReady),
+                  Deferred.await(admissionClosed).pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new OrchestrationNotReadyError({
+                          message: "Orchestration is shutting down.",
+                          retryable: true,
+                          retryAfterMs: 1_000,
+                          phase: "quiescing",
+                        }),
+                      ),
+                    ),
+                  ),
+                );
                 if (yield* Ref.get(cancelled)) return yield* Effect.interrupt;
                 return yield* effect;
               }),
@@ -216,7 +235,7 @@ export const makeCommandGate = Effect.gen(function* () {
             ),
           ),
         );
-        return yield* Effect.race(Deferred.await(result), expired).pipe(
+        return yield* Effect.raceFirst(Deferred.await(result), expired).pipe(
           Effect.ensuring(Ref.set(cancelled, true)),
           Effect.ensuring(Ref.update(queuedCount, (count) => Math.max(0, count - 1))),
         );
@@ -388,6 +407,8 @@ export const make = Effect.gen(function* () {
   const orchestrationReactor = yield* OrchestrationReactor.OrchestrationReactor;
   const deliveryRuntime = yield* OrchestrationDeliveryRuntime.OrchestrationDeliveryRuntime;
   const orphanTurnReconciler = yield* OrphanTurnReconciler.OrphanTurnReconciler;
+  const providerRuntimeIngestion = yield* ProviderRuntimeIngestion.ProviderRuntimeIngestionService;
+  const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
   const shutdownCoordinator = yield* ShutdownCoordinator.ShutdownCoordinator;
   const providerSessionReaper = yield* ProviderSessionReaper.ProviderSessionReaper;
   const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
@@ -444,7 +465,15 @@ export const make = Effect.gen(function* () {
     yield* runStartupPhase(
       "orchestration.reconcile",
       Effect.gen(function* () {
-        yield* orphanTurnReconciler.reconcileStartup;
+        // This is the only provider path allowed before recovery settles. It
+        // projects markers/events but does not execute command side effects.
+        yield* providerRuntimeIngestion.start().pipe(Scope.provide(reactorScope));
+        const reconciliation = yield* orphanTurnReconciler.reconcileStartup;
+        if (reconciliation.status === "unresolved") {
+          return yield* Effect.die(
+            `startup reconciliation left ${reconciliation.candidateCount} unresolved candidate(s)`,
+          );
+        }
         yield* deliveryRuntime.start().pipe(Scope.provide(reactorScope));
         yield* deliveryRuntime.drain;
         const readiness = yield* deliveryRuntime.inspectReadiness;
@@ -524,6 +553,11 @@ export const make = Effect.gen(function* () {
         ),
       );
     }
+
+    // Linearizes reactor startup and all internal recovery work before hot
+    // external commands can enter the authoritative engine queue.
+    yield* orchestrationEngine.barrier;
+    yield* orchestrationEngine.openExternalAdmission;
   }).pipe(
     Effect.annotateSpans({
       "server.mode": serverConfig.mode,

@@ -20,7 +20,6 @@ import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
@@ -34,6 +33,7 @@ import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
   ProviderCommandReactor,
+  type OrchestrationDeliveryResolution,
   type ProviderCommandReactorShape,
 } from "../Services/ProviderCommandReactor.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -43,7 +43,7 @@ import * as TerminalManager from "../../terminal/Manager.ts";
 import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
-const decodeOrchestrationEvent = Schema.decodeEffect(OrchestrationEvent);
+const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 
 type ProviderIntentEvent = Extract<
   OrchestrationEvent,
@@ -1074,14 +1074,20 @@ const make = Effect.gen(function* () {
     decodeOrchestrationEvent(delivery.payload);
 
   const deliver: ProviderCommandReactorShape["deliver"] = Effect.fn("deliver")(
-    function* (delivery) {
+    function* (delivery): Effect.fn.Return<OrchestrationDeliveryResolution, unknown> {
       const event = yield* decodeDeliveryEvent(delivery);
       switch (delivery.deliveryKind) {
+        case "runtime-mode-change":
+          if (event.type !== "thread.runtime-mode-set") {
+            return yield* Effect.die(`runtime-mode-change delivery contains ${event.type}`);
+          }
+          yield* Effect.scoped(processDomainEvent(event));
+          return "delivered" as const;
         case "turn-start":
           if (event.type !== "thread.turn-start-requested") {
             return yield* Effect.die(`turn-start delivery contains ${event.type}`);
           }
-          yield* processTurnStartRequested(event);
+          yield* Effect.scoped(processTurnStartRequested(event));
           return "delivered" as const;
         case "turn-interrupt":
           if (event.type !== "thread.turn-interrupt-requested") {
@@ -1113,7 +1119,10 @@ const make = Effect.gen(function* () {
           }
           yield* orchestrationEngine.dispatchInternal({
             type: "thread.session.stop",
-            commandId: archiveStopCommandId(event),
+            commandId: archiveStopCommandId({
+              eventId: event.eventId,
+              threadId: event.payload.threadId,
+            }),
             threadId: event.payload.threadId,
             createdAt: event.payload.archivedAt,
           });
@@ -1131,15 +1140,7 @@ const make = Effect.gen(function* () {
   );
 
   const start: ProviderCommandReactorShape["start"] = Effect.fn("start")(function* () {
-    const processEvent = Effect.fn("processEvent")(function* (event: OrchestrationEvent) {
-      if (event.type === "thread.runtime-mode-set") {
-        return yield* worker.enqueue(event);
-      }
-    });
-
-    yield* Effect.forkScoped(
-      Stream.runForEach(orchestrationEngine.streamDomainEvents, processEvent),
-    );
+    yield* Effect.void;
   });
 
   return {

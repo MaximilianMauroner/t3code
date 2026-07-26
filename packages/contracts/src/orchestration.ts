@@ -844,6 +844,7 @@ export type OrchestrationReactorDeliveryReplayPolicy =
   typeof OrchestrationReactorDeliveryReplayPolicy.Type;
 
 export const OrchestrationReactorDeliveryKind = Schema.Literals([
+  "runtime-mode-change",
   "turn-start",
   "turn-interrupt",
   "approval-response",

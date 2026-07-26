@@ -1,10 +1,30 @@
 import {
+  type DispatchableClientOrchestrationCommand,
   type OrchestrationEvent,
   OrchestrationReactorDeliveryKind,
   OrchestrationReactorDeliveryReplayPolicy,
   ThreadId,
 } from "@t3tools/contracts";
 import type { NewOrchestrationReactorDelivery } from "../persistence/Services/OrchestrationReactorDeliveries.ts";
+import { externalCommandEffects } from "./externalCommandClassification.ts";
+
+type ExternalCommandType = DispatchableClientOrchestrationCommand["type"];
+type HotExternalCommandType = {
+  [Type in ExternalCommandType]: (typeof externalCommandEffects)[Type] extends "hot" ? Type : never;
+}[ExternalCommandType];
+
+/** Keeps lifecycle classification and durable side-effect planning exhaustive together. */
+export const hotCommandDeliveryKinds = {
+  "thread.runtime-mode.set": "runtime-mode-change",
+  "thread.turn.start": "turn-start",
+  "thread.turn.interrupt": "turn-interrupt",
+  "thread.approval.respond": "approval-response",
+  "thread.user-input.respond": "user-input-response",
+  "thread.checkpoint.revert": "checkpoint-revert",
+  "thread.session.stop": "session-stop",
+  "thread.archive": "archive-cleanup",
+  "thread.delete": "thread-delete",
+} satisfies Record<HotExternalCommandType, OrchestrationReactorDeliveryKind>;
 
 export function deliveryIdForEvent(
   event: Pick<OrchestrationEvent, "eventId">,
@@ -19,6 +39,12 @@ function deliveryDescriptor(event: OrchestrationEvent): {
   readonly replayPolicy: OrchestrationReactorDeliveryReplayPolicy;
 } | null {
   switch (event.type) {
+    case "thread.runtime-mode-set":
+      return {
+        reactor: "provider-command",
+        kind: "runtime-mode-change",
+        replayPolicy: "replay-idempotent",
+      };
     case "thread.turn-start-requested":
       return {
         reactor: "provider-command",

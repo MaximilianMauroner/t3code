@@ -63,7 +63,10 @@ export interface OrchestrationEngineShape {
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   /** Linearizably rejects new external commands while preserving internal recovery dispatch. */
-  readonly closeExternalAdmission?: Effect.Effect<void, never, never>;
+  readonly closeExternalAdmission: Effect.Effect<void, never, never>;
+
+  /** Opens hot external command admission after startup recovery is fully settled. */
+  readonly openExternalAdmission: Effect.Effect<void, never, never>;
 
   /** Resolves after all earlier envelopes have committed and planned deliveries are durable. */
   readonly barrier: Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;

@@ -52,6 +52,7 @@ import {
 } from "../Services/OrchestrationEngine.ts";
 import { UpdateMaintenanceGate, type UpdateDispatchAcceptance } from "../UpdateMaintenanceGate.ts";
 import { planReactorDelivery } from "../reactorDeliveries.ts";
+import { classifyExternalCommand } from "../externalCommandClassification.ts";
 import { ServerBootIdentity } from "../../serverBootId.ts";
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
@@ -70,8 +71,12 @@ interface BarrierEnvelope {
   readonly _tag: "barrier";
   readonly result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
 }
+interface StopEnvelope {
+  readonly _tag: "stop";
+  readonly completed: Deferred.Deferred<void>;
+}
 
-type EngineEnvelope = CommandEnvelope | BarrierEnvelope;
+type EngineEnvelope = CommandEnvelope | BarrierEnvelope | StopEnvelope;
 
 function commandToAggregateRef(command: OrchestrationCommand): {
   readonly aggregateKind: "project" | "thread";
@@ -111,7 +116,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const eventPubSub = yield* PubSub.unbounded<OrchestrationEvent>();
   const admissionLock = yield* Semaphore.make(1);
   let sealed = false;
-  let externalAdmissionClosed = false;
+  let externalAdmissionClosed = true;
 
   const projectEventsOntoReadModel = (
     baseReadModel: OrchestrationReadModel,
@@ -365,7 +370,11 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       Effect.flatMap((envelope) =>
         envelope._tag === "command"
           ? processEnvelope(envelope)
-          : Deferred.succeed(envelope.result, { sequence: commandReadModel.snapshotSequence }),
+          : envelope._tag === "barrier"
+            ? Deferred.succeed(envelope.result, { sequence: commandReadModel.snapshotSequence })
+            : Deferred.succeed(envelope.completed, undefined).pipe(
+                Effect.andThen(Effect.interrupt),
+              ),
       ),
     ),
   );
@@ -377,8 +386,61 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive, limit) =>
     eventStore.readFromSequence(fromSequenceExclusive, limit);
 
-  const enqueueCommand = (command: OrchestrationCommand, external: boolean) =>
+  const enqueueCommand = (command: OrchestrationCommand, externalEffect: "hot" | "pure" | null) =>
+    Effect.gen(function* () {
+      const result = yield* admissionLock.withPermits(1)(
+        Effect.gen(function* () {
+          if (sealed) {
+            return yield* new OrchestrationNotReadyError({
+              message: "Orchestration engine is sealed.",
+              retryable: false,
+              retryAfterMs: 0,
+              phase: "sealed",
+            });
+          }
+          if (externalEffect !== null && externalAdmissionClosed && externalEffect === "hot") {
+            return yield* new OrchestrationNotReadyError({
+              message: "Orchestration is quiescing.",
+              retryable: true,
+              retryAfterMs: 1_000,
+              phase: "quiescing",
+            });
+          }
+          const maintenanceAcceptance = yield* maintenanceGate.ensureDispatchAllowed(command);
+          const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
+          yield* Queue.offer(commandQueue, {
+            _tag: "command",
+            command,
+            maintenanceAcceptance,
+            result,
+            startedAtMs: yield* Clock.currentTimeMillis,
+          });
+          return result;
+        }),
+      );
+      return yield* Deferred.await(result);
+    });
+
+  const dispatch: OrchestrationEngineShape["dispatch"] = (command) => enqueueCommand(command, null);
+  const dispatchExternal: OrchestrationEngineShape["dispatchExternal"] = (
+    command: DispatchableClientOrchestrationCommand,
+  ) => enqueueCommand(command, classifyExternalCommand(command));
+  const dispatchInternal: OrchestrationEngineShape["dispatchInternal"] = (command) =>
+    enqueueCommand(command, null);
+  const closeExternalAdmission: OrchestrationEngineShape["closeExternalAdmission"] =
     admissionLock.withPermits(1)(
+      Effect.sync(() => {
+        externalAdmissionClosed = true;
+      }),
+    );
+  const openExternalAdmission: OrchestrationEngineShape["openExternalAdmission"] =
+    admissionLock.withPermits(1)(
+      Effect.sync(() => {
+        if (!sealed) externalAdmissionClosed = false;
+      }),
+    );
+  const barrier: OrchestrationEngineShape["barrier"] = Effect.gen(function* () {
+    const result = yield* admissionLock.withPermits(1)(
       Effect.gen(function* () {
         if (sealed) {
           return yield* new OrchestrationNotReadyError({
@@ -388,64 +450,30 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             phase: "sealed",
           });
         }
-        if (external && externalAdmissionClosed) {
-          return yield* new OrchestrationNotReadyError({
-            message: "Orchestration is quiescing.",
-            retryable: true,
-            retryAfterMs: 1_000,
-            phase: "quiescing",
-          });
-        }
-        const maintenanceAcceptance = yield* maintenanceGate.ensureDispatchAllowed(command);
-        const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
-        yield* Queue.offer(commandQueue, {
-          _tag: "command",
-          command,
-          maintenanceAcceptance,
-          result,
-          startedAtMs: yield* Clock.currentTimeMillis,
-        });
-        return yield* Deferred.await(result);
+        const deferred = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
+        yield* Queue.offer(commandQueue, { _tag: "barrier", result: deferred });
+        return deferred;
       }),
     );
-
-  const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
-    enqueueCommand(command, false);
-  const dispatchExternal: OrchestrationEngineShape["dispatchExternal"] = (
-    command: DispatchableClientOrchestrationCommand,
-  ) => enqueueCommand(command, true);
-  const dispatchInternal: OrchestrationEngineShape["dispatchInternal"] = (command) =>
-    enqueueCommand(command, false);
-  const closeExternalAdmission: OrchestrationEngineShape["closeExternalAdmission"] =
-    admissionLock.withPermits(1)(
-      Effect.sync(() => {
+    return yield* Deferred.await(result);
+  });
+  const sealAndStop: OrchestrationEngineShape["sealAndStop"] = Effect.gen(function* () {
+    const completed = yield* admissionLock.withPermits(1)(
+      Effect.gen(function* () {
+        if (sealed) return null;
+        sealed = true;
         externalAdmissionClosed = true;
+        const deferred = yield* Deferred.make<void>();
+        yield* Queue.offer(commandQueue, { _tag: "stop", completed: deferred });
+        return deferred;
       }),
     );
-  const barrier: OrchestrationEngineShape["barrier"] = admissionLock.withPermits(1)(
-    Effect.gen(function* () {
-      if (sealed) {
-        return yield* new OrchestrationNotReadyError({
-          message: "Orchestration engine is sealed.",
-          retryable: false,
-          retryAfterMs: 0,
-          phase: "sealed",
-        });
-      }
-      const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
-      yield* Queue.offer(commandQueue, { _tag: "barrier", result });
-      return yield* Deferred.await(result);
-    }),
-  );
-  const sealAndStop: OrchestrationEngineShape["sealAndStop"] = admissionLock.withPermits(1)(
-    Effect.gen(function* () {
-      if (sealed) return;
-      sealed = true;
-      yield* Queue.shutdown(commandQueue);
-      yield* Fiber.interrupt(workerFiber).pipe(Effect.ignore);
-      yield* PubSub.shutdown(eventPubSub);
-    }),
-  );
+    if (completed === null) return;
+    yield* Deferred.await(completed);
+    yield* Fiber.interrupt(workerFiber).pipe(Effect.ignore);
+    yield* Queue.shutdown(commandQueue);
+    yield* PubSub.shutdown(eventPubSub);
+  });
 
   return {
     readEvents,
@@ -453,6 +481,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     dispatchExternal,
     dispatchInternal,
     closeExternalAdmission,
+    openExternalAdmission,
     barrier,
     sealAndStop,
     isSealed: Effect.sync(() => sealed),
