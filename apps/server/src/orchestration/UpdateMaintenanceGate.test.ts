@@ -15,6 +15,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Scope from "effect/Scope";
 import type * as PlatformError from "effect/PlatformError";
 import { describe, expect } from "vite-plus/test";
 
@@ -89,7 +90,21 @@ describe("UpdateMaintenanceGate", () => {
   it.effect("holds a bootstrap reservation through its durable commit", () =>
     withFixture((fixture) =>
       Effect.gen(function* () {
-        const reservation = yield* fixture.gate.reserveDispatchAllowed(turnCommand);
+        const reservationScope = yield* Scope.make();
+        const reservation = yield* fixture.gate.reserveDispatchAllowed(
+          turnCommand,
+          reservationScope,
+        );
+        const mismatch = yield* reservation
+          .withDispatchAllowed(
+            {
+              ...turnCommand,
+              message: { ...turnCommand.message, text: "different command" },
+            },
+            Effect.succeed("incorrectly accepted"),
+          )
+          .pipe(Effect.flip);
+        expect(mismatch.message).toContain("server update is in progress");
         const commitEntered = yield* Deferred.make<void>();
         const allowCommit = yield* Deferred.make<void>();
         const commitFiber = yield* reservation
@@ -118,7 +133,10 @@ describe("UpdateMaintenanceGate", () => {
     withFixture((fixture) =>
       Effect.gen(function* () {
         yield* fixture.gate.acquire;
-        const error = yield* fixture.gate.reserveDispatchAllowed(turnCommand).pipe(Effect.flip);
+        const reservationScope = yield* Scope.make();
+        const error = yield* fixture.gate
+          .reserveDispatchAllowed(turnCommand, reservationScope)
+          .pipe(Effect.flip);
         expect(error.message).toContain("server update is in progress");
         yield* fixture.gate.release;
       }),

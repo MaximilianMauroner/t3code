@@ -1,6 +1,8 @@
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 
 import { OrchestrationDeliveryRuntime } from "../Services/OrchestrationDeliveryRuntime.ts";
@@ -10,6 +12,7 @@ import { OrphanTurnReconciler } from "../Services/OrphanTurnReconciler.ts";
 import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeIngestion.ts";
 import {
   SHUTDOWN_COORDINATOR_BUDGET_MS,
+  SHUTDOWN_COORDINATOR_FORCE_BUDGET_MS,
   ShutdownCoordinator,
   type ShutdownCoordinatorShape,
 } from "../Services/ShutdownCoordinator.ts";
@@ -49,10 +52,31 @@ export const runShutdownWithBudget = Effect.fn("ShutdownCoordinator.runShutdownW
     readonly actions: ShutdownSequenceActions;
     readonly forced: Effect.Effect<void, never>;
     readonly budgetMs?: number;
+    readonly forcedBudgetMs?: number;
+    readonly onForcedTimeout?: Effect.Effect<void>;
   }) {
-    yield* runShutdownSequence(input.actions).pipe(
+    const gracefulFiber = yield* runShutdownSequence(input.actions).pipe(
+      Effect.forkDetach({ startImmediately: true }),
+    );
+    yield* Fiber.join(gracefulFiber).pipe(
       Effect.timeout(`${input.budgetMs ?? SHUTDOWN_COORDINATOR_BUDGET_MS} millis`),
-      Effect.catchCause(() => input.forced),
+      Effect.catchCause(() =>
+        Effect.gen(function* () {
+          gracefulFiber.interruptUnsafe();
+          const forcedFiber = yield* input.forced.pipe(
+            Effect.forkDetach({ startImmediately: true }),
+          );
+          yield* Fiber.join(forcedFiber).pipe(
+            Effect.timeout(
+              `${input.forcedBudgetMs ?? SHUTDOWN_COORDINATOR_FORCE_BUDGET_MS} millis`,
+            ),
+            Effect.catchCause(() => {
+              forcedFiber.interruptUnsafe();
+              return input.onForcedTimeout ?? Effect.void;
+            }),
+          );
+        }),
+      ),
     );
   },
 );
@@ -66,16 +90,25 @@ const make = Effect.gen(function* () {
 
   const shutdown: ShutdownCoordinatorShape["shutdown"] = Effect.fn("ShutdownCoordinator.shutdown")(
     function* ({ reactorScope, closeExternalAdmission }) {
-      const closeReactorScope = Scope.close(reactorScope, Exit.void);
-      const forceCloseReactorScope = Effect.sync(() =>
-        Scope.closeUnsafe(reactorScope, Exit.void),
-      ).pipe(
-        Effect.flatMap((finalizers) =>
-          finalizers === undefined
-            ? Effect.void
-            : finalizers.pipe(Effect.forkDetach({ startImmediately: true }), Effect.asVoid),
-        ),
-      );
+      const reactorScopeCloseLock = yield* Semaphore.make(1);
+      let reactorScopeCloseFiber: Fiber.Fiber<void> | null = null;
+      const closeReactorScope = Effect.gen(function* () {
+        const closeFiber = yield* reactorScopeCloseLock.withPermit(
+          Effect.suspend(() =>
+            reactorScopeCloseFiber === null
+              ? Scope.close(reactorScope, Exit.void).pipe(
+                  Effect.forkDetach({ startImmediately: true }),
+                  Effect.tap((fiber) =>
+                    Effect.sync(() => {
+                      reactorScopeCloseFiber = fiber;
+                    }),
+                  ),
+                )
+              : Effect.succeed(reactorScopeCloseFiber),
+          ),
+        );
+        yield* Fiber.join(closeFiber);
+      });
       yield* runShutdownWithBudget({
         actions: {
           closeExternalAdmission: closeExternalAdmission.pipe(
@@ -93,7 +126,14 @@ const make = Effect.gen(function* () {
         },
         forced: Effect.logError("orchestration shutdown coordinator exceeded its budget", {
           unresolvedDeliveries: "unknown",
-        }).pipe(Effect.andThen(engine.forceStop), Effect.andThen(forceCloseReactorScope)),
+        }).pipe(
+          Effect.andThen(engine.forceStop),
+          Effect.andThen(engine.awaitStopped),
+          Effect.andThen(closeReactorScope),
+        ),
+        onForcedTimeout: Effect.logError(
+          "forced orchestration shutdown exceeded its secondary budget; awaiting systemd termination",
+        ),
       });
     },
   );

@@ -3,6 +3,7 @@ import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 
 export const SHUTDOWN_COORDINATOR_BUDGET_MS = 4_000;
+export const SHUTDOWN_COORDINATOR_FORCE_BUDGET_MS = 2_000;
 export const MINIMUM_EFFECTIVE_TIMEOUT_STOP_SECONDS = 12;
 
 export function hasSafeEffectiveTimeoutStop(timeoutStopSeconds: number): boolean {

@@ -5,11 +5,13 @@ import * as NodeFS from "node:fs";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as Scope from "effect/Scope";
 
 import * as ServerConfig from "../config.ts";
 import { OrchestrationCommandInvariantError } from "./Errors.ts";
@@ -41,6 +43,7 @@ export interface UpdateMaintenanceGateService {
   ) => Effect.Effect<UpdateDispatchAcceptance, OrchestrationCommandInvariantError>;
   readonly reserveDispatchAllowed: (
     command: OrchestrationCommand,
+    ownerScope: Scope.Scope,
   ) => Effect.Effect<UpdateDispatchReservation, OrchestrationCommandInvariantError>;
   readonly withDispatchAllowed: <A, E, R>(
     command: OrchestrationCommand,
@@ -251,6 +254,7 @@ export const make = Effect.gen(function* () {
 
   const reserveDispatchAllowed: UpdateMaintenanceGateService["reserveDispatchAllowed"] = (
     command,
+    ownerScope,
   ) =>
     !isHotExternalCommand(command)
       ? Effect.succeed({
@@ -288,20 +292,16 @@ export const make = Effect.gen(function* () {
                 }
               }),
             );
-            const reservedCommandId = command.commandId;
             const withReservedDispatch = <A, E, R>(
               reservedCommand: OrchestrationCommand,
               effect: Effect.Effect<A, E, R>,
             ): Effect.Effect<A, E | OrchestrationCommandInvariantError, R> => {
-              if (
-                active &&
-                reservedCommand.commandId === reservedCommandId &&
-                isHotExternalCommand(reservedCommand)
-              ) {
+              if (active && Equal.equals(reservedCommand, command)) {
                 return effect.pipe(Effect.ensuring(cancel));
               }
               return Effect.fail(dispatchError(reservedCommand));
             };
+            yield* Scope.addFinalizer(ownerScope, cancel);
             return {
               withDispatchAllowed: withReservedDispatch,
               cancel,

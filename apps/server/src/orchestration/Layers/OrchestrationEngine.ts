@@ -13,6 +13,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
@@ -22,6 +23,7 @@ import * as Queue from "effect/Queue";
 import * as Fiber from "effect/Fiber";
 import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -526,104 +528,116 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           phase: "quiescing",
         });
       }
-      const reservationId = yield* admissionLock.withPermits(1)(
-        Effect.gen(function* () {
-          if (sealed || externalAdmissionClosed) {
-            return yield* new OrchestrationNotReadyError({
-              message: sealed ? "Orchestration engine is sealed." : "Orchestration is quiescing.",
-              retryable: !sealed,
-              retryAfterMs: sealed ? 0 : 1_000,
-              phase: sealed ? "sealed" : "quiescing",
-            });
-          }
-          if (activeReservationIds.size === 0) {
-            reservationsDrained = yield* Deferred.make<void>();
-          }
-          const reservationId = nextReservationId++;
-          activeReservationIds.add(reservationId);
-          return reservationId;
-        }),
-      );
-
-      const maintenanceReservation = yield* maintenanceGate
-        .reserveDispatchAllowed(reservedCommand)
-        .pipe(
-          Effect.tapError(() => admissionLock.withPermits(1)(releaseReservation(reservationId))),
-        );
-      activeBootstrapMaintenanceReservations.add(maintenanceReservation);
-
-      const cancel = admissionLock
-        .withPermits(1)(releaseReservation(reservationId))
-        .pipe(
-          Effect.andThen(
-            Effect.sync(() => {
-              activeBootstrapMaintenanceReservations.delete(maintenanceReservation);
-            }),
-          ),
-          Effect.andThen(maintenanceReservation.cancel),
-        );
-      if (sealed || !activeReservationIds.has(reservationId)) {
-        yield* cancel;
-        return yield* new OrchestrationNotReadyError({
-          message: "Bootstrap admission reservation is no longer active.",
-          retryable: false,
-          retryAfterMs: 0,
-          phase: "sealed",
-        });
-      }
-
-      const dispatch: OrchestrationHotAdmissionReservation["dispatch"] = (command) =>
-        Effect.gen(function* () {
-          const result = yield* admissionLock.withPermits(1)(
-            Effect.gen(function* () {
-              if (!activeReservationIds.has(reservationId)) {
+      const reservationScope = yield* Scope.make("parallel");
+      return yield* Effect.gen(function* () {
+        const reservationId = yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            yield* restore(admissionLock.take(1));
+            return yield* Effect.gen(function* () {
+              if (sealed || externalAdmissionClosed) {
                 return yield* new OrchestrationNotReadyError({
-                  message: "Bootstrap admission reservation is no longer active.",
-                  retryable: false,
-                  retryAfterMs: 0,
+                  message: sealed
+                    ? "Orchestration engine is sealed."
+                    : "Orchestration is quiescing.",
+                  retryable: !sealed,
+                  retryAfterMs: sealed ? 0 : 1_000,
                   phase: sealed ? "sealed" : "quiescing",
                 });
               }
-              if (sealed) {
-                yield* releaseReservation(reservationId);
-                return yield* new OrchestrationNotReadyError({
-                  message: "Orchestration engine is sealed.",
-                  retryable: false,
-                  retryAfterMs: 0,
-                  phase: "sealed",
-                });
+              if (activeReservationIds.size === 0) {
+                reservationsDrained = yield* Deferred.make<void>();
               }
-              if (classifyExternalCommand(command) !== "hot") {
-                yield* releaseReservation(reservationId);
-                return yield* new OrchestrationNotReadyError({
-                  message: "Bootstrap reservation only accepts hot commands.",
-                  retryable: false,
-                  retryAfterMs: 0,
-                  phase: "quiescing",
-                });
-              }
-              const deferred = yield* Deferred.make<
-                { sequence: number },
-                OrchestrationDispatchError
-              >();
-              const envelope = {
-                _tag: "command",
-                command,
-                maintenanceAcceptance: { generation: 0 },
-                maintenanceReservation,
-                result: deferred,
-                startedAtMs: yield* Clock.currentTimeMillis,
-              } satisfies CommandEnvelope;
-              pendingCommands.add(envelope);
+              const reservationId = nextReservationId++;
+              activeReservationIds.add(reservationId);
+              yield* Scope.addFinalizer(
+                reservationScope,
+                admissionLock.withPermits(1)(releaseReservation(reservationId)).pipe(Effect.ignore),
+              );
+              return reservationId;
+            }).pipe(Effect.ensuring(admissionLock.release(1)));
+          }),
+        );
+        const maintenanceReservation = yield* maintenanceGate.reserveDispatchAllowed(
+          reservedCommand,
+          reservationScope,
+        );
+        yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            activeBootstrapMaintenanceReservations.add(maintenanceReservation);
+          }),
+          () =>
+            Effect.sync(() => {
               activeBootstrapMaintenanceReservations.delete(maintenanceReservation);
-              yield* Queue.offer(commandQueue, envelope);
-              yield* releaseReservation(reservationId);
-              return deferred;
             }),
-          );
-          return yield* Deferred.await(result);
-        });
-      return { dispatch, cancel } satisfies OrchestrationHotAdmissionReservation;
+        );
+
+        let enqueued = false;
+        const releaseOwnedReservation = Scope.close(reservationScope, Exit.void);
+        const cancel = Effect.suspend(() => (enqueued ? Effect.void : releaseOwnedReservation));
+        const ownedMaintenanceReservation: UpdateDispatchReservation = {
+          withDispatchAllowed: (command, effect) =>
+            maintenanceReservation
+              .withDispatchAllowed(command, effect)
+              .pipe(Effect.ensuring(releaseOwnedReservation)),
+          cancel: releaseOwnedReservation,
+        };
+        const dispatch: OrchestrationHotAdmissionReservation["dispatch"] = (command) =>
+          Effect.gen(function* () {
+            const result = yield* admissionLock.withPermits(1)(
+              Effect.gen(function* () {
+                if (!activeReservationIds.has(reservationId)) {
+                  return yield* new OrchestrationNotReadyError({
+                    message: "Bootstrap admission reservation is no longer active.",
+                    retryable: false,
+                    retryAfterMs: 0,
+                    phase: sealed ? "sealed" : "quiescing",
+                  });
+                }
+                if (sealed) {
+                  return yield* new OrchestrationNotReadyError({
+                    message: "Orchestration engine is sealed.",
+                    retryable: false,
+                    retryAfterMs: 0,
+                    phase: "sealed",
+                  });
+                }
+                if (!Equal.equals(command, reservedCommand)) {
+                  return yield* new OrchestrationNotReadyError({
+                    message: "Bootstrap reservation only accepts its exact command.",
+                    retryable: false,
+                    retryAfterMs: 0,
+                    phase: "quiescing",
+                  });
+                }
+                const deferred = yield* Deferred.make<
+                  { sequence: number },
+                  OrchestrationDispatchError
+                >();
+                const envelope = {
+                  _tag: "command",
+                  command,
+                  maintenanceAcceptance: { generation: 0 },
+                  maintenanceReservation: ownedMaintenanceReservation,
+                  result: deferred,
+                  startedAtMs: yield* Clock.currentTimeMillis,
+                } satisfies CommandEnvelope;
+                yield* Effect.gen(function* () {
+                  pendingCommands.add(envelope);
+                  yield* Queue.offer(commandQueue, envelope);
+                  enqueued = true;
+                }).pipe(Effect.uninterruptible);
+                return deferred;
+              }),
+            );
+            return yield* Deferred.await(result);
+          });
+        return { dispatch, cancel } satisfies OrchestrationHotAdmissionReservation;
+      }).pipe(
+        Scope.provide(reservationScope),
+        Effect.onExit((exit) =>
+          Exit.isFailure(exit) ? Scope.close(reservationScope, exit) : Effect.void,
+        ),
+      );
     });
   const closeExternalAdmission: OrchestrationEngineShape["closeExternalAdmission"] =
     admissionLock.withPermits(1)(
@@ -715,10 +729,15 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     yield* Effect.forEach(snapshot.stops, (envelope) =>
       Deferred.succeed(envelope.completed, undefined),
     );
-    yield* Effect.forEach(snapshot.maintenanceReservations, (reservation) => reservation.cancel);
     yield* Queue.shutdown(commandQueue);
     yield* PubSub.shutdown(eventPubSub);
+    yield* Effect.forEach(snapshot.maintenanceReservations, (reservation) =>
+      reservation.cancel.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
   }).pipe(Effect.uninterruptible);
+  const awaitStopped: OrchestrationEngineShape["awaitStopped"] = Fiber.await(workerFiber).pipe(
+    Effect.asVoid,
+  );
 
   return {
     readEvents,
@@ -731,6 +750,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     barrier,
     sealAndStop,
     forceStop,
+    awaitStopped,
     isSealed: Effect.sync(() => sealed),
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (wsServer, ProviderRuntimeIngestion, CheckpointReactor, etc.)

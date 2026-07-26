@@ -91,6 +91,9 @@ export interface OrchestrationEngineShape {
   /** Immediately seals admission and tears down worker transports without an in-band queue stop. */
   readonly forceStop: Effect.Effect<void, never, never>;
 
+  /** Resolves once the command worker has actually terminated. */
+  readonly awaitStopped: Effect.Effect<void, never, never>;
+
   readonly isSealed: Effect.Effect<boolean, never, never>;
 
   /**

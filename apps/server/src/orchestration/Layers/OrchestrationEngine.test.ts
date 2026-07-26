@@ -19,6 +19,7 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -47,7 +48,10 @@ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts"
 import { ServerConfig } from "../../config.ts";
 import { OrchestrationCommandInvariantError } from "../Errors.ts";
 import * as UpdateMaintenanceGate from "../UpdateMaintenanceGate.ts";
-import type { UpdateMaintenanceGateService } from "../UpdateMaintenanceGate.ts";
+import type {
+  UpdateDispatchReservation,
+  UpdateMaintenanceGateService,
+} from "../UpdateMaintenanceGate.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
@@ -687,6 +691,16 @@ describe("OrchestrationEngine", () => {
     );
     expect(barrierFiber.pollUnsafe()).toBeUndefined();
 
+    await expect(
+      system.run(
+        reservation.dispatch({
+          ...reservedTurnCommand,
+          message: { ...reservedTurnCommand.message, text: "different command" },
+        }),
+      ),
+    ).rejects.toThrow("exact command");
+    expect(barrierFiber.pollUnsafe()).toBeUndefined();
+
     const dispatched = await system.run(reservation.dispatch(reservedTurnCommand));
     await system.run(Fiber.join(updateFiber));
     await system.run(system.maintenanceGate.release);
@@ -706,6 +720,205 @@ describe("OrchestrationEngine", () => {
     expect(cancelledBarrier.pollUnsafe()).toBeUndefined();
     await system.run(cancelledReservation.cancel);
     await system.run(Fiber.join(cancelledBarrier));
+    await system.dispose();
+  });
+
+  it("releases engine admission when bootstrap reservation is interrupted behind maintenance", async () => {
+    const system = await createOrchestrationSystem();
+    const command = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-bootstrap-interrupted-maintenance"),
+      threadId: ThreadId.make("thread-bootstrap-interrupted-maintenance"),
+      message: {
+        messageId: asMessageId("msg-bootstrap-interrupted-maintenance"),
+        role: "user",
+        text: "interrupted",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+    const acceptance = await system.run(system.maintenanceGate.ensureDispatchAllowed(command));
+    const maintenanceEntered = Deferred.makeUnsafe<void>();
+    const releaseMaintenance = Deferred.makeUnsafe<void>();
+    const maintenanceFiber = await system.run(
+      system.maintenanceGate
+        .withDispatchAllowed(
+          command,
+          acceptance,
+          Deferred.succeed(maintenanceEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseMaintenance)),
+          ),
+        )
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(maintenanceEntered));
+
+    const reservationFiber = await system.run(
+      system.engine
+        .reserveExternalHotAdmission(command)
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Effect.yieldNow);
+    const barrierFiber = await system.run(
+      system.engine.barrier.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    expect(barrierFiber.pollUnsafe()).toBeUndefined();
+
+    reservationFiber.interruptUnsafe();
+    await system.run(Fiber.await(reservationFiber));
+    await system.run(Deferred.succeed(releaseMaintenance, undefined));
+    await system.run(Fiber.join(maintenanceFiber));
+    await expect(system.run(Fiber.join(barrierFiber))).resolves.toEqual({ sequence: 0 });
+    await expect(system.run(system.maintenanceGate.acquire)).resolves.toMatchObject({
+      pid: process.pid,
+    });
+    await system.run(system.maintenanceGate.release);
+    await system.dispose();
+  });
+
+  it("releases both admissions when interrupted at maintenance reservation completion", async () => {
+    const reservationCompleting = Deferred.makeUnsafe<void>();
+    const allowReservationCompletion = Deferred.makeUnsafe<void>();
+    const reservationCancelled = Deferred.makeUnsafe<void>();
+    let maintenanceReservationActive = false;
+    const cancelMaintenanceReservation = Effect.sync(() => {
+      maintenanceReservationActive = false;
+    }).pipe(Effect.andThen(Deferred.succeed(reservationCancelled, undefined)));
+    const maintenanceReservation: UpdateDispatchReservation = {
+      withDispatchAllowed: (_command, effect) =>
+        effect.pipe(Effect.ensuring(cancelMaintenanceReservation)),
+      cancel: cancelMaintenanceReservation,
+    };
+    const gateService: UpdateMaintenanceGateService = {
+      acquire: Effect.suspend(() =>
+        maintenanceReservationActive
+          ? Deferred.await(reservationCancelled).pipe(
+              Effect.as({ pid: process.pid, token: "test-maintenance-token" }),
+            )
+          : Effect.succeed({ pid: process.pid, token: "test-maintenance-token" }),
+      ),
+      release: Effect.void,
+      isHeld: Effect.succeed(false),
+      ensureDispatchAllowed: () => Effect.succeed({ generation: 0 }),
+      reserveDispatchAllowed: (_command, ownerScope) =>
+        Effect.gen(function* () {
+          maintenanceReservationActive = true;
+          yield* Scope.addFinalizer(ownerScope, cancelMaintenanceReservation);
+          yield* Deferred.succeed(reservationCompleting, undefined);
+          yield* Deferred.await(allowReservationCompletion);
+          return maintenanceReservation;
+        }).pipe(Effect.uninterruptible),
+      withDispatchAllowed: (_command, _acceptance, effect) => effect,
+    };
+    const system = await createOrchestrationSystem(gateService);
+    const command = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-bootstrap-interrupted-completion"),
+      threadId: ThreadId.make("thread-bootstrap-interrupted-completion"),
+      message: {
+        messageId: asMessageId("msg-bootstrap-interrupted-completion"),
+        role: "user",
+        text: "interrupted",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+
+    const reservationFiber = await system.run(
+      system.engine
+        .reserveExternalHotAdmission(command)
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(reservationCompleting).pipe(Effect.timeout("2 seconds")));
+    reservationFiber.interruptUnsafe();
+    await system.run(Deferred.succeed(allowReservationCompletion, undefined));
+    await system.run(Fiber.await(reservationFiber).pipe(Effect.timeout("2 seconds")));
+    await system.run(Deferred.await(reservationCancelled).pipe(Effect.timeout("2 seconds")));
+    await expect(
+      system.run(system.engine.barrier.pipe(Effect.timeout("2 seconds"))),
+    ).resolves.toEqual({ sequence: 0 });
+    await expect(
+      system.run(system.maintenanceGate.acquire.pipe(Effect.timeout("2 seconds"))),
+    ).resolves.toMatchObject({ pid: process.pid });
+    await system.dispose();
+  });
+
+  it("keeps maintenance reserved after an enqueued bootstrap caller is interrupted", async () => {
+    const projectionEntered = Deferred.makeUnsafe<void>();
+    const allowProjection = Deferred.makeUnsafe<void>();
+    const pipeline: OrchestrationProjectionPipelineShape = {
+      bootstrap: Effect.void,
+      projectEvent: (event) =>
+        event.type === "thread.turn-start-requested"
+          ? Deferred.succeed(projectionEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(allowProjection)),
+            )
+          : Effect.void,
+    };
+    const system = await createOrchestrationSystem(null, pipeline);
+    const projectId = asProjectId("project-bootstrap-interrupted-after-enqueue");
+    const threadId = ThreadId.make("thread-bootstrap-interrupted-after-enqueue");
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-bootstrap-interrupted-after-enqueue-project"),
+        projectId,
+        title: "Interrupted bootstrap",
+        workspaceRoot: "/tmp/project-bootstrap-interrupted-after-enqueue",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-bootstrap-interrupted-after-enqueue-thread"),
+        threadId,
+        projectId,
+        title: "Interrupted bootstrap",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    const command = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-bootstrap-interrupted-after-enqueue-start"),
+      threadId,
+      message: {
+        messageId: asMessageId("msg-bootstrap-interrupted-after-enqueue"),
+        role: "user",
+        text: "persist me",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+    const reservation = await system.run(system.engine.reserveExternalHotAdmission(command));
+    const dispatchFiber = await system.run(
+      reservation
+        .dispatch(command)
+        .pipe(Effect.ensuring(reservation.cancel), Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(projectionEntered));
+    dispatchFiber.interruptUnsafe();
+    await system.run(Fiber.await(dispatchFiber));
+
+    const updateFiber = await system.run(
+      system.maintenanceGate.acquire.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Effect.yieldNow);
+    expect(updateFiber.pollUnsafe()).toBeUndefined();
+    await system.run(Deferred.succeed(allowProjection, undefined));
+    await system.run(Fiber.join(updateFiber));
+    await system.run(system.maintenanceGate.release);
     await system.dispose();
   });
 
@@ -868,6 +1081,48 @@ describe("OrchestrationEngine", () => {
       ),
     ).rejects.toMatchObject({ phase: "sealed" });
     await system.run(Deferred.succeed(allowProjection, undefined));
+    await system.dispose();
+  });
+
+  it("force-stops without awaiting a stuck maintenance reservation cancellation", async () => {
+    const gateService: UpdateMaintenanceGateService = {
+      acquire: Effect.succeed({ pid: process.pid, token: "test-maintenance-token" }),
+      release: Effect.void,
+      isHeld: Effect.succeed(false),
+      ensureDispatchAllowed: () => Effect.succeed({ generation: 0 }),
+      reserveDispatchAllowed: (_command, ownerScope) => {
+        const reservation: UpdateDispatchReservation = {
+          withDispatchAllowed: (_command, effect) => effect,
+          cancel: Effect.never,
+        };
+        return Scope.addFinalizer(ownerScope, reservation.cancel).pipe(Effect.as(reservation));
+      },
+      withDispatchAllowed: (_command, _acceptance, effect) => effect,
+    };
+    const system = await createOrchestrationSystem(gateService);
+    const command = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-force-stop-stuck-reservation"),
+      threadId: ThreadId.make("thread-force-stop-stuck-reservation"),
+      message: {
+        messageId: asMessageId("msg-force-stop-stuck-reservation"),
+        role: "user",
+        text: "stuck reservation",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+    await system.run(system.engine.reserveExternalHotAdmission(command));
+
+    await expect(
+      system.run(system.engine.forceStop.pipe(Effect.timeout("250 millis"))),
+    ).resolves.toBeUndefined();
+    await expect(
+      system.run(system.engine.awaitStopped.pipe(Effect.timeout("250 millis"))),
+    ).resolves.toBeUndefined();
+    expect(await system.run(system.engine.isSealed)).toBe(true);
     await system.dispose();
   });
 
