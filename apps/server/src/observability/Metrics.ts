@@ -71,6 +71,10 @@ export const eventLoopDelay = Metric.histogram("t3_event_loop_delay_ms", {
   boundaries: [5, 10, 25, 50, 100, 250, 500, 1_000, 2_000],
 });
 
+export const eventLoopHealthy = Metric.gauge("t3_event_loop_healthy", {
+  description: "Whether the most recent event-loop delay sample is within the health threshold.",
+});
+
 export const canonicalLoggerDuration = Metric.timer("t3_canonical_logger_duration", {
   description: "Time spent serializing and submitting canonical provider log records.",
 });
@@ -80,11 +84,11 @@ export const canonicalLoggerBytesTotal = Metric.counter("t3_canonical_logger_byt
 });
 
 export const providerOutputBytesTotal = Metric.counter("t3_provider_output_bytes_total", {
-  description: "Provider output bytes observed per turn.",
+  description: "Provider output bytes observed, grouped by bounded stream dimensions.",
 });
 
 export const providerOutputEventsTotal = Metric.counter("t3_provider_output_events_total", {
-  description: "Provider output events observed per turn.",
+  description: "Provider output events observed, grouped by bounded stream dimensions.",
 });
 
 export const healthProbeDuration = Metric.timer("t3_health_probe_duration", {

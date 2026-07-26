@@ -11,6 +11,7 @@ import {
   recoveryAttachmentUnavailableDetail,
 } from "./threadRecoveryAttachments";
 import {
+  RECOVERY_PARTIAL_OUTPUT_NOTICE,
   recoveryRetryUnavailableDetail,
   type ThreadRecoveryPresentation,
 } from "./threadRecoveryPresentation";
@@ -172,6 +173,9 @@ export function ThreadRecoveryNotice(props: {
           </Text>
           <Text className="text-sm leading-normal text-foreground-secondary">
             {props.presentation.detail}
+          </Text>
+          <Text className="text-sm leading-normal text-foreground-secondary">
+            {RECOVERY_PARTIAL_OUTPUT_NOTICE}
           </Text>
           <View className="mt-1 gap-0.5">
             <Text className="text-xs text-foreground-muted">

@@ -1,7 +1,6 @@
 import {
   EnvironmentId,
   EventId,
-  ORCHESTRATION_WS_METHODS,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -20,6 +19,8 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
 
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
+import { makeSubscribeThreadTestRpcClient } from "../test/rpcClient.ts";
+import { makeTestServerConfig } from "../test/serverConfig.ts";
 import {
   AVAILABLE_CONNECTION_STATE,
   PrimaryConnectionTarget,
@@ -108,9 +109,10 @@ function testSession(
   return {
     client,
     initialConfig: Effect.succeed({
+      ...makeTestServerConfig(TARGET.environmentId),
       ...(options?.completionMarker === true ? { threadResumeCompletionMarker: true } : {}),
       ...(options?.recoveryEvents === true ? { threadRecoveryEventsV1: true } : {}),
-    } as never),
+    }),
     ready: Effect.void,
     probe: Effect.void,
     closed: Effect.never,
@@ -155,29 +157,24 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
         input instanceof Error ? Effect.fail(input) : Effect.succeed(input),
       ),
     );
-  const client = {
-    [ORCHESTRATION_WS_METHODS.subscribeThread]: (input: {
-      readonly afterSequence?: number;
-      readonly requestCompletionMarker?: boolean;
-      readonly threadRecoveryEventsV1?: boolean;
-    }) =>
-      Stream.unwrap(
-        Ref.updateAndGet(subscriptionCount, (count) => count + 1).pipe(
-          Effect.andThen(Ref.set(lastSubscribeAfterSequence, input.afterSequence)),
-          Effect.andThen(Ref.set(lastRequestCompletionMarker, input.requestCompletionMarker)),
-          Effect.andThen(Ref.set(lastThreadRecoveryEventsV1, input.threadRecoveryEventsV1)),
-          Effect.as(streamFrom(inputs)),
-        ),
+  const client = makeSubscribeThreadTestRpcClient((input) =>
+    Stream.unwrap(
+      Ref.updateAndGet(subscriptionCount, (count) => count + 1).pipe(
+        Effect.andThen(Ref.set(lastSubscribeAfterSequence, input.afterSequence)),
+        Effect.andThen(Ref.set(lastRequestCompletionMarker, input.requestCompletionMarker)),
+        Effect.andThen(Ref.set(lastThreadRecoveryEventsV1, input.threadRecoveryEventsV1)),
+        Effect.as(streamFrom(inputs)),
       ),
-  } as unknown as WsRpcProtocolClient;
+    ),
+  );
   const supervisorSession = yield* SubscriptionRef.make<Option.Option<RpcSession.RpcSession>>(
     Option.some(
       testSession(
         client,
         options?.completionMarker === true || options?.recoveryEvents === true
           ? {
-              completionMarker: options.completionMarker,
-              recoveryEvents: options.recoveryEvents,
+              ...(options.completionMarker === true ? { completionMarker: true } : {}),
+              ...(options.recoveryEvents === true ? { recoveryEvents: true } : {}),
             }
           : undefined,
       ),
@@ -265,8 +262,8 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
           client,
           options?.completionMarker === true || options?.recoveryEvents === true
             ? {
-                completionMarker: options.completionMarker,
-                recoveryEvents: options.recoveryEvents,
+                ...(options.completionMarker === true ? { completionMarker: true } : {}),
+                ...(options.recoveryEvents === true ? { recoveryEvents: true } : {}),
               }
             : undefined,
         ),

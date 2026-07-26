@@ -235,6 +235,10 @@ import {
   buildThreadRecoveryPresentation,
   resolveThreadRecoveryRetry,
 } from "../threadRecoveryPresentation";
+import {
+  hydrateRecoveryAttachments,
+  recoveryAttachmentUnavailableMessage,
+} from "../threadRecoveryAttachments";
 import { resolveThreadPr } from "./ThreadStatusIndicators";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import {
@@ -307,19 +311,6 @@ const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
-
-async function fetchRecoveryAttachmentDataUrl(input: {
-  readonly url: string;
-  readonly name: string;
-  readonly mimeType: string;
-}): Promise<string> {
-  const response = await fetch(input.url);
-  if (!response.ok) {
-    throw new Error(`Could not load original attachment (${response.status}).`);
-  }
-  const blob = await response.blob();
-  return readFileAsDataUrl(new File([blob], input.name, { type: input.mimeType }));
-}
 
 function useDraftHeroLayoutTransition(isDraftHeroState: boolean) {
   const transitionGroupRef = useRef<HTMLDivElement | null>(null);
@@ -2197,19 +2188,13 @@ function ChatViewContent(props: ChatViewProps) {
     setThreadError(threadIdForRetry, null);
 
     try {
-      const attachments = await Promise.all(
-        recoveryRetry.attachments.map(async ({ attachment, url }) => ({
-          type: "image" as const,
-          name: attachment.name,
-          mimeType: attachment.mimeType,
-          sizeBytes: attachment.sizeBytes,
-          dataUrl: await fetchRecoveryAttachmentDataUrl({
-            url,
-            name: attachment.name,
-            mimeType: attachment.mimeType,
-          }),
-        })),
-      );
+      const hydration = await hydrateRecoveryAttachments({
+        sources: recoveryRetry.attachments,
+      });
+      if (hydration.kind === "unavailable") {
+        throw new Error(recoveryAttachmentUnavailableMessage(hydration));
+      }
+      const attachments = hydration.attachments;
       const optimisticAttachments = recoveryRetry.attachments.map(({ attachment, url }) => ({
         ...attachment,
         previewUrl: url,

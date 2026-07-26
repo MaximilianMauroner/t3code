@@ -127,7 +127,7 @@ describe("EventNdjsonLogger", () => {
           }
 
           yield* logger.write({ id: "evt-no-thread" }, null);
-          yield* logger.write({ id: "evt-invalid-thread" }, "!!!" as unknown as ThreadId);
+          yield* logger.write({ id: "evt-invalid-thread" }, ThreadId.make("!!!"));
           yield* logger.close();
 
           const globalPath = NodePath.join(tempDir, "_global.log");
@@ -191,7 +191,7 @@ describe("EventNdjsonLogger", () => {
     }),
   );
 
-  it.effect("records canonical logger cost and per-turn provider output volume", () =>
+  it.effect("records canonical logger cost and bounded provider output volume", () =>
     Effect.gen(function* () {
       const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-log-"));
       const basePath = NodePath.join(tempDir, "provider-canonical.ndjson");
@@ -222,15 +222,22 @@ describe("EventNdjsonLogger", () => {
         assert.equal(
           has("t3_provider_output_events_total", {
             stream: "canonical",
-            turnId: "turn-metrics",
           }),
           true,
         );
         assert.equal(
           has("t3_provider_output_bytes_total", {
             stream: "canonical",
-            turnId: "turn-metrics",
           }),
+          true,
+        );
+        const outputSamples = snapshots.filter(
+          (snapshot) =>
+            snapshot.id === "t3_provider_output_events_total" ||
+            snapshot.id === "t3_provider_output_bytes_total",
+        );
+        assert.equal(
+          outputSamples.every((snapshot) => snapshot.attributes?.turnId === undefined),
           true,
         );
         assert.equal(has("t3_canonical_logger_duration", { stream: "canonical" }), true);

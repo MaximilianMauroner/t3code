@@ -5,6 +5,9 @@ import {
 } from "@t3tools/client-runtime/state/threads";
 import type { OrchestrationThread } from "@t3tools/contracts";
 
+export const RECOVERY_PARTIAL_OUTPUT_NOTICE =
+  "Partial output is preserved in the conversation below.";
+
 export interface ThreadRecoveryPresentation {
   readonly kind: "turn-interrupted" | "start-interrupted" | "stale-runtime";
   readonly title: string;

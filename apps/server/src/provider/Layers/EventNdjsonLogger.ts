@@ -97,11 +97,6 @@ function resolveStreamLabel(stream: EventNdjsonStream): string {
   }
 }
 
-function resolveTurnId(event: unknown): string {
-  if (typeof event !== "object" || event === null || !("turnId" in event)) return "unknown";
-  return typeof event.turnId === "string" && event.turnId !== "" ? event.turnId : "unknown";
-}
-
 const toLogMessage = Effect.fn("toLogMessage")(function* (
   event: unknown,
 ): Effect.fn.Return<string | undefined> {
@@ -277,7 +272,6 @@ export const makeEventNdjsonLogger = Effect.fn("makeEventNdjsonLogger")(function
     const bytes = Buffer.byteLength(message, "utf8");
     const attributes = metricAttributes({
       stream: options.stream,
-      turnId: resolveTurnId(event),
     });
     yield* Metric.update(Metric.withAttributes(providerOutputEventsTotal, attributes), 1);
     yield* Metric.update(Metric.withAttributes(providerOutputBytesTotal, attributes), bytes);

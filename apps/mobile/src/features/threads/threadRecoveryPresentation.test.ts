@@ -8,7 +8,10 @@ import {
   type OrchestrationThread,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
-import { resolveThreadRecoveryPresentation } from "./threadRecoveryPresentation";
+import {
+  RECOVERY_PARTIAL_OUTPUT_NOTICE,
+  resolveThreadRecoveryPresentation,
+} from "./threadRecoveryPresentation";
 
 const TURN_ID = TurnId.make("turn-1");
 const SOURCE_ID = MessageId.make("source-message");
@@ -95,6 +98,12 @@ function thread(input: Partial<OrchestrationThread> = {}): OrchestrationThread {
 }
 
 describe("resolveThreadRecoveryPresentation", () => {
+  it("provides explicit preserved-output copy for the accessible recovery notice", () => {
+    expect(RECOVERY_PARTIAL_OUTPUT_NOTICE).toBe(
+      "Partial output is preserved in the conversation below.",
+    );
+  });
+
   it("uses turn-owned reason and distinct execution/detection evidence", () => {
     expect(resolveThreadRecoveryPresentation(thread())).toMatchObject({
       kind: "turn-interrupted",

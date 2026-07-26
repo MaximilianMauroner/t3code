@@ -1,6 +1,5 @@
 import {
   EnvironmentId,
-  ORCHESTRATION_WS_METHODS,
   type OrchestrationReplayEventsInput,
   type RelayClientInstallProgressEvent,
   WS_METHODS,
@@ -27,6 +26,8 @@ import {
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
+import { makeReplayEventsTestRpcClient } from "../test/rpcClient.ts";
+import { makeTestServerConfig } from "../test/serverConfig.ts";
 import {
   EnvironmentRpcRequestObserver,
   replayOrchestrationEvents,
@@ -88,18 +89,18 @@ describe("environment RPC", () => {
   it.effect("independently negotiates recovery events for raw replay", () =>
     Effect.gen(function* () {
       const inputs: OrchestrationReplayEventsInput[] = [];
-      const client = {
-        [ORCHESTRATION_WS_METHODS.replayEvents]: (input: OrchestrationReplayEventsInput) => {
-          inputs.push(input);
-          return Effect.succeed([]);
-        },
-      } as WsRpcProtocolClient;
+      const client = makeReplayEventsTestRpcClient((input: OrchestrationReplayEventsInput) => {
+        inputs.push(input);
+        return Effect.succeed([]);
+      });
       const { activeSession, supervisor } = yield* makeHarness();
       yield* SubscriptionRef.set(
         activeSession,
         Option.some({
           ...session(client),
-          initialConfig: Effect.succeed({ threadRecoveryEventsV1: true } as never),
+          initialConfig: Effect.succeed(
+            makeTestServerConfig(TARGET.environmentId, { threadRecoveryEventsV1: true }),
+          ),
         }),
       );
 
@@ -108,7 +109,10 @@ describe("environment RPC", () => {
       );
       yield* SubscriptionRef.set(
         activeSession,
-        Option.some({ ...session(client), initialConfig: Effect.succeed({} as never) }),
+        Option.some({
+          ...session(client),
+          initialConfig: Effect.succeed(makeTestServerConfig(TARGET.environmentId)),
+        }),
       );
       yield* replayOrchestrationEvents(10).pipe(
         Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
