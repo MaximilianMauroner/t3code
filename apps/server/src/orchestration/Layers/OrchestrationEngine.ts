@@ -1,6 +1,5 @@
 import type {
   DispatchableClientOrchestrationCommand,
-  InternalOrchestrationCommand,
   OrchestrationEvent,
   OrchestrationReadModel,
   ProjectId,
@@ -112,6 +111,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const eventPubSub = yield* PubSub.unbounded<OrchestrationEvent>();
   const admissionLock = yield* Semaphore.make(1);
   let sealed = false;
+  let externalAdmissionClosed = false;
 
   const projectEventsOntoReadModel = (
     baseReadModel: OrchestrationReadModel,
@@ -377,7 +377,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive, limit) =>
     eventStore.readFromSequence(fromSequenceExclusive, limit);
 
-  const enqueueCommand = (command: OrchestrationCommand) =>
+  const enqueueCommand = (command: OrchestrationCommand, external: boolean) =>
     admissionLock.withPermits(1)(
       Effect.gen(function* () {
         if (sealed) {
@@ -386,6 +386,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             retryable: false,
             retryAfterMs: 0,
             phase: "sealed",
+          });
+        }
+        if (external && externalAdmissionClosed) {
+          return yield* new OrchestrationNotReadyError({
+            message: "Orchestration is quiescing.",
+            retryable: true,
+            retryAfterMs: 1_000,
+            phase: "quiescing",
           });
         }
         const maintenanceAcceptance = yield* maintenanceGate.ensureDispatchAllowed(command);
@@ -401,13 +409,19 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       }),
     );
 
-  const dispatch: OrchestrationEngineShape["dispatch"] = enqueueCommand;
+  const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
+    enqueueCommand(command, false);
   const dispatchExternal: OrchestrationEngineShape["dispatchExternal"] = (
     command: DispatchableClientOrchestrationCommand,
-  ) => enqueueCommand(command);
-  const dispatchInternal: OrchestrationEngineShape["dispatchInternal"] = (
-    command: InternalOrchestrationCommand,
-  ) => enqueueCommand(command);
+  ) => enqueueCommand(command, true);
+  const dispatchInternal: OrchestrationEngineShape["dispatchInternal"] = (command) =>
+    enqueueCommand(command, false);
+  const closeExternalAdmission: OrchestrationEngineShape["closeExternalAdmission"] =
+    admissionLock.withPermits(1)(
+      Effect.sync(() => {
+        externalAdmissionClosed = true;
+      }),
+    );
   const barrier: OrchestrationEngineShape["barrier"] = admissionLock.withPermits(1)(
     Effect.gen(function* () {
       if (sealed) {
@@ -438,6 +452,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     dispatch,
     dispatchExternal,
     dispatchInternal,
+    closeExternalAdmission,
     barrier,
     sealAndStop,
     isSealed: Effect.sync(() => sealed),

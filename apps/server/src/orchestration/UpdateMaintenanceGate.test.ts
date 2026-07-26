@@ -128,6 +128,38 @@ describe("UpdateMaintenanceGate", () => {
     ),
   );
 
+  it.effect("gates archive, checkpoint revert, and delete as hot external commands", () =>
+    withFixture((fixture) =>
+      Effect.gen(function* () {
+        yield* fixture.gate.acquire;
+        const hotCommands: ReadonlyArray<OrchestrationCommand> = [
+          {
+            type: "thread.archive",
+            commandId: CommandId.make("cmd-hot-archive"),
+            threadId: ThreadId.make("thread-hot"),
+          },
+          {
+            type: "thread.checkpoint.revert",
+            commandId: CommandId.make("cmd-hot-checkpoint"),
+            threadId: ThreadId.make("thread-hot"),
+            turnCount: 1,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+          {
+            type: "thread.delete",
+            commandId: CommandId.make("cmd-hot-delete"),
+            threadId: ThreadId.make("thread-hot"),
+          },
+        ];
+        for (const command of hotCommands) {
+          const error = yield* fixture.gate.ensureDispatchAllowed(command).pipe(Effect.flip);
+          expect(error.message).toContain("server update is in progress");
+        }
+        yield* fixture.gate.release;
+      }),
+    ),
+  );
+
   it.effect("rejects an early-accepted queued turn when the update wins the permit", () =>
     withFixture((fixture) =>
       Effect.gen(function* () {

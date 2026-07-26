@@ -685,6 +685,10 @@ const buildAppUnderTest = (options?: {
         Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
           readEvents: () => Stream.empty,
           dispatch: () => Effect.succeed({ sequence: 0 }),
+          dispatchExternal: (command) =>
+            options?.layers?.orchestrationEngine?.dispatchExternal?.(command) ??
+            options?.layers?.orchestrationEngine?.dispatch?.(command) ??
+            Effect.succeed({ sequence: 0 }),
           streamDomainEvents: Stream.empty,
           latestSequence: Effect.succeed(0),
           ...options?.layers?.orchestrationEngine,
@@ -6322,7 +6326,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("stops the provider session and closes thread terminals after archive", () =>
+  it.effect("uses one transport dispatch for archive and leaves cleanup to durable delivery", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-archive");
       const effects: string[] = [];
@@ -6380,20 +6384,15 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
-      const sessionStopCommand = dispatchedCommands[1];
-      assert.equal(sessionStopCommand?.type, "thread.session.stop");
-      if (sessionStopCommand?.type === "thread.session.stop") {
-        assert.equal(sessionStopCommand.threadId, threadId);
-      }
+      assert.deepEqual(effects, ["dispatch:thread.archive"]);
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.archive"],
+      );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("checks session status before archiving removes the thread from active lookups", () =>
+  it.effect("does not perform a transport-side archive precheck", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-archive-precheck");
       const effects: string[] = [];
@@ -6458,15 +6457,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "query:thread-shell:active",
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
+      assert.deepEqual(effects, ["dispatch:thread.archive"]);
       assert.deepEqual(
         dispatchedCommands.map((command) => command.type),
-        ["thread.archive", "thread.session.stop"],
+        ["thread.archive"],
       );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
@@ -6514,7 +6508,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, ["dispatch:thread.archive", `terminal.close:${threadId}`]);
+      assert.deepEqual(effects, ["dispatch:thread.archive"]);
       assert.deepEqual(
         dispatchedCommands.map((command) => command.type),
         ["thread.archive"],
@@ -6582,7 +6576,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         );
 
         assert.equal(dispatchResult.sequence, 1);
-        assert.deepEqual(effects, ["dispatch:thread.archive", `terminal.close:${threadId}`]);
+        assert.deepEqual(effects, ["dispatch:thread.archive"]);
         assert.deepEqual(
           dispatchedCommands.map((command) => command.type),
           ["thread.archive"],
@@ -6590,7 +6584,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("archives and still closes terminals when session stop fails", () =>
+  it.effect("archive commit is independent of obsolete transport cleanup failures", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-archive-stop-failure");
       const effects: string[] = [];
@@ -6655,19 +6649,15 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
+      assert.deepEqual(effects, ["dispatch:thread.archive"]);
       assert.deepEqual(
         dispatchedCommands.map((command) => command.type),
-        ["thread.archive", "thread.session.stop"],
+        ["thread.archive"],
       );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("archives and still closes terminals when session stop defects", () =>
+  it.effect("archive transport does not run a second defect-prone dispatch", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-archive-stop-defect");
       const effects: string[] = [];
@@ -6727,14 +6717,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
+      assert.deepEqual(effects, ["dispatch:thread.archive"]);
       assert.deepEqual(
         dispatchedCommands.map((command) => command.type),
-        ["thread.archive", "thread.session.stop"],
+        ["thread.archive"],
       );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );

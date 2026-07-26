@@ -12,7 +12,6 @@
  */
 import type {
   DispatchableClientOrchestrationCommand,
-  InternalOrchestrationCommand,
   OrchestrationCommand,
   OrchestrationEvent,
 } from "@t3tools/contracts";
@@ -60,8 +59,11 @@ export interface OrchestrationEngineShape {
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   readonly dispatchInternal: (
-    command: InternalOrchestrationCommand,
+    command: OrchestrationCommand,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  /** Linearizably rejects new external commands while preserving internal recovery dispatch. */
+  readonly closeExternalAdmission?: Effect.Effect<void, never, never>;
 
   /** Resolves after all earlier envelopes have committed and planned deliveries are durable. */
   readonly barrier: Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;

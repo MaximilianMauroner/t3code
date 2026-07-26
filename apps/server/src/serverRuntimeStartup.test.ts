@@ -70,6 +70,56 @@ it.effect("enqueueCommand fails queued work when readiness fails", () =>
   ),
 );
 
+it.effect("an interrupted queued request is removed and never executes later", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const executionCount = yield* Ref.make(0);
+      const commandGate = yield* ServerRuntimeStartup.makeCommandGate;
+      const fiber = yield* commandGate
+        .enqueueCommand(
+          Ref.update(executionCount, (count) => count + 1),
+          {
+            requestId: "request-disconnected",
+            connectionId: "connection-closed",
+          },
+        )
+        .pipe(Effect.forkScoped);
+
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(fiber);
+      yield* commandGate.signalCommandReady;
+      yield* Effect.yieldNow;
+
+      assert.equal(yield* Ref.get(executionCount), 0);
+    }),
+  ),
+);
+
+it.effect("bounds the startup queue at one hundred pending requests", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const commandGate = yield* ServerRuntimeStartup.makeCommandGate;
+      yield* Effect.forEach(
+        Array.from({ length: 100 }, (_, index) => index),
+        (index) =>
+          commandGate
+            .enqueueCommand(Effect.never, { requestId: `queued-${index}` })
+            .pipe(Effect.forkScoped),
+        { discard: true },
+      );
+      yield* Effect.yieldNow;
+
+      const error = yield* Effect.flip(
+        commandGate.enqueueCommand(Effect.void, { requestId: "queue-overflow" }),
+      );
+      assert.equal(error._tag, "orchestration_not_ready");
+      if (error._tag === "orchestration_not_ready") {
+        assert.equal(error.phase, "starting");
+      }
+    }),
+  ),
+);
+
 it.effect("launchStartupHeartbeat does not block the caller while counts are loading", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -167,6 +217,12 @@ it.effect("resolveAutoBootstrapWelcomeTargets returns existing project and threa
           Ref.update(dispatchCalls, (calls) => [...calls, command.type]).pipe(
             Effect.as({ sequence: 1 }),
           ),
+        dispatchExternal: () => Effect.die("unused"),
+        dispatchInternal: () => Effect.die("unused"),
+        closeExternalAdmission: Effect.void,
+        barrier: Effect.succeed({ sequence: 0 }),
+        sealAndStop: Effect.void,
+        isSealed: Effect.succeed(false),
         streamDomainEvents: Stream.empty,
         latestSequence: Effect.succeed(0),
       } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
@@ -211,6 +267,12 @@ it.effect("resolveAutoBootstrapWelcomeTargets creates a project and thread when 
           Ref.update(dispatchCalls, (calls) => [...calls, command.type]).pipe(
             Effect.as({ sequence: 1 }),
           ),
+        dispatchExternal: () => Effect.die("unused"),
+        dispatchInternal: () => Effect.die("unused"),
+        closeExternalAdmission: Effect.void,
+        barrier: Effect.succeed({ sequence: 0 }),
+        sealAndStop: Effect.void,
+        isSealed: Effect.succeed(false),
         streamDomainEvents: Stream.empty,
         latestSequence: Effect.succeed(0),
       } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
@@ -261,6 +323,12 @@ it.effect("resolveAutoBootstrapWelcomeTargets preserves typed UUID generation fa
           Ref.update(dispatchCalls, (calls) => [...calls, command.type]).pipe(
             Effect.as({ sequence: 1 }),
           ),
+        dispatchExternal: () => Effect.die("unused"),
+        dispatchInternal: () => Effect.die("unused"),
+        closeExternalAdmission: Effect.void,
+        barrier: Effect.succeed({ sequence: 0 }),
+        sealAndStop: Effect.void,
+        isSealed: Effect.succeed(false),
         streamDomainEvents: Stream.empty,
         latestSequence: Effect.succeed(0),
       } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),

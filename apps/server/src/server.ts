@@ -49,6 +49,9 @@ import { ProviderRuntimeIngestionLive } from "./orchestration/Layers/ProviderRun
 import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderCommandReactor.ts";
 import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.ts";
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
+import { OrchestrationDeliveryRuntimeLive } from "./orchestration/Layers/OrchestrationDeliveryRuntime.ts";
+import { OrphanTurnReconcilerLive } from "./orchestration/Layers/OrphanTurnReconciler.ts";
+import { ShutdownCoordinatorLive } from "./orchestration/Layers/ShutdownCoordinator.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
@@ -84,6 +87,7 @@ import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ForkUpdate from "./cloud/forkUpdate.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
+import * as OutputPressureMonitor from "./diagnostics/OutputPressureMonitor.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import {
@@ -165,6 +169,9 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ProviderCommandReactorLive),
   Layer.provideMerge(CheckpointReactorLive),
   Layer.provideMerge(ThreadDeletionReactorLive),
+  Layer.provideMerge(OrchestrationDeliveryRuntimeLive),
+  Layer.provideMerge(OrphanTurnReconcilerLive),
+  Layer.provideMerge(ShutdownCoordinatorLive),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(RuntimeReceiptBusLive),
 );
@@ -339,6 +346,7 @@ const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
   // Misc.
   Layer.provideMerge(ProcessDiagnostics.layer),
   Layer.provideMerge(ProcessResourceMonitor.layer),
+  Layer.provideMerge(OutputPressureMonitor.layer),
   Layer.provideMerge(TraceDiagnostics.layer),
   Layer.provideMerge(AnalyticsService.layer),
   Layer.provideMerge(ExternalLauncher.layer),

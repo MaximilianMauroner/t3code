@@ -3,6 +3,8 @@ import {
   AuthAdministrativeScopes,
   EnvironmentHttpApi,
   EnvironmentHttpCommonError,
+  EnvironmentOrchestrationNotReadyError,
+  OrchestrationNotReadyPhase,
   type OrchestrationReadModel,
   ProjectId,
   type ClientOrchestrationCommand,
@@ -51,6 +53,7 @@ type ProjectCliDispatchCommand = Extract<
 >;
 
 const isEnvironmentHttpCommonError = Schema.is(EnvironmentHttpCommonError);
+const isEnvironmentOrchestrationNotReadyError = Schema.is(EnvironmentOrchestrationNotReadyError);
 
 export class ProjectCommandIdGenerationError extends Schema.TaggedErrorClass<ProjectCommandIdGenerationError>()(
   "ProjectCommandIdGenerationError",
@@ -88,6 +91,22 @@ export class ProjectLiveServerUndeclaredStatusError extends Schema.TaggedErrorCl
 ) {
   override get message(): string {
     return `Server request failed with undeclared status ${this.status}.`;
+  }
+}
+
+export class ProjectOrchestrationNotReadyError extends Schema.TaggedErrorClass<ProjectOrchestrationNotReadyError>()(
+  "ProjectOrchestrationNotReadyError",
+  {
+    operation: Schema.Literal("callLiveServer"),
+    code: Schema.Literal("orchestration_not_ready"),
+    retryable: Schema.Boolean,
+    retryAfterMs: Schema.Number,
+    phase: OrchestrationNotReadyPhase,
+    traceId: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Server orchestration is ${this.phase}; retry after ${this.retryAfterMs}ms.`;
   }
 }
 
@@ -159,6 +178,7 @@ export const ProjectCommandError = Schema.Union([
   ProjectCommandIdGenerationError,
   ProjectLiveServerDeclaredResponseError,
   ProjectLiveServerUndeclaredStatusError,
+  ProjectOrchestrationNotReadyError,
   ProjectLiveServerRequestError,
   ProjectTitleEmptyError,
   ProjectIdentifierEmptyError,
@@ -168,6 +188,16 @@ export const ProjectCommandError = Schema.Union([
 export type ProjectCommandError = typeof ProjectCommandError.Type;
 
 export function projectCommandErrorFromLiveServerRequest(cause: unknown): ProjectCommandError {
+  if (isEnvironmentOrchestrationNotReadyError(cause)) {
+    return new ProjectOrchestrationNotReadyError({
+      operation: "callLiveServer",
+      code: cause.code,
+      retryable: cause.retryable,
+      retryAfterMs: cause.retryAfterMs,
+      phase: cause.phase,
+      traceId: cause.traceId,
+    });
+  }
   if (isEnvironmentHttpCommonError(cause)) {
     return new ProjectLiveServerDeclaredResponseError({
       operation: "callLiveServer",
@@ -423,7 +453,7 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
       const output = yield* run({
         snapshot,
-        dispatch: (command) => orchestrationEngine.dispatch(command),
+        dispatch: (command) => orchestrationEngine.dispatchExternal(command),
         mode: "offline",
       });
       yield* Console.log(output);

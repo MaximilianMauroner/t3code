@@ -408,6 +408,24 @@ describe("OrchestrationEngine", () => {
     expect(pending).toHaveLength(1);
     expect(pending[0]?.deliveryKind).toBe("turn-start");
 
+    await system.run(system.engine.closeExternalAdmission ?? Effect.void);
+    await expect(
+      system.run(
+        system.engine.dispatchExternal({
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-during-quiesce"),
+          threadId,
+        }),
+      ),
+    ).rejects.toMatchObject({ _tag: "orchestration_not_ready", phase: "quiescing" });
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.archive",
+        commandId: CommandId.make("cmd-internal-during-quiesce"),
+        threadId,
+      }),
+    );
+
     await system.run(system.engine.sealAndStop);
     expect(await system.run(system.engine.isSealed)).toBe(true);
     await expect(

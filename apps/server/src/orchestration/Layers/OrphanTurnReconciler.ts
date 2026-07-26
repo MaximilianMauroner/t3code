@@ -302,6 +302,13 @@ const make = Effect.gen(function* () {
       Effect.forkScoped,
       Effect.asVoid,
     );
+  const reconcileStartup: OrphanTurnReconcilerShape["reconcileStartup"] = Effect.gen(function* () {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (attempt > 0) yield* Effect.sleep(SWEEP_INTERVAL);
+      yield* runSweep("server-restarted");
+      if ((yield* collectCandidates()).length === 0) return;
+    }
+  });
   const snapshotAndInterrupt: OrphanTurnReconcilerShape["snapshotAndInterrupt"] = () =>
     collectCandidates().pipe(
       Effect.flatMap((candidates) =>
@@ -317,7 +324,7 @@ const make = Effect.gen(function* () {
 
   return {
     sweep,
-    reconcileStartup: runSweep("server-restarted"),
+    reconcileStartup,
     snapshotAndInterrupt,
     startPeriodic,
   } satisfies OrphanTurnReconcilerShape;

@@ -12,6 +12,7 @@ import * as Semaphore from "effect/Semaphore";
 
 import * as ServerConfig from "../config.ts";
 import { OrchestrationCommandInvariantError } from "./Errors.ts";
+import { classifyExternalCommand } from "./externalCommandClassification.ts";
 
 export interface UpdateDispatchAcceptance {
   readonly generation: number;
@@ -188,8 +189,23 @@ export const make = Effect.gen(function* () {
       commandType: command.type,
       detail: "A server update is in progress; new turns are temporarily paused.",
     });
+  const isHotExternalCommand = (command: OrchestrationCommand): boolean => {
+    switch (command.type) {
+      case "thread.session.set":
+      case "thread.message.assistant.delta":
+      case "thread.message.assistant.complete":
+      case "thread.proposed-plan.upsert":
+      case "thread.turn.diff.complete":
+      case "thread.activity.append":
+      case "thread.revert.complete":
+      case "thread.session.interrupt-if-active":
+        return false;
+      default:
+        return classifyExternalCommand(command) === "hot";
+    }
+  };
   const ensureDispatchAllowed = (command: OrchestrationCommand) =>
-    command.type !== "thread.turn.start"
+    !isHotExternalCommand(command)
       ? Ref.get(generation).pipe(Effect.map((current) => ({ generation: current })))
       : Effect.gen(function* () {
           if (yield* isHeld) return yield* dispatchError(command);
@@ -200,7 +216,7 @@ export const make = Effect.gen(function* () {
     acceptance,
     effect,
   ) =>
-    command.type !== "thread.turn.start"
+    !isHotExternalCommand(command)
       ? effect
       : semaphore.withPermit(
           Effect.gen(function* () {
