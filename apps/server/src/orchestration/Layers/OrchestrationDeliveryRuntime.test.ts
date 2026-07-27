@@ -42,7 +42,10 @@ import {
   type OrchestrationEngineShape,
 } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
-import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
+import {
+  OrchestrationDeliveryExecutionError,
+  ProviderCommandReactor,
+} from "../Services/ProviderCommandReactor.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import { OrchestrationDeliveryRuntimeLive } from "./OrchestrationDeliveryRuntime.ts";
 import { OrchestrationCommandInvariantError } from "../Errors.ts";
@@ -52,6 +55,14 @@ const threadId = ThreadId.make("thread-1");
 const decodeEvent = Schema.decodeUnknownSync(OrchestrationEvent);
 const decodeNewDelivery = Schema.decodeUnknownSync(NewOrchestrationReactorDelivery);
 const decodeThread = Schema.decodeUnknownSync(OrchestrationThread);
+
+function deliveryFailure(detail: string): OrchestrationDeliveryExecutionError {
+  return new OrchestrationDeliveryExecutionError({
+    reactor: "test",
+    deliveryId: "test-delivery",
+    cause: detail,
+  });
+}
 
 function eventBase(sequence: number, eventId: string) {
   return {
@@ -366,7 +377,7 @@ describe("OrchestrationDeliveryRuntime", () => {
     () =>
       Effect.gen(function* () {
         const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
-          Effect.fail("poison"),
+          Effect.fail(deliveryFailure("poison")),
         );
         const poison = deliveryFor(sessionStopEvent(1, "event-poison"), "prior-boot");
         const follower = deliveryFor(sessionStopEvent(2, "event-follower"), "prior-boot");
@@ -437,7 +448,7 @@ describe("OrchestrationDeliveryRuntime", () => {
   effectIt.effect("keeps startup closed when a poison delivery exhausts its retry budget", () =>
     Effect.gen(function* () {
       const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
-        Effect.fail("poison"),
+        Effect.fail(deliveryFailure("poison")),
       );
       const delivery = deliveryFor(sessionStopEvent(1, "startup-poison"), "prior-boot");
       const exit = yield* Effect.gen(function* () {
@@ -567,7 +578,7 @@ describe("OrchestrationDeliveryRuntime", () => {
         Effect.succeed("delivered" as const),
       );
       const checkpointDeliver = vi.fn<CheckpointReactor["Service"]["deliver"]>(() =>
-        Effect.fail("crashed after provider rollback"),
+        Effect.fail(deliveryFailure("crashed after provider rollback")),
       );
       const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
         () => Effect.succeed({ sequence: 2 }),
@@ -704,7 +715,7 @@ describe("OrchestrationDeliveryRuntime", () => {
   effectIt.effect("reclassifies a stale pending CAS as the exact concrete active turn", () =>
     Effect.gen(function* () {
       const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
-        Effect.fail("provider completion became uncertain"),
+        Effect.fail(deliveryFailure("provider completion became uncertain")),
       );
       let thread: OrchestrationThread = absentSessionThread();
       let probes = 0;
@@ -806,7 +817,7 @@ describe("OrchestrationDeliveryRuntime", () => {
   effectIt.effect("keeps an uncertain turn start non-terminal when liveness is unavailable", () =>
     Effect.gen(function* () {
       const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
-        Effect.fail("provider completion became uncertain"),
+        Effect.fail(deliveryFailure("provider completion became uncertain")),
       );
       const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
         () => Effect.succeed({ sequence: 2 }),
@@ -848,7 +859,7 @@ describe("OrchestrationDeliveryRuntime", () => {
     () =>
       Effect.gen(function* () {
         const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
-          Effect.fail("provider completion became uncertain"),
+          Effect.fail(deliveryFailure("provider completion became uncertain")),
         );
         const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
           () => Effect.succeed({ sequence: 2 }),
@@ -885,7 +896,7 @@ describe("OrchestrationDeliveryRuntime", () => {
         const blockExternalHotAdmission = vi.fn((_: string) => Effect.void);
         const releaseExternalHotAdmissionBlocker = vi.fn((_: string) => Effect.void);
         const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
-          Effect.fail("provider completion became uncertain"),
+          Effect.fail(deliveryFailure("provider completion became uncertain")),
         );
         let sampleCount = 0;
         const delivery = deliveryFor(turnStartEvent(1, "repeated-unknown"), "current-boot");
@@ -942,7 +953,8 @@ describe("OrchestrationDeliveryRuntime", () => {
       }).pipe(
         Effect.provide(
           createLayer({
-            providerDeliver: () => Effect.fail("provider completion became uncertain"),
+            providerDeliver: () =>
+              Effect.fail(deliveryFailure("provider completion became uncertain")),
             thread: absentSessionThread(),
             inspectTarget: () =>
               Effect.succeed({ state: "unknown", reason: "unavailable" } as const),
@@ -964,7 +976,7 @@ describe("OrchestrationDeliveryRuntime", () => {
       Effect.gen(function* () {
         const recoveryCommitted = yield* Deferred.make<void>();
         const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
-          Effect.fail("provider completion became uncertain"),
+          Effect.fail(deliveryFailure("provider completion became uncertain")),
         );
         const delivery = deliveryFor(turnStartEvent(1, "pending-commit-barrier"), "current-boot");
         const result = yield* Effect.gen(function* () {
@@ -1005,7 +1017,7 @@ describe("OrchestrationDeliveryRuntime", () => {
       Effect.gen(function* () {
         let terminalUpdates = 0;
         const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
-          Effect.fail("provider completion became uncertain"),
+          Effect.fail(deliveryFailure("provider completion became uncertain")),
         );
         const delivery = deliveryFor(turnStartEvent(1, "atomic-recovery"), "current-boot");
         const row = yield* Effect.gen(function* () {
@@ -1106,7 +1118,7 @@ describe("OrchestrationDeliveryRuntime", () => {
     () =>
       Effect.gen(function* () {
         const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
-          Effect.fail("provider failed after execution marker"),
+          Effect.fail(deliveryFailure("provider failed after execution marker")),
         );
         const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
           () => Effect.succeed({ sequence: 2 }),
@@ -1197,7 +1209,7 @@ describe("OrchestrationDeliveryRuntime", () => {
     Effect.gen(function* () {
       let closed = 0;
       const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
-        Effect.fail("poison"),
+        Effect.fail(deliveryFailure("poison")),
       );
       const delivery = deliveryFor(sessionStopEvent(1, "same-boot-poison"), "current-boot");
       yield* Effect.gen(function* () {

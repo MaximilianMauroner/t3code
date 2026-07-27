@@ -36,8 +36,8 @@ import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
+  OrchestrationDeliveryExecutionError,
   ProviderCommandReactor,
-  type OrchestrationDeliveryResolution,
   type ProviderCommandReactorShape,
 } from "../Services/ProviderCommandReactor.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -1105,69 +1105,82 @@ const make = Effect.gen(function* () {
   const decodeDeliveryEvent = (delivery: OrchestrationReactorDelivery) =>
     decodeOrchestrationEvent(delivery.payload);
 
-  const deliver: ProviderCommandReactorShape["deliver"] = Effect.fn("deliver")(
-    function* (delivery): Effect.fn.Return<OrchestrationDeliveryResolution, unknown> {
-      const event = yield* decodeDeliveryEvent(delivery);
-      switch (delivery.deliveryKind) {
-        case "runtime-mode-change":
-          if (event.type !== "thread.runtime-mode-set") {
-            return yield* Effect.die(`runtime-mode-change delivery contains ${event.type}`);
-          }
-          yield* Effect.scoped(processDomainEvent(event));
-          return "delivered" as const;
-        case "turn-start":
-          if (event.type !== "thread.turn-start-requested") {
-            return yield* Effect.die(`turn-start delivery contains ${event.type}`);
-          }
-          yield* Effect.scoped(processTurnStartRequested(event));
-          return "delivered" as const;
-        case "turn-interrupt":
-          if (event.type !== "thread.turn-interrupt-requested") {
-            return yield* Effect.die(`turn-interrupt delivery contains ${event.type}`);
-          }
-          yield* processTurnInterruptRequested(event);
-          return "delivered" as const;
-        case "approval-response":
-          if (event.type !== "thread.approval-response-requested") {
-            return yield* Effect.die(`approval-response delivery contains ${event.type}`);
-          }
-          yield* processApprovalResponseRequested(event);
-          return "delivered" as const;
-        case "user-input-response":
-          if (event.type !== "thread.user-input-response-requested") {
-            return yield* Effect.die(`user-input-response delivery contains ${event.type}`);
-          }
-          yield* processUserInputResponseRequested(event);
-          return "delivered" as const;
-        case "session-stop":
-          if (event.type !== "thread.session-stop-requested") {
-            return yield* Effect.die(`session-stop delivery contains ${event.type}`);
-          }
-          yield* processSessionStopRequested(event);
-          return "delivered" as const;
-        case "archive-cleanup":
-          if (event.type !== "thread.archived") {
-            return yield* Effect.die(`archive-cleanup delivery contains ${event.type}`);
-          }
-          yield* orchestrationEngine.dispatchInternal({
-            type: "thread.session.stop",
-            commandId: archiveStopCommandId({
-              eventId: event.eventId,
-              threadId: event.payload.threadId,
-            }),
+  const deliverUnmapped = Effect.fn("deliverUnmapped")(function* (
+    delivery: OrchestrationReactorDelivery,
+  ) {
+    const event = yield* decodeDeliveryEvent(delivery);
+    switch (delivery.deliveryKind) {
+      case "runtime-mode-change":
+        if (event.type !== "thread.runtime-mode-set") {
+          return yield* Effect.die(`runtime-mode-change delivery contains ${event.type}`);
+        }
+        yield* Effect.scoped(processDomainEvent(event));
+        return "delivered" as const;
+      case "turn-start":
+        if (event.type !== "thread.turn-start-requested") {
+          return yield* Effect.die(`turn-start delivery contains ${event.type}`);
+        }
+        yield* Effect.scoped(processTurnStartRequested(event));
+        return "delivered" as const;
+      case "turn-interrupt":
+        if (event.type !== "thread.turn-interrupt-requested") {
+          return yield* Effect.die(`turn-interrupt delivery contains ${event.type}`);
+        }
+        yield* processTurnInterruptRequested(event);
+        return "delivered" as const;
+      case "approval-response":
+        if (event.type !== "thread.approval-response-requested") {
+          return yield* Effect.die(`approval-response delivery contains ${event.type}`);
+        }
+        yield* processApprovalResponseRequested(event);
+        return "delivered" as const;
+      case "user-input-response":
+        if (event.type !== "thread.user-input-response-requested") {
+          return yield* Effect.die(`user-input-response delivery contains ${event.type}`);
+        }
+        yield* processUserInputResponseRequested(event);
+        return "delivered" as const;
+      case "session-stop":
+        if (event.type !== "thread.session-stop-requested") {
+          return yield* Effect.die(`session-stop delivery contains ${event.type}`);
+        }
+        yield* processSessionStopRequested(event);
+        return "delivered" as const;
+      case "archive-cleanup":
+        if (event.type !== "thread.archived") {
+          return yield* Effect.die(`archive-cleanup delivery contains ${event.type}`);
+        }
+        yield* orchestrationEngine.dispatchInternal({
+          type: "thread.session.stop",
+          commandId: archiveStopCommandId({
+            eventId: event.eventId,
             threadId: event.payload.threadId,
-            createdAt: event.payload.archivedAt,
-          });
-          if (Option.isSome(terminalManager)) {
-            yield* Effect.scoped(terminalManager.value.close({ threadId: event.payload.threadId }));
-          }
-          return "delivered" as const;
-        case "checkpoint-revert":
-        case "thread-delete":
-          return yield* Effect.die(
-            `provider command reactor cannot handle ${delivery.deliveryKind}`,
-          );
-      }
+          }),
+          threadId: event.payload.threadId,
+          createdAt: event.payload.archivedAt,
+        });
+        if (Option.isSome(terminalManager)) {
+          yield* Effect.scoped(terminalManager.value.close({ threadId: event.payload.threadId }));
+        }
+        return "delivered" as const;
+      case "checkpoint-revert":
+      case "thread-delete":
+        return yield* Effect.die(`provider command reactor cannot handle ${delivery.deliveryKind}`);
+    }
+  });
+
+  const deliver: ProviderCommandReactorShape["deliver"] = Effect.fn("deliver")(
+    function* (delivery) {
+      return yield* deliverUnmapped(delivery).pipe(
+        Effect.mapError(
+          (cause) =>
+            new OrchestrationDeliveryExecutionError({
+              reactor: "provider-command",
+              deliveryId: delivery.deliveryId,
+              cause,
+            }),
+        ),
+      );
     },
   );
 

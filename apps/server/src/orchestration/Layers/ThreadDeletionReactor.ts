@@ -11,6 +11,7 @@ import {
   ThreadDeletionReactor,
   type ThreadDeletionReactorShape,
 } from "../Services/ThreadDeletionReactor.ts";
+import { OrchestrationDeliveryExecutionError } from "../Services/ProviderCommandReactor.ts";
 import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
@@ -57,7 +58,7 @@ const make = Effect.gen(function* () {
   const providerService = yield* ProviderService;
   const terminalManager = yield* TerminalManager.TerminalManager;
 
-  const deliver: ThreadDeletionReactorShape["deliver"] = Effect.fn("deliver")(function* (
+  const deliverUnmapped = Effect.fn("deliverUnmapped")(function* (
     delivery: OrchestrationReactorDelivery,
   ) {
     if (delivery.deliveryKind !== "thread-delete") {
@@ -73,6 +74,19 @@ const make = Effect.gen(function* () {
     });
     yield* terminalManager.close({ threadId: event.payload.threadId, deleteHistory: true });
     return "delivered" as const;
+  });
+
+  const deliver: ThreadDeletionReactorShape["deliver"] = Effect.fn("deliver")(function* (delivery) {
+    return yield* deliverUnmapped(delivery).pipe(
+      Effect.mapError(
+        (cause) =>
+          new OrchestrationDeliveryExecutionError({
+            reactor: "thread-deletion",
+            deliveryId: delivery.deliveryId,
+            cause,
+          }),
+      ),
+    );
   });
 
   const start: ThreadDeletionReactorShape["start"] = Effect.fn("start")(function* () {

@@ -11,6 +11,7 @@ import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 import type { OrchestrationDeliveryResolution } from "./ProviderCommandReactor.ts";
+import type { OrchestrationDeliveryExecutionError } from "./ProviderCommandReactor.ts";
 
 /**
  * CheckpointReactorShape - Service API for checkpoint reactor lifecycle.
@@ -34,7 +35,7 @@ export interface CheckpointReactorShape {
   readonly drain: Effect.Effect<void>;
   readonly deliver: (
     delivery: OrchestrationReactorDelivery,
-  ) => Effect.Effect<OrchestrationDeliveryResolution, unknown>;
+  ) => Effect.Effect<OrchestrationDeliveryResolution, OrchestrationDeliveryExecutionError>;
 }
 
 /**

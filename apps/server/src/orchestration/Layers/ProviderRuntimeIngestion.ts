@@ -730,9 +730,7 @@ export function runtimeEventToActivities(
 }
 
 export interface ProviderRuntimeIngestionLiveOptions {
-  readonly beforeProcessRuntimeEvent?: (
-    event: ProviderRuntimeEvent,
-  ) => Effect.Effect<void, unknown>;
+  readonly beforeProcessRuntimeEvent?: (event: ProviderRuntimeEvent) => Effect.Effect<void, string>;
 }
 
 export function latestEligibleProviderExitObservation(

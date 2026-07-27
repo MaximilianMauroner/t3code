@@ -8,10 +8,24 @@
  */
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 
 export type OrchestrationDeliveryResolution = "delivered" | "cancelled";
+
+export class OrchestrationDeliveryExecutionError extends Schema.TaggedErrorClass<OrchestrationDeliveryExecutionError>()(
+  "OrchestrationDeliveryExecutionError",
+  {
+    reactor: Schema.String,
+    deliveryId: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `${this.reactor} failed delivery ${this.deliveryId}`;
+  }
+}
 
 /**
  * ProviderCommandReactorShape - Service API for provider command reactors.
@@ -40,7 +54,7 @@ export interface ProviderCommandReactorShape {
   /** Executes one already-claimed provider delivery. */
   readonly deliver: (
     delivery: OrchestrationReactorDelivery,
-  ) => Effect.Effect<OrchestrationDeliveryResolution, unknown>;
+  ) => Effect.Effect<OrchestrationDeliveryResolution, OrchestrationDeliveryExecutionError>;
 }
 
 /**

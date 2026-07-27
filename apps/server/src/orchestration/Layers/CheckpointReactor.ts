@@ -27,6 +27,7 @@ import {
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { CheckpointReactor, type CheckpointReactorShape } from "../Services/CheckpointReactor.ts";
+import { OrchestrationDeliveryExecutionError } from "../Services/ProviderCommandReactor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { RuntimeReceiptBus } from "../Services/RuntimeReceiptBus.ts";
@@ -836,7 +837,7 @@ const make = Effect.gen(function* () {
 
   const worker = yield* makeDrainableWorker(processInputSafely);
 
-  const deliver: CheckpointReactorShape["deliver"] = Effect.fn("deliver")(function* (
+  const deliverUnmapped = Effect.fn("deliverUnmapped")(function* (
     delivery: OrchestrationReactorDelivery,
   ) {
     if (delivery.deliveryKind !== "checkpoint-revert") {
@@ -851,6 +852,19 @@ const make = Effect.gen(function* () {
       CommandId.make(`delivery:${delivery.deliveryId}:checkpoint-revert-complete`),
     );
     return "delivered" as const;
+  });
+
+  const deliver: CheckpointReactorShape["deliver"] = Effect.fn("deliver")(function* (delivery) {
+    return yield* deliverUnmapped(delivery).pipe(
+      Effect.mapError(
+        (cause) =>
+          new OrchestrationDeliveryExecutionError({
+            reactor: "checkpoint",
+            deliveryId: delivery.deliveryId,
+            cause,
+          }),
+      ),
+    );
   });
 
   const start: CheckpointReactorShape["start"] = Effect.fn("start")(function* () {

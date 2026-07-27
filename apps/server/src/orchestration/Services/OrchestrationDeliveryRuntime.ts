@@ -3,6 +3,7 @@ import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 
 import type { OrchestrationReactorDeliveryReadiness } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import type { ProjectionRepositoryError } from "../../persistence/Errors.ts";
 
 export interface OrchestrationDeliveryRuntimeShape {
   /** Starts the durable consumer. The domain event stream is only a wakeup hint. */
@@ -10,9 +11,12 @@ export interface OrchestrationDeliveryRuntimeShape {
   /** Processes ordered durable work until the first unresolved blocker or completion. */
   readonly drain: Effect.Effect<void>;
   /** Resolves startup work through scheduled retries within the bounded recovery budget. */
-  readonly recoverStartup: Effect.Effect<void, unknown>;
+  readonly recoverStartup: Effect.Effect<void, ProjectionRepositoryError>;
   /** Exposes unresolved and poison rows to the startup readiness gate. */
-  readonly inspectReadiness: Effect.Effect<OrchestrationReactorDeliveryReadiness, unknown>;
+  readonly inspectReadiness: Effect.Effect<
+    OrchestrationReactorDeliveryReadiness,
+    ProjectionRepositoryError
+  >;
 }
 
 export class OrchestrationDeliveryRuntime extends Context.Service<

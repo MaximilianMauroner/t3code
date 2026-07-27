@@ -11,6 +11,7 @@ import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 import type { OrchestrationDeliveryResolution } from "./ProviderCommandReactor.ts";
+import type { OrchestrationDeliveryExecutionError } from "./ProviderCommandReactor.ts";
 
 /**
  * ThreadDeletionReactorShape - Service API for thread deletion cleanup.
@@ -31,7 +32,7 @@ export interface ThreadDeletionReactorShape {
   readonly drain: Effect.Effect<void>;
   readonly deliver: (
     delivery: OrchestrationReactorDelivery,
-  ) => Effect.Effect<OrchestrationDeliveryResolution, unknown>;
+  ) => Effect.Effect<OrchestrationDeliveryResolution, OrchestrationDeliveryExecutionError>;
 }
 
 /**

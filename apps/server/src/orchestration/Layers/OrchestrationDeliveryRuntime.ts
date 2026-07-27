@@ -584,7 +584,7 @@ const make = Effect.gen(function* () {
     return true;
   });
 
-  const processNext: Effect.Effect<boolean, unknown> = Effect.gen(function* () {
+  const processNext = Effect.gen(function* () {
     const claimedAtValue = yield* DateTime.now;
     const claimedAt = DateTime.formatIso(claimedAtValue);
     const claimToken = yield* crypto.randomUUIDv4;
@@ -692,7 +692,7 @@ const make = Effect.gen(function* () {
     return succeeded;
   });
 
-  const drainUnlocked: Effect.Effect<void, unknown> = Effect.gen(function* () {
+  const drainUnlocked = Effect.gen(function* () {
     while (yield* processNext) {
       // claimNext enforces the single global predecessor, including poison rows.
     }

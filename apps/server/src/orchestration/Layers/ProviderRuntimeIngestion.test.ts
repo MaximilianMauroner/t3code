@@ -499,8 +499,11 @@ describe("ProviderRuntimeIngestion", () => {
       acknowledged,
     });
 
-    const attemptDeadline = Date.now() + 2_000;
-    while (Effect.runSync(Ref.get(attempts)) === 0 && Date.now() < attemptDeadline) {
+    const attemptDeadline = (await Effect.runPromise(Clock.currentTimeMillis)) + 2_000;
+    while (
+      Effect.runSync(Ref.get(attempts)) === 0 &&
+      (await Effect.runPromise(Clock.currentTimeMillis)) < attemptDeadline
+    ) {
       await Effect.runPromise(Effect.sleep("10 millis"));
     }
     expect(Effect.runSync(Ref.get(attempts))).toBeGreaterThan(0);
