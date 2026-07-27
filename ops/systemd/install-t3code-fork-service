@@ -429,6 +429,10 @@ wait_for_unit_inactive() {
   printf '%s\n' "Timed out waiting for ${unit} to become inactive." >&2
   return 1
 }
+reset_unit_if_failed() {
+  unit="$1"; failed_state="$2"
+  [ "$failed_state" != failed ] || systemctl reset-failed "$unit"
+}
 stop_known_unit() {
   unit="$1"; known_state="$2"
   case "$known_state" in
@@ -613,11 +617,15 @@ install -m 0644 "$script_dir/t3code-availability-healthcheck.timer" "$availabili
 install -m 0644 "$script_dir/t3code-watchdog.tmpfiles" "$tmpfiles_config"
 /usr/bin/systemd-tmpfiles --create "$tmpfiles_config"
 systemctl daemon-reload
-systemctl reset-failed t3code-fork-healthcheck.timer t3code-fork-healthcheck.service t3code-availability-healthcheck.timer t3code-availability-healthcheck.service
-systemctl disable --now t3code-fork-healthcheck.timer
-systemctl stop t3code-fork-healthcheck.service
-systemctl disable --now t3code-availability-healthcheck.timer
-systemctl stop t3code-availability-healthcheck.service
+reset_unit_if_failed t3code-fork-healthcheck.timer "$health_failed"
+reset_unit_if_failed t3code-fork-healthcheck.service "$health_service_failed"
+reset_unit_if_failed t3code-availability-healthcheck.timer "$availability_failed"
+reset_unit_if_failed t3code-availability-healthcheck.service "$availability_service_failed"
+# The watchdog units may be brand-new and therefore not loaded by systemd yet.
+# They were already quiesced before replacement, so disable the staged timers
+# without issuing redundant `--now` stop jobs against unloaded units.
+systemctl disable t3code-fork-healthcheck.timer
+systemctl disable t3code-availability-healthcheck.timer
 systemctl show t3code.service -p ExecStart --value | grep -F "fork-current/node_modules/t3/dist/bin.mjs" >/dev/null
 systemctl stop "$nightly_timer_unit"
 systemctl stop "$nightly_service_unit"

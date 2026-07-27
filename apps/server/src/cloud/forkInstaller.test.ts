@@ -172,6 +172,194 @@ function runHealthHarness(
   };
 }
 
+interface WatchdogStagingInput {
+  readonly forkPresent: boolean;
+  readonly forkActive: boolean;
+  readonly forkFailed: boolean;
+  readonly availabilityPresent: boolean;
+  readonly availabilityActive: boolean;
+  readonly availabilityFailed: boolean;
+}
+
+function runWatchdogStagingHarness(
+  stateDir: string,
+  input: WatchdogStagingInput,
+): {
+  readonly status: number | null;
+  readonly stderr: string;
+  readonly log: string;
+} {
+  const mockBin = NodePath.join(stateDir, "bin");
+  const modelDir = NodePath.join(stateDir, "model");
+  const logPath = NodePath.join(stateDir, "systemctl.log");
+  const harnessPath = NodePath.join(stateDir, "staging-model");
+  NodeFS.mkdirSync(mockBin);
+  NodeFS.mkdirSync(modelDir);
+
+  const writeState = (
+    unit: string,
+    enabled: string,
+    active: string,
+    failed: string,
+    loaded = true,
+  ): void => {
+    const key = unit.replaceAll(/[^a-zA-Z0-9]/g, "_");
+    NodeFS.writeFileSync(NodePath.join(modelDir, `${key}.enabled`), `${enabled}\n`);
+    NodeFS.writeFileSync(NodePath.join(modelDir, `${key}.active`), `${active}\n`);
+    NodeFS.writeFileSync(NodePath.join(modelDir, `${key}.failed`), `${failed}\n`);
+    if (loaded) NodeFS.writeFileSync(NodePath.join(modelDir, `${key}.loaded`), "");
+  };
+  writeState(
+    "t3code-fork-healthcheck.timer",
+    input.forkPresent ? "enabled" : "not-found",
+    input.forkActive ? "active" : "inactive",
+    input.forkFailed ? "failed" : "inactive",
+    input.forkPresent,
+  );
+  writeState(
+    "t3code-fork-healthcheck.service",
+    input.forkPresent ? "static" : "not-found",
+    input.forkActive ? "active" : "inactive",
+    input.forkFailed ? "failed" : "inactive",
+    input.forkPresent,
+  );
+  writeState("t3code-healthcheck.timer", "enabled", "active", "inactive");
+  writeState("t3code-healthcheck.service", "static", "inactive", "inactive");
+  writeState(
+    "t3code-availability-healthcheck.timer",
+    input.availabilityPresent ? "enabled" : "not-found",
+    input.availabilityActive ? "active" : "inactive",
+    input.availabilityFailed ? "failed" : "inactive",
+    input.availabilityPresent,
+  );
+  writeState(
+    "t3code-availability-healthcheck.service",
+    input.availabilityPresent ? "static" : "not-found",
+    input.availabilityActive ? "active" : "inactive",
+    input.availabilityFailed ? "failed" : "inactive",
+    input.availabilityPresent,
+  );
+
+  NodeFS.writeFileSync(
+    NodePath.join(mockBin, "systemctl"),
+    [
+      "#!/bin/sh",
+      "set -eu",
+      'command="$1"',
+      "shift",
+      "now=false",
+      'while [ "${1-}" = --now ]; do now=true; shift; done',
+      'key_for() { printf "%s" "$1" | tr -c "a-zA-Z0-9" "_"; }',
+      'read_value() { cat "$1"; }',
+      'write_value() { printf "%s\\n" "$2" >"$1"; }',
+      'printf "%s %s now=%s\\n" "$command" "$*" "$now" >>"$SYSTEMCTL_LOG"',
+      'case "$command" in',
+      "  is-active)",
+      '    key="$(key_for "$1")"',
+      '    read_value "$MODEL_DIR/${key}.active"',
+      "    ;;",
+      "  stop)",
+      '    key="$(key_for "$1")"',
+      '    [ -f "$MODEL_DIR/${key}.loaded" ] || exit 5',
+      '    write_value "$MODEL_DIR/${key}.active" inactive',
+      "    ;;",
+      "  reset-failed)",
+      '    for unit in "$@"; do',
+      '      key="$(key_for "$unit")"',
+      '      [ -f "$MODEL_DIR/${key}.loaded" ] || exit 5',
+      '      write_value "$MODEL_DIR/${key}.failed" inactive',
+      "    done",
+      "    ;;",
+      "  disable)",
+      '    key="$(key_for "$1")"',
+      '    write_value "$MODEL_DIR/${key}.enabled" disabled',
+      '    if [ "$now" = true ]; then',
+      '      [ -f "$MODEL_DIR/${key}.loaded" ] || exit 5',
+      '      write_value "$MODEL_DIR/${key}.active" inactive',
+      "    fi",
+      "    ;;",
+      "  restart)",
+      '    [ "$1" = t3code.service ]',
+      '    printf "restarted\\n" >"$RESTART_MARKER"',
+      "    ;;",
+      "  *) exit 64 ;;",
+      "esac",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  NodeFS.writeFileSync(NodePath.join(mockBin, "sleep"), ["#!/bin/sh", ":", ""].join("\n"), {
+    mode: 0o755,
+  });
+
+  const stopHelpers = installer.slice(
+    installer.indexOf("wait_for_unit_inactive() {"),
+    installer.indexOf("\nrestore_legacy_general_watchdog() {"),
+  );
+  const quiesceStart = installer.indexOf(
+    "stop_known_unit t3code-fork-healthcheck.timer",
+    installer.indexOf("# Quiesce every watchdog timer"),
+  );
+  const quiesce = installer.slice(quiesceStart, installer.indexOf("\nnext_link=", quiesceStart));
+  const stagingStart = installer.indexOf(
+    'reset_unit_if_failed t3code-fork-healthcheck.timer "$health_failed"',
+  );
+  const staging = installer.slice(
+    stagingStart,
+    installer.indexOf("\nsystemctl show t3code.service", stagingStart),
+  );
+  const availabilityEnabled = input.availabilityPresent ? "enabled" : "not-found";
+  const availabilityServiceEnabled = input.availabilityPresent ? "static" : "not-found";
+  const availabilityActive = input.availabilityActive ? "active" : "inactive";
+  const availabilityFailed = input.availabilityFailed ? "failed" : "inactive";
+  const forkEnabled = input.forkPresent ? "enabled" : "not-found";
+  const forkServiceEnabled = input.forkPresent ? "static" : "not-found";
+  const forkFailed = input.forkFailed ? "failed" : "inactive";
+  NodeFS.writeFileSync(
+    harnessPath,
+    [
+      "#!/bin/sh",
+      "set -eu",
+      stopHelpers,
+      `health_enabled="${forkEnabled}"`,
+      `health_failed="${forkFailed}"`,
+      `health_service_enabled="${forkServiceEnabled}"`,
+      `health_service_failed="${forkFailed}"`,
+      `availability_enabled="${availabilityEnabled}"`,
+      `availability_active="${availabilityActive}"`,
+      `availability_failed="${availabilityFailed}"`,
+      `availability_service_enabled="${availabilityServiceEnabled}"`,
+      `availability_service_active="${availabilityActive}"`,
+      `availability_service_failed="${availabilityFailed}"`,
+      'legacy_health_timer_unit="t3code-healthcheck.timer"',
+      'legacy_health_service_unit="t3code-healthcheck.service"',
+      'legacy_health_enabled="enabled"',
+      'legacy_health_service_enabled="static"',
+      quiesce,
+      staging,
+      "systemctl restart t3code.service",
+      "",
+    ].join("\n"),
+    { mode: 0o700 },
+  );
+
+  const result = NodeChildProcess.spawnSync("/bin/sh", [harnessPath], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      MODEL_DIR: modelDir,
+      PATH: `${mockBin}:/usr/bin:/bin`,
+      RESTART_MARKER: NodePath.join(stateDir, "restart-marker"),
+      SYSTEMCTL_LOG: logPath,
+    },
+  });
+  return {
+    status: result.status,
+    stderr: result.stderr,
+    log: NodeFS.existsSync(logPath) ? NodeFS.readFileSync(logPath, "utf8") : "",
+  };
+}
+
 describe("fork service bootstrap installer", () => {
   it("uses the last-sorting override and validates effective ExecStart before nightly shutdown", () => {
     expect(NodeFS.existsSync(NodePath.join(opsDir, "t3code.service.d/zz-fork-update.conf"))).toBe(
@@ -246,7 +434,10 @@ describe("fork service bootstrap installer", () => {
     const tmpfiles = NodeFS.readFileSync(NodePath.join(opsDir, "t3code-watchdog.tmpfiles"), "utf8");
     expect(installer).toContain('install -m 0755 "$script_dir/t3code-availability-healthcheck"');
     expect(installer).toContain('/usr/bin/systemd-tmpfiles --create "$tmpfiles_config"');
-    expect(installer).toContain("systemctl disable --now t3code-availability-healthcheck.timer");
+    expect(installer).toContain("systemctl disable t3code-availability-healthcheck.timer");
+    expect(installer).not.toContain(
+      "systemctl disable --now t3code-availability-healthcheck.timer",
+    );
     expect(tmpfiles).toContain("f /run/t3code-watchdog/authority.lock 0660 root t3code-watchdog -");
     expect(tmpfiles).toContain("d /run/t3code-watchdog 3770 root t3code-watchdog -");
     expect(tmpfiles).toContain(
@@ -262,7 +453,7 @@ describe("fork service bootstrap installer", () => {
       transactionStart,
     );
     const stagedDisable = installer.indexOf(
-      "systemctl disable --now t3code-availability-healthcheck.timer",
+      "systemctl disable t3code-availability-healthcheck.timer",
       legacyTimerStop,
     );
     const restart = installer.indexOf("systemctl restart t3code.service", stagedDisable);
@@ -308,6 +499,65 @@ describe("fork service bootstrap installer", () => {
     expect(installer.slice(legacyTimerStop, newTimerStart)).not.toContain(
       'systemctl start "$legacy_health_timer_unit"',
     );
+  });
+
+  it("stages brand-new unloaded watchdog units without reset or stop jobs", () => {
+    withStateDir((stateDir) => {
+      const result = runWatchdogStagingHarness(stateDir, {
+        forkPresent: false,
+        forkActive: false,
+        forkFailed: false,
+        availabilityPresent: false,
+        availabilityActive: false,
+        availabilityFailed: false,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.log).toContain("restart t3code.service");
+      expect(result.log).toContain("disable t3code-fork-healthcheck.timer now=false");
+      expect(result.log).toContain("disable t3code-availability-healthcheck.timer now=false");
+      expect(result.log).not.toContain("reset-failed t3code-");
+      expect(result.log).not.toContain("stop t3code-fork-healthcheck");
+      expect(result.log).not.toContain("stop t3code-availability-healthcheck");
+    });
+  });
+
+  it("quiesces loaded active availability units on repeat install", () => {
+    withStateDir((stateDir) => {
+      const result = runWatchdogStagingHarness(stateDir, {
+        forkPresent: true,
+        forkActive: true,
+        forkFailed: false,
+        availabilityPresent: true,
+        availabilityActive: true,
+        availabilityFailed: false,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.log).toContain("stop t3code-availability-healthcheck.timer");
+      expect(result.log).toContain("stop t3code-availability-healthcheck.service");
+      expect(result.log).toContain("stop t3code-fork-healthcheck.timer");
+      expect(result.log).toContain("stop t3code-fork-healthcheck.service");
+      expect(result.log).not.toContain("reset-failed t3code-");
+      expect(result.log).toContain("restart t3code.service");
+    });
+  });
+
+  it("clears failed state for loaded availability units on repeat install", () => {
+    withStateDir((stateDir) => {
+      const result = runWatchdogStagingHarness(stateDir, {
+        forkPresent: true,
+        forkActive: false,
+        forkFailed: true,
+        availabilityPresent: true,
+        availabilityActive: false,
+        availabilityFailed: true,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.log).toContain("reset-failed t3code-availability-healthcheck.timer");
+      expect(result.log).toContain("reset-failed t3code-availability-healthcheck.service");
+      expect(result.log).toContain("reset-failed t3code-fork-healthcheck.timer");
+      expect(result.log).toContain("reset-failed t3code-fork-healthcheck.service");
+      expect(result.log).toContain("restart t3code.service");
+    });
   });
 
   it("captures and restores exact state for every watchdog timer and service", () => {
@@ -780,7 +1030,7 @@ describe("fork service bootstrap installer", () => {
       installer.indexOf("systemctl show t3code.service"),
     );
     const forwardResetIndex = installer.indexOf(
-      "systemctl reset-failed t3code-fork-healthcheck.timer t3code-fork-healthcheck.service",
+      'reset_unit_if_failed t3code-fork-healthcheck.timer "$health_failed"',
       installReloadIndex,
     );
     const restartIndex = installer.indexOf("systemctl restart t3code.service", forwardResetIndex);
@@ -796,6 +1046,18 @@ describe("fork service bootstrap installer", () => {
     expect(watchIndex).toBeGreaterThan(readinessIndex);
     expect(timerIndex).toBeGreaterThan(watchIndex);
     expect(installer.match(/systemctl reset-failed/g)).toHaveLength(2);
+    expect(installer).toContain(
+      'reset_unit_if_failed t3code-fork-healthcheck.timer "$health_failed"',
+    );
+    expect(installer).toContain(
+      'reset_unit_if_failed t3code-fork-healthcheck.service "$health_service_failed"',
+    );
+    expect(installer).toContain(
+      'reset_unit_if_failed t3code-availability-healthcheck.timer "$availability_failed"',
+    );
+    expect(installer).toContain(
+      'reset_unit_if_failed t3code-availability-healthcheck.service "$availability_service_failed"',
+    );
     expect(installer).not.toMatch(/reset-failed[^\n]*nightly/);
   });
 
