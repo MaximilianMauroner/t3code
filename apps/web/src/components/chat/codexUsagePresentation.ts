@@ -1,4 +1,12 @@
-import type { CodexUsageSnapshot } from "@t3tools/contracts";
+import type { CodexUsageSnapshot, ServerProvider } from "@t3tools/contracts";
+
+export function canShowCodexUsage(provider: ServerProvider | null): boolean {
+  return (
+    provider?.driver === "codex" &&
+    provider.auth.status === "authenticated" &&
+    provider.auth.type === "chatgpt"
+  );
+}
 
 const resetFormatter = new Intl.DateTimeFormat(undefined, {
   month: "short",

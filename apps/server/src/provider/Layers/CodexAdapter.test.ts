@@ -64,6 +64,7 @@ const asItemId = (value: string): ProviderItemId => ProviderItemId.make(value);
 class FakeCodexRuntime implements CodexSessionRuntimeShape {
   private readonly eventQueue = Effect.runSync(Queue.unbounded<ProviderEvent>());
   private readonly now = "2026-01-01T00:00:00.000Z";
+  public rateLimitsShouldFail = false;
 
   public readonly startImpl = vi.fn(() =>
     Promise.resolve({
@@ -132,6 +133,13 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
         },
       }),
   );
+  public readonly readAccountImpl = vi.fn(
+    (): Promise<EffectCodexSchema.V2GetAccountResponse> =>
+      Promise.resolve({
+        account: { type: "chatgpt", email: "test@example.com", planType: "plus" },
+        requiresOpenaiAuth: true,
+      }),
+  );
 
   readonly options: CodexSessionRuntimeOptions;
 
@@ -144,7 +152,17 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
   }
 
   getSession = Effect.promise(() => this.startImpl());
-  readAccountRateLimits = Effect.promise(() => this.readAccountRateLimitsImpl());
+  readAccountRateLimits = Effect.suspend(() =>
+    this.rateLimitsShouldFail
+      ? Effect.fail(
+          new CodexErrors.CodexAppServerTransportError({
+            operation: "read-input-stream",
+            cause: new Error("temporary usage failure"),
+          }),
+        )
+      : Effect.promise(() => this.readAccountRateLimitsImpl()),
+  );
+  readAccount = Effect.promise(() => this.readAccountImpl());
 
   sendTurn(input: CodexSessionRuntimeSendTurnInput) {
     return Effect.promise(() => this.sendTurnImpl(input));
@@ -181,8 +199,10 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
 
 function makeRuntimeFactory() {
   const runtimes: Array<FakeCodexRuntime> = [];
+  let accountResponse: EffectCodexSchema.V2GetAccountResponse | null = null;
   const factory = vi.fn((options: CodexSessionRuntimeOptions) => {
     const runtime = new FakeCodexRuntime(options);
+    if (accountResponse) runtime.readAccountImpl.mockResolvedValue(accountResponse);
     runtimes.push(runtime);
     return Effect.succeed(runtime);
   });
@@ -191,6 +211,9 @@ function makeRuntimeFactory() {
     factory,
     get lastRuntime(): FakeCodexRuntime | undefined {
       return runtimes.at(-1);
+    },
+    set accountResponse(value: EffectCodexSchema.V2GetAccountResponse | null) {
+      accountResponse = value;
     },
   };
 }
@@ -271,6 +294,22 @@ validationLayer("CodexAdapterLive validation", (it) => {
         [60],
       );
       NodeAssert.equal(usage?.model, "gpt-5.3-codex");
+      validationRuntimeFactory.factory.mockClear();
+    }),
+  );
+  it.effect("suppresses API-key usage without reading rate limits", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      validationRuntimeFactory.factory.mockClear();
+      validationRuntimeFactory.accountResponse = {
+        account: { type: "apiKey" },
+        requiresOpenaiAuth: false,
+      };
+      const usage = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+      const runtime = validationRuntimeFactory.lastRuntime;
+      NodeAssert.equal(usage, null);
+      NodeAssert.equal(runtime?.readAccountRateLimitsImpl.mock.calls.length ?? 0, 0);
+      validationRuntimeFactory.accountResponse = null;
       validationRuntimeFactory.factory.mockClear();
     }),
   );
@@ -515,6 +554,7 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
 });
 
 const lifecycleRuntimeFactory = makeRuntimeFactory();
+let lifecycleUsageNow = new Date("2026-01-01T00:00:00.000Z");
 const lifecycleLayer = it.layer(
   Layer.effect(
     CodexAdapter,
@@ -522,6 +562,7 @@ const lifecycleLayer = it.layer(
       const codexConfig = decodeCodexSettings({});
       return yield* makeCodexAdapter(codexConfig, {
         makeRuntime: lifecycleRuntimeFactory.factory,
+        now: () => lifecycleUsageNow,
       });
     }),
   ).pipe(
@@ -547,6 +588,57 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect(
+    "merges sparse notifications, preserves observation time, and reconciles full reads",
+    () =>
+      Effect.gen(function* () {
+        const { adapter, runtime } = yield* startLifecycleRuntime();
+        lifecycleUsageNow = new Date("2026-01-02T00:00:00.000Z");
+        const initial = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+        NodeAssert.equal(initial?.windows[0]?.remainingPercent, 60);
+        NodeAssert.equal(initial?.checkedAt, "2026-01-02T00:00:00.000Z");
+
+        const eventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+        yield* runtime.emit({
+          id: asEventId("evt-rate-limits"),
+          kind: "notification",
+          provider: ProviderDriverKind.make("codex"),
+          createdAt: "2026-02-03T04:05:06.000Z",
+          method: "account/rateLimits/updated",
+          threadId: asThreadId("thread-1"),
+          payload: {
+            rateLimits: {
+              limitId: "gpt-5.3-codex",
+              primary: { usedPercent: 65 },
+            },
+          },
+        });
+        yield* Fiber.join(eventFiber);
+
+        runtime.rateLimitsShouldFail = true;
+        const retained = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+        NodeAssert.equal(retained?.source, "notification");
+        NodeAssert.equal(retained?.checkedAt, "2026-02-03T04:05:06.000Z");
+        NodeAssert.equal(retained?.windows[0]?.remainingPercent, 35);
+
+        runtime.rateLimitsShouldFail = false;
+        lifecycleUsageNow = new Date("2026-02-04T00:00:00.000Z");
+        runtime.readAccountRateLimitsImpl.mockResolvedValue({
+          rateLimits: { limitId: "codex", primary: { usedPercent: 5 } },
+          rateLimitsByLimitId: {
+            "gpt-5.3-codex": {
+              limitId: "gpt-5.3-codex",
+              primary: { usedPercent: 10, windowDurationMins: 300 },
+            },
+          },
+        });
+        const reconciled = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+        NodeAssert.equal(reconciled?.source, "read");
+        NodeAssert.equal(reconciled?.windows[0]?.remainingPercent, 90);
+        NodeAssert.equal(reconciled?.checkedAt, "2026-02-04T00:00:00.000Z");
+      }),
+  );
+
   it.effect("holds a liveness marker behind a paused lifecycle enqueue", () =>
     Effect.gen(function* () {
       const mutationObserved = yield* Deferred.make<void>();

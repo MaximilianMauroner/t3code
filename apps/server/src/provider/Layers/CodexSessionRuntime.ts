@@ -146,6 +146,10 @@ export interface CodexSessionRuntimeShape {
     EffectCodexSchema.V2GetAccountRateLimitsResponse,
     CodexSessionRuntimeError
   >;
+  readonly readAccount: Effect.Effect<
+    EffectCodexSchema.V2GetAccountResponse,
+    CodexSessionRuntimeError
+  >;
   readonly respondToRequest: (
     requestId: ApprovalRequestId,
     decision: ProviderApprovalDecision,
@@ -1294,6 +1298,7 @@ export const makeCodexSessionRuntime = (
       readAccountRateLimits: ensureInitialized.pipe(
         Effect.andThen(client.request("account/rateLimits/read", undefined)),
       ),
+      readAccount: ensureInitialized.pipe(Effect.andThen(client.request("account/read", {}))),
       sendTurn: (input) =>
         Effect.gen(function* () {
           const providerThreadId = yield* readProviderThreadId;

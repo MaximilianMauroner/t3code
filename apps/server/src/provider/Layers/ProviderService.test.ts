@@ -223,6 +223,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
         sessions.clear();
       }),
   );
+  const readCodexUsage = vi.fn((_model: string) => Effect.succeed(null));
 
   const adapter: ProviderAdapterShape<ProviderAdapterError> = {
     provider,
@@ -240,6 +241,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     requestLivenessSample,
     readThread,
     rollbackThread,
+    readCodexUsage,
     stopAll,
     get streamEvents() {
       return Stream.fromPubSub(runtimeEventPubSub).pipe(Stream.filter(isProviderRuntimeEvent));
@@ -268,6 +270,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     adapter,
     emit,
     updateSession,
+    readCodexUsage,
     startSession,
     sendTurn,
     interruptTurn,
@@ -1935,6 +1938,41 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
 
 const validation = makeProviderServiceLayer();
 validation.layer("ProviderServiceLive validation", (it) => {
+  it.effect("contains Codex usage adapter failures", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      validation.codex.readCodexUsage.mockImplementation(() =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: "codex",
+            method: "account/rateLimits/read",
+            detail: "temporary failure",
+          }),
+        ),
+      );
+
+      const usage = yield* provider.getCodexUsage({
+        providerInstanceId: codexInstanceId,
+        model: "gpt-5.3-codex",
+      });
+      assert.equal(usage, null);
+      validation.codex.readCodexUsage.mockImplementation(() => Effect.succeed(null));
+    }),
+  );
+
+  it.effect("does not ask non-Codex adapters for Codex usage", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      validation.claude.readCodexUsage.mockClear();
+      const usage = yield* provider.getCodexUsage({
+        providerInstanceId: claudeAgentInstanceId,
+        model: "claude-opus",
+      });
+      assert.equal(usage, null);
+      assert.equal(validation.claude.readCodexUsage.mock.calls.length, 0);
+    }),
+  );
+
   it.effect("rejects session starts without an explicit provider instance id", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

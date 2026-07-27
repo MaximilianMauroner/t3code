@@ -52,6 +52,23 @@ describe("resolveCodexUsageSnapshot", () => {
     ).toBeNull();
   });
 
+  it("rejects prefix and suffix collisions", () => {
+    expect(
+      resolve("gpt-5.3", {
+        rateLimitsByLimitId: {
+          "gpt-5.3-mini": bucket("gpt-5.3-mini", 20),
+        },
+      }),
+    ).toBeNull();
+    expect(
+      resolve("gpt-5.3-codex", {
+        rateLimitsByLimitId: {
+          "preview-gpt-5.3-codex": bucket("preview-gpt-5.3-codex", 20),
+        },
+      }),
+    ).toBeNull();
+  });
+
   it("clamps values and tolerates missing reset data", () => {
     expect(
       resolve("gpt-5.3", {
@@ -67,5 +84,42 @@ describe("resolveCodexUsageSnapshot", () => {
         rateLimits: { limitId: "codex", primary: { usedPercent: Number.NaN } },
       }),
     ).toBeNull();
+  });
+
+  it("requires an explicit legacy identity and honors an exact limit name", () => {
+    expect(
+      resolve("gpt-5.3-codex", {
+        rateLimits: { primary: { usedPercent: 20 } },
+      }),
+    ).toBeNull();
+    expect(
+      resolve("gpt-5.3-codex", {
+        rateLimits: {
+          limitName: "gpt-5.3-codex",
+          primary: { usedPercent: 20 },
+        },
+      })?.limitId,
+    ).toBe("gpt-5.3-codex");
+    expect(
+      resolve("gpt-5.3-codex", {
+        rateLimits: {
+          limitName: "gpt-5.3-codex-preview",
+          primary: { usedPercent: 20 },
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("preserves an authoritative observed timestamp", () => {
+    expect(
+      resolveCodexUsageSnapshot({
+        providerInstanceId,
+        model: "gpt-5.3-codex",
+        payload: { rateLimitsByLimitId: { "gpt-5.3-codex": bucket("gpt-5.3-codex", 20) } },
+        source: "cache",
+        checkedAt: "2026-01-01T00:00:00.000Z",
+        now: new Date("2027-01-01T00:00:00.000Z"),
+      })?.checkedAt,
+    ).toBe("2026-01-01T00:00:00.000Z");
   });
 });

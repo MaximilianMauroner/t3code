@@ -1,6 +1,11 @@
-import { ProviderInstanceId, type CodexUsageSnapshot } from "@t3tools/contracts";
+import {
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type CodexUsageSnapshot,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
-import { codexUsagePresentation } from "./codexUsagePresentation";
+import { canShowCodexUsage, codexUsagePresentation } from "./codexUsagePresentation";
 
 const snapshot = {
   providerInstanceId: ProviderInstanceId.make("codex"),
@@ -38,5 +43,30 @@ describe("codexUsagePresentation", () => {
     expect(codexUsagePresentation({ ...snapshot, source: "cache" }).details).toContain(
       "last successful reading",
     );
+  });
+});
+
+const provider = {
+  instanceId: ProviderInstanceId.make("codex"),
+  driver: ProviderDriverKind.make("codex"),
+  enabled: true,
+  installed: true,
+  version: "1.0.0",
+  status: "ready",
+  auth: { status: "authenticated", type: "chatgpt" },
+  checkedAt: "2026-07-27T00:00:00.000Z",
+  models: [],
+  slashCommands: [],
+  skills: [],
+} satisfies ServerProvider;
+
+describe("canShowCodexUsage", () => {
+  it("allows only authenticated ChatGPT subscription accounts", () => {
+    expect(canShowCodexUsage(provider)).toBe(true);
+    expect(
+      canShowCodexUsage({ ...provider, auth: { status: "authenticated", type: "apiKey" } }),
+    ).toBe(false);
+    expect(canShowCodexUsage({ ...provider, auth: { status: "unknown" } })).toBe(false);
+    expect(canShowCodexUsage({ ...provider, auth: { status: "unauthenticated" } })).toBe(false);
   });
 });

@@ -89,6 +89,7 @@ import {
 } from "./composerProviderState";
 import { ContextWindowMeter } from "./ContextWindowMeter";
 import { CodexUsageIndicator } from "./CodexUsageIndicator";
+import { canShowCodexUsage } from "./codexUsagePresentation";
 import { buildExpandedImagePreview, type ExpandedImagePreview } from "./ExpandedImagePreview";
 import { basenameOfPath } from "../../pierre-icons";
 import { cn, randomUUID } from "~/lib/utils";
@@ -2671,7 +2672,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     onInstanceModelChange={onProviderModelSelect}
                   />
                 )}
-                {selectedProvider === "codex" && !noProviderAvailable ? (
+                {canShowCodexUsage(selectedProviderStatus) && !noProviderAvailable ? (
                   <CodexUsageIndicator
                     key={`${selectedInstanceId}:${selectedModel}`}
                     environmentId={environmentId}

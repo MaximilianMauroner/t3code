@@ -92,6 +92,7 @@ export interface CodexAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly beforeRuntimeEventEnqueue?: (event: ProviderRuntimeEvent) => Effect.Effect<void>;
+  readonly now?: () => Date;
 }
 
 interface CodexAdapterSessionContext {
@@ -1408,8 +1409,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
   const runtimeEventQueue = yield* Queue.unbounded<ProviderAdapterOutput>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
-  let cachedCodexUsagePayload: CodexUsageRawPayload | null = null;
-  let cachedCodexUsageSource: "read" | "notification" = "read";
+  let cachedCodexUsage: {
+    readonly payload: CodexUsageRawPayload;
+    readonly checkedAt: string;
+    readonly source: "read" | "notification";
+  } | null = null;
   const startEpochs = new Map<ThreadId, number>();
   const transitions = yield* makeTargetTransitionLock();
   const invalidateStart = (threadId: ThreadId) =>
@@ -1510,22 +1514,25 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                   if (event.method === "account/rateLimits/updated") {
                     const update = readRateLimitsUpdate(event.payload);
                     const limitId = update?.limitId?.trim();
-                    if (cachedCodexUsagePayload && update && limitId) {
-                      cachedCodexUsagePayload = {
-                        ...cachedCodexUsagePayload,
-                        rateLimits:
-                          cachedCodexUsagePayload.rateLimits?.limitId === limitId
-                            ? { ...cachedCodexUsagePayload.rateLimits, ...update }
-                            : cachedCodexUsagePayload.rateLimits,
-                        rateLimitsByLimitId: {
-                          ...cachedCodexUsagePayload.rateLimitsByLimitId,
-                          [limitId]: {
-                            ...cachedCodexUsagePayload.rateLimitsByLimitId?.[limitId],
-                            ...update,
+                    if (cachedCodexUsage && update && limitId) {
+                      cachedCodexUsage = {
+                        checkedAt: event.createdAt,
+                        source: "notification",
+                        payload: {
+                          ...cachedCodexUsage.payload,
+                          rateLimits:
+                            cachedCodexUsage.payload.rateLimits?.limitId === limitId
+                              ? { ...cachedCodexUsage.payload.rateLimits, ...update }
+                              : cachedCodexUsage.payload.rateLimits,
+                          rateLimitsByLimitId: {
+                            ...cachedCodexUsage.payload.rateLimitsByLimitId,
+                            [limitId]: {
+                              ...cachedCodexUsage.payload.rateLimitsByLimitId?.[limitId],
+                              ...update,
+                            },
                           },
                         },
                       };
-                      cachedCodexUsageSource = "notification";
                     }
                   }
                   const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
@@ -1874,12 +1881,19 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 }),
             ),
           );
-          return yield* runtime.readAccountRateLimits.pipe(
-            Effect.mapError((cause) =>
-              mapCodexRuntimeError(usageThreadId, "account/rateLimits/read", cause),
-            ),
-            Effect.ensuring(runtime.close),
-          );
+          return yield* Effect.gen(function* () {
+            const account = yield* runtime.readAccount.pipe(
+              Effect.mapError((cause) =>
+                mapCodexRuntimeError(usageThreadId, "account/read", cause),
+              ),
+            );
+            if (account.account?.type !== "chatgpt") return null;
+            return yield* runtime.readAccountRateLimits.pipe(
+              Effect.mapError((cause) =>
+                mapCodexRuntimeError(usageThreadId, "account/rateLimits/read", cause),
+              ),
+            );
+          }).pipe(Effect.ensuring(runtime.close));
         }),
       (usageScope) => Scope.close(usageScope, Exit.void),
     );
@@ -1887,38 +1901,50 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
   const readCodexUsage: NonNullable<CodexAdapterShape["readCodexUsage"]> = Effect.fn(
     "CodexAdapter.readCodexUsage",
-  )(
-    function* (model): Effect.fn.Return<CodexUsageSnapshot | null, ProviderAdapterError> {
+  )(function* (model): Effect.fn.Return<CodexUsageSnapshot | null, ProviderAdapterError> {
+    return yield* Effect.gen(function* () {
       const session = Array.from(sessions.values()).findLast((candidate) => !candidate.stopped);
       const payload = yield* session
-        ? session.runtime.readAccountRateLimits.pipe(
-            Effect.mapError((cause) =>
-              mapCodexRuntimeError(session.threadId, "account/rateLimits/read", cause),
-            ),
-          )
+        ? Effect.gen(function* () {
+            const account = yield* session.runtime.readAccount.pipe(
+              Effect.mapError((cause) =>
+                mapCodexRuntimeError(session.threadId, "account/read", cause),
+              ),
+            );
+            if (account.account?.type !== "chatgpt") return null;
+            return yield* session.runtime.readAccountRateLimits.pipe(
+              Effect.mapError((cause) =>
+                mapCodexRuntimeError(session.threadId, "account/rateLimits/read", cause),
+              ),
+            );
+          })
         : readCodexUsageWithoutSession();
-      cachedCodexUsagePayload = payload;
-      cachedCodexUsageSource = "read";
+      if (payload === null) return null;
+      const checkedAt = (options?.now?.() ?? new Date()).toISOString();
+      cachedCodexUsage = { payload, checkedAt, source: "read" };
       return resolveCodexUsageSnapshot({
         providerInstanceId: boundInstanceId,
         model,
         payload,
         source: "read",
+        checkedAt,
       });
-    },
-    Effect.catch((error) =>
-      cachedCodexUsagePayload
-        ? Effect.succeed(
-            resolveCodexUsageSnapshot({
-              providerInstanceId: boundInstanceId,
-              model,
-              payload: cachedCodexUsagePayload,
-              source: cachedCodexUsageSource === "notification" ? "notification" : "cache",
-            }),
-          )
-        : Effect.fail(error),
-    ),
-  );
+    }).pipe(
+      Effect.catch((error) =>
+        cachedCodexUsage
+          ? Effect.succeed(
+              resolveCodexUsageSnapshot({
+                providerInstanceId: boundInstanceId,
+                model,
+                payload: cachedCodexUsage.payload,
+                source: cachedCodexUsage.source === "notification" ? "notification" : "cache",
+                checkedAt: cachedCodexUsage.checkedAt,
+              }),
+            )
+          : Effect.fail(error),
+      ),
+    );
+  });
 
   const requestLivenessSample: CodexAdapterShape["requestLivenessSample"] = (
     threadId,

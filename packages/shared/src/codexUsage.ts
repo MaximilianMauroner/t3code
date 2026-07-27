@@ -35,10 +35,9 @@ function bucketIdentifiers(key: string, bucket: CodexUsageRawBucket): ReadonlySe
 
 function matchesModel(model: string, key: string, bucket: CodexUsageRawBucket): boolean {
   const normalizedModel = normalizeIdentifier(model);
-  return [...bucketIdentifiers(key, bucket)].some(
-    (identifier) =>
-      identifier === normalizedModel ||
-      (normalizedModel.length > 0 && identifier.includes(normalizedModel)),
+  return (
+    normalizedModel.length > 0 &&
+    [...bucketIdentifiers(key, bucket)].some((identifier) => identifier === normalizedModel)
   );
 }
 
@@ -67,6 +66,7 @@ export function resolveCodexUsageSnapshot(input: {
   readonly payload: CodexUsageRawPayload;
   readonly source: CodexUsageSnapshotSource;
   readonly now?: Date;
+  readonly checkedAt?: string;
 }): CodexUsageSnapshot | null {
   const model = input.model.trim();
   if (model.length === 0) return null;
@@ -83,9 +83,10 @@ export function resolveCodexUsageSnapshot(input: {
     if (generic.length === 1 && competing.length === 0) selected = generic[0]!;
     if (entries.length === 0 && input.payload.rateLimits) {
       const legacy = input.payload.rateLimits;
-      const legacyId = legacy.limitId?.trim() || "codex";
-      if (normalizeIdentifier(legacyId) === "codex" || matchesModel(model, legacyId, legacy)) {
-        selected = [legacyId, legacy];
+      const legacyKey = legacy.limitId?.trim() ?? "";
+      const identities = bucketIdentifiers(legacyKey, legacy);
+      if (identities.has("codex") || matchesModel(model, legacyKey, legacy)) {
+        selected = [legacyKey || legacy.limitName?.trim() || model, legacy];
       }
     }
   }
@@ -115,7 +116,7 @@ export function resolveCodexUsageSnapshot(input: {
     providerInstanceId: input.providerInstanceId,
     model,
     limitId: selected[1].limitId?.trim() || selected[0],
-    checkedAt: (input.now ?? new Date()).toISOString(),
+    checkedAt: input.checkedAt ?? (input.now ?? new Date()).toISOString(),
     windows,
     rateLimitReachedType: selected[1].rateLimitReachedType ?? null,
     source: input.source,
