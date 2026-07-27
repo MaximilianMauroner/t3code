@@ -30,6 +30,51 @@ const makeDelivery = (
 });
 
 it.layer(testLayer)("OrchestrationReactorDeliveries", (it) => {
+  it.effect("defers uncertain execution without making it replayable", () =>
+    Effect.gen(function* () {
+      const repository = yield* OrchestrationReactorDeliveries;
+      yield* repository.insert(makeDelivery("uncertain", 1));
+      yield* repository.claimNext({
+        claimToken: "uncertain-claim",
+        currentBootId: "boot-1",
+        claimedAt: "2026-07-26T00:00:01.000Z",
+        leaseExpiresAt: "2026-07-26T00:05:01.000Z",
+      });
+      yield* repository.markExecutionStarted(
+        "uncertain",
+        "uncertain-claim",
+        "2026-07-26T00:00:01.500Z",
+      );
+
+      expect(
+        yield* repository.deferUncertain(
+          "uncertain",
+          "wrong-claim",
+          "2026-07-26T00:00:02.000Z",
+          "2026-07-26T00:00:03.000Z",
+          "awaiting liveness",
+        ),
+      ).toBe(false);
+      expect(
+        yield* repository.deferUncertain(
+          "uncertain",
+          "uncertain-claim",
+          "2026-07-26T00:00:02.000Z",
+          "2026-07-26T00:00:03.000Z",
+          "awaiting liveness",
+        ),
+      ).toBe(true);
+      expect(Option.getOrThrow(yield* repository.getById("uncertain"))).toMatchObject({
+        status: "pending",
+        executionStartedAt: "2026-07-26T00:00:01.500Z",
+        nextAttemptAt: "2026-07-26T00:00:03.000Z",
+        lastError: "awaiting liveness",
+        claimToken: null,
+      });
+      yield* repository.markCancelled("uncertain", "2026-07-26T00:00:02.500Z");
+    }),
+  );
+
   it.effect("leases, retries, and blocks globally ordered durable delivery work", () =>
     Effect.gen(function* () {
       const repository = yield* OrchestrationReactorDeliveries;

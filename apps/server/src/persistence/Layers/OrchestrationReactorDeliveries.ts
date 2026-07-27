@@ -54,6 +54,13 @@ const FailureInput = Schema.Struct({
   maxAttempts: PositiveInt,
   nextAttemptAt: IsoDateTime,
 });
+const DeferredUncertainInput = Schema.Struct({
+  deliveryId: Schema.String,
+  expectedClaimToken: TrimmedNonEmptyString,
+  deferredAt: IsoDateTime,
+  nextAttemptAt: IsoDateTime,
+  detail: Schema.String,
+});
 const FailureResult = Schema.Struct({
   status: Schema.Literals(["pending", "dead-letter"]),
 });
@@ -236,6 +243,19 @@ const make = Effect.gen(function* () {
       RETURNING delivery_id AS "deliveryId"
     `,
   });
+  const updateDeferredUncertain = SqlSchema.findOneOption({
+    Request: DeferredUncertainInput,
+    Result: UpdatedDelivery,
+    execute: ({ deliveryId, expectedClaimToken, deferredAt, nextAttemptAt, detail }) => sql`
+      UPDATE orchestration_reactor_deliveries
+      SET status = 'pending', last_error = ${detail}, last_failed_at = ${deferredAt},
+          next_attempt_at = ${nextAttemptAt},
+          claim_token = NULL, claim_boot_id = NULL, claimed_at = NULL, lease_expires_at = NULL
+      WHERE delivery_id = ${deliveryId} AND status = 'delivering'
+        AND claim_token = ${expectedClaimToken} AND execution_started_at IS NOT NULL
+      RETURNING delivery_id AS "deliveryId"
+    `,
+  });
   const updateFailure = SqlSchema.findOneOption({
     Request: FailureInput,
     Result: FailureResult,
@@ -358,6 +378,23 @@ const make = Effect.gen(function* () {
       Effect.map(Option.isSome),
       Effect.mapError(mapError("OrchestrationReactorDeliveries.markCancelled")),
     );
+  const deferUncertain: OrchestrationReactorDeliveriesShape["deferUncertain"] = (
+    deliveryId,
+    expectedClaimToken,
+    deferredAt,
+    nextAttemptAt,
+    detail,
+  ) =>
+    updateDeferredUncertain({
+      deliveryId,
+      expectedClaimToken,
+      deferredAt,
+      nextAttemptAt,
+      detail,
+    }).pipe(
+      Effect.map(Option.isSome),
+      Effect.mapError(mapError("OrchestrationReactorDeliveries.deferUncertain")),
+    );
   const recordFailure: OrchestrationReactorDeliveriesShape["recordFailure"] = (
     deliveryId,
     expectedClaimToken,
@@ -388,6 +425,7 @@ const make = Effect.gen(function* () {
     markExecutionStarted,
     markDelivered,
     markCancelled,
+    deferUncertain,
     recordFailure,
   } satisfies OrchestrationReactorDeliveriesShape;
 });

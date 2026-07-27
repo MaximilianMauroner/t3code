@@ -7,12 +7,14 @@ import {
   OrchestrationEvent,
   OrchestrationThread,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -30,6 +32,8 @@ import {
   type OrchestrationReactorDeliveriesShape,
 } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 import { ServerBootIdentity } from "../../serverBootId.ts";
+import type { ProviderLivenessSample } from "../../provider/Services/ProviderAdapter.ts";
+import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { planReactorDelivery } from "../reactorDeliveries.ts";
 import { CheckpointReactor } from "../Services/CheckpointReactor.ts";
 import { OrchestrationDeliveryRuntime } from "../Services/OrchestrationDeliveryRuntime.ts";
@@ -38,6 +42,7 @@ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts"
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import { OrchestrationDeliveryRuntimeLive } from "./OrchestrationDeliveryRuntime.ts";
+import { OrchestrationCommandInvariantError } from "../Errors.ts";
 
 const now = "2026-01-01T00:00:00.000Z";
 const threadId = ThreadId.make("thread-1");
@@ -161,6 +166,23 @@ function activeSessionThread() {
   });
 }
 
+function activeProviderSample(): ProviderLivenessSample {
+  return {
+    state: "present",
+    threadId,
+    session: {
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      status: "running",
+      runtimeMode: "full-access",
+      threadId,
+      activeTurnId: TurnId.make("turn-1"),
+      createdAt: now,
+      updatedAt: now,
+    },
+  };
+}
+
 describe("OrchestrationDeliveryRuntime", () => {
   function createLayer(input: {
     readonly providerDeliver: ProviderCommandReactor["Service"]["deliver"];
@@ -168,6 +190,8 @@ describe("OrchestrationDeliveryRuntime", () => {
     readonly dispatchInternal?: OrchestrationEngineService["Service"]["dispatchInternal"];
     readonly closeExternalAdmission?: OrchestrationEngineService["Service"]["closeExternalAdmission"];
     readonly thread?: ReturnType<typeof absentSessionThread>;
+    readonly getThread?: () => OrchestrationThread | undefined;
+    readonly inspectTarget?: NonNullable<ProviderService["Service"]["inspectTarget"]>;
     readonly transformRepository?: (
       repository: OrchestrationReactorDeliveriesShape,
     ) => OrchestrationReactorDeliveriesShape;
@@ -192,7 +216,19 @@ describe("OrchestrationDeliveryRuntime", () => {
       ),
       Layer.provideMerge(
         Layer.mock(ProjectionSnapshotQuery)({
-          getThreadDetailById: () => Effect.succeed(Option.fromUndefinedOr(input.thread)),
+          getThreadDetailById: () =>
+            Effect.succeed(Option.fromUndefinedOr(input.getThread?.() ?? input.thread)),
+        }),
+      ),
+      Layer.provideMerge(
+        Layer.mock(ProviderService)({
+          inspectTarget:
+            input.inspectTarget ??
+            (() =>
+              Effect.succeed({
+                state: "absent",
+                threadId,
+              } satisfies ProviderLivenessSample)),
         }),
       ),
       Layer.provideMerge(
@@ -548,6 +584,282 @@ describe("OrchestrationDeliveryRuntime", () => {
           }),
         );
         expect(status).toBe("cancelled");
+      }),
+  );
+
+  effectIt.effect(
+    "retains an uncertain turn start while successful provider execution is ahead of ingestion",
+    () =>
+      Effect.gen(function* () {
+        const barrier = yield* Deferred.make<ProviderLivenessSample>();
+        const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+          Effect.succeed("delivered" as const),
+        );
+        const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
+          () => Effect.succeed({ sequence: 2 }),
+        );
+        let thread: OrchestrationThread = absentSessionThread();
+        let failTerminalUpdate = true;
+        const delivery = deliveryFor(turnStartEvent(1, "ingestion-lags"), "current-boot");
+
+        const result = yield* Effect.gen(function* () {
+          const repository = yield* OrchestrationReactorDeliveries;
+          const runtime = yield* OrchestrationDeliveryRuntime;
+          yield* repository.insert(delivery);
+          const drainFiber = yield* runtime.drain.pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          const whileLagging = Option.getOrThrow(
+            yield* repository.getById(delivery.deliveryId),
+          ).status;
+          thread = activeSessionThread();
+          yield* Deferred.succeed(barrier, activeProviderSample());
+          yield* Fiber.join(drainFiber);
+          return {
+            whileLagging,
+            final: Option.getOrThrow(yield* repository.getById(delivery.deliveryId)).status,
+          };
+        }).pipe(
+          Effect.provide(
+            createLayer({
+              providerDeliver,
+              dispatchInternal,
+              getThread: () => thread,
+              inspectTarget: () => Deferred.await(barrier),
+              transformRepository: (repository) => ({
+                ...repository,
+                markDelivered: (...args) => {
+                  if (failTerminalUpdate) {
+                    failTerminalUpdate = false;
+                    return Effect.die("injected terminal update failure");
+                  }
+                  return repository.markDelivered(...args);
+                },
+              }),
+            }),
+          ),
+        );
+
+        expect(result.whileLagging).toBe("delivering");
+        expect(result.final).toBe("delivered");
+        expect(dispatchInternal).not.toHaveBeenCalled();
+      }),
+  );
+
+  effectIt.effect("reclassifies a stale pending CAS as the exact concrete active turn", () =>
+    Effect.gen(function* () {
+      const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+        Effect.fail("provider completion became uncertain"),
+      );
+      let thread: OrchestrationThread = absentSessionThread();
+      let probes = 0;
+      const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
+        () =>
+          Effect.sync(() => {
+            thread = activeSessionThread();
+          }).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new OrchestrationCommandInvariantError({
+                  commandType: "thread.session.interrupt-if-active",
+                  detail: "Recovery target no longer matches the projected session.",
+                }),
+              ),
+            ),
+          ),
+      );
+      const delivery = deliveryFor(turnStartEvent(1, "stale-pending-cas"), "current-boot");
+      const status = yield* Effect.gen(function* () {
+        const repository = yield* OrchestrationReactorDeliveries;
+        const runtime = yield* OrchestrationDeliveryRuntime;
+        yield* repository.insert(delivery);
+        yield* runtime.drain;
+        return Option.getOrThrow(yield* repository.getById(delivery.deliveryId)).status;
+      }).pipe(
+        Effect.provide(
+          createLayer({
+            providerDeliver,
+            dispatchInternal,
+            getThread: () => thread,
+            inspectTarget: () =>
+              Effect.sync(() => {
+                probes += 1;
+                return probes === 1
+                  ? ({ state: "absent", threadId } satisfies ProviderLivenessSample)
+                  : activeProviderSample();
+              }),
+          }),
+        ),
+      );
+
+      expect(dispatchInternal).toHaveBeenCalledTimes(1);
+      expect(probes).toBe(2);
+      expect(status).toBe("delivered");
+    }),
+  );
+
+  effectIt.effect(
+    "settles a barrier-proven missing provider against the exact concrete active turn",
+    () =>
+      Effect.gen(function* () {
+        const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+          Effect.succeed("delivered" as const),
+        );
+        const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
+          () => Effect.succeed({ sequence: 2 }),
+        );
+        const delivery = decodeNewDelivery({
+          ...deliveryFor(turnStartEvent(1, "concrete-provider-missing"), "current-boot"),
+          executionStartedAt: now,
+        });
+        const status = yield* Effect.gen(function* () {
+          const repository = yield* OrchestrationReactorDeliveries;
+          const runtime = yield* OrchestrationDeliveryRuntime;
+          yield* repository.insert(delivery);
+          yield* runtime.drain;
+          return Option.getOrThrow(yield* repository.getById(delivery.deliveryId)).status;
+        }).pipe(
+          Effect.provide(
+            createLayer({
+              providerDeliver,
+              dispatchInternal,
+              thread: activeSessionThread(),
+              inspectTarget: () => Effect.succeed({ state: "absent", threadId }),
+            }),
+          ),
+        );
+
+        expect(dispatchInternal).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "thread.session.interrupt-if-active",
+            target: expect.objectContaining({
+              kind: "turn",
+              turnId: TurnId.make("turn-1"),
+              retrySourceMessageId: MessageId.make("message-1"),
+              expectedSession: expect.objectContaining({
+                kind: "present",
+                status: "running",
+                activeTurnId: TurnId.make("turn-1"),
+              }),
+            }),
+          }),
+        );
+        expect(status).toBe("cancelled");
+      }),
+  );
+
+  effectIt.effect("keeps an uncertain turn start non-terminal when liveness is unavailable", () =>
+    Effect.gen(function* () {
+      const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+        Effect.fail("provider completion became uncertain"),
+      );
+      const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
+        () => Effect.succeed({ sequence: 2 }),
+      );
+      const delivery = deliveryFor(turnStartEvent(1, "liveness-unavailable"), "current-boot");
+      const result = yield* Effect.gen(function* () {
+        const repository = yield* OrchestrationReactorDeliveries;
+        const runtime = yield* OrchestrationDeliveryRuntime;
+        yield* repository.insert(delivery);
+        yield* runtime.drain;
+        return {
+          row: Option.getOrThrow(yield* repository.getById(delivery.deliveryId)),
+          readiness: yield* runtime.inspectReadiness,
+        };
+      }).pipe(
+        Effect.provide(
+          createLayer({
+            providerDeliver,
+            dispatchInternal,
+            thread: absentSessionThread(),
+            inspectTarget: () =>
+              Effect.succeed({ state: "unknown", reason: "unavailable" } as const),
+          }),
+        ),
+      );
+
+      expect(result.row).toMatchObject({
+        status: "pending",
+        executionStartedAt: expect.any(String),
+        nextAttemptAt: expect.any(String),
+      });
+      expect(result.readiness.counts.pending).toBe(1);
+      expect(dispatchInternal).not.toHaveBeenCalled();
+    }),
+  );
+
+  effectIt.effect(
+    "keeps an uncertain turn start non-terminal when its ingestion barrier times out",
+    () =>
+      Effect.gen(function* () {
+        const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+          Effect.fail("provider completion became uncertain"),
+        );
+        const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
+          () => Effect.succeed({ sequence: 2 }),
+        );
+        const delivery = deliveryFor(turnStartEvent(1, "liveness-timeout"), "current-boot");
+        const status = yield* Effect.gen(function* () {
+          const repository = yield* OrchestrationReactorDeliveries;
+          const runtime = yield* OrchestrationDeliveryRuntime;
+          yield* repository.insert(delivery);
+          const drainFiber = yield* runtime.drain.pipe(Effect.forkChild);
+          yield* TestClock.adjust("3 seconds");
+          yield* Fiber.join(drainFiber);
+          return Option.getOrThrow(yield* repository.getById(delivery.deliveryId)).status;
+        }).pipe(
+          Effect.provide(
+            createLayer({
+              providerDeliver,
+              dispatchInternal,
+              thread: absentSessionThread(),
+              inspectTarget: () => Effect.never,
+            }),
+          ),
+        );
+
+        expect(status).toBe("pending");
+        expect(dispatchInternal).not.toHaveBeenCalled();
+      }),
+  );
+
+  effectIt.effect(
+    "does not terminalize an exact pending start until its conditional recovery commits",
+    () =>
+      Effect.gen(function* () {
+        const recoveryCommitted = yield* Deferred.make<void>();
+        const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+          Effect.fail("provider completion became uncertain"),
+        );
+        const delivery = deliveryFor(turnStartEvent(1, "pending-commit-barrier"), "current-boot");
+        const result = yield* Effect.gen(function* () {
+          const repository = yield* OrchestrationReactorDeliveries;
+          const runtime = yield* OrchestrationDeliveryRuntime;
+          yield* repository.insert(delivery);
+          const drainFiber = yield* runtime.drain.pipe(Effect.forkChild);
+          yield* Effect.yieldNow;
+          const beforeCommit = Option.getOrThrow(
+            yield* repository.getById(delivery.deliveryId),
+          ).status;
+          yield* Deferred.succeed(recoveryCommitted, undefined);
+          yield* Fiber.join(drainFiber);
+          return {
+            beforeCommit,
+            afterCommit: Option.getOrThrow(yield* repository.getById(delivery.deliveryId)).status,
+          };
+        }).pipe(
+          Effect.provide(
+            createLayer({
+              providerDeliver,
+              thread: absentSessionThread(),
+              inspectTarget: () => Effect.succeed({ state: "absent", threadId }),
+              dispatchInternal: () =>
+                Deferred.await(recoveryCommitted).pipe(Effect.as({ sequence: 2 })),
+            }),
+          ),
+        );
+
+        expect(result.beforeCommit).toBe("delivering");
+        expect(result.afterCommit).toBe("cancelled");
       }),
   );
 

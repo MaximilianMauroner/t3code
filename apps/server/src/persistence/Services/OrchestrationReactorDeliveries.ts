@@ -135,6 +135,18 @@ export interface OrchestrationReactorDeliveriesShape {
     cancelledAt: string,
     expectedClaimToken?: string | undefined,
   ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+  /**
+   * Releases an uncertain execution claim for a later evidence-based retry.
+   * Unlike ordinary failure handling this retains executionStartedAt, so the
+   * external action can never be replayed.
+   */
+  readonly deferUncertain: (
+    deliveryId: string,
+    expectedClaimToken: string,
+    deferredAt: string,
+    nextAttemptAt: string,
+    detail: string,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
   readonly recordFailure: (
     deliveryId: string,
     expectedClaimToken: string,

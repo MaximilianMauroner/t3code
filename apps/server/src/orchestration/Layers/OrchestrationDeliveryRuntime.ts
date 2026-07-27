@@ -4,7 +4,9 @@ import {
   type OrchestrationExpectedSession,
   type OrchestrationRecoveryTarget,
   type OrchestrationSession,
+  type OrchestrationThread,
   OrchestrationEvent,
+  type ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -24,6 +26,8 @@ import {
 
 import { OrchestrationReactorDeliveries } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
 import type { OrchestrationReactorDelivery } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import type { ProviderLivenessSample } from "../../provider/Services/ProviderAdapter.ts";
+import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ServerBootIdentity } from "../../serverBootId.ts";
 import { recoveryCommandId } from "../recoveryCommandId.ts";
 import { CheckpointReactor } from "../Services/CheckpointReactor.ts";
@@ -40,6 +44,7 @@ const MAX_DELIVERY_ATTEMPTS = 3;
 const CLAIM_LEASE_MINUTES = 5;
 const RETRY_BACKOFF_MILLIS = [1_000, 5_000, 30_000] as const;
 const STARTUP_RECOVERY_BUDGET_MILLIS = 40_000;
+const SAME_BOOT_RECOVERY_RECLASSIFY_LIMIT = 3;
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 
 function expectedSessionFrom(session: OrchestrationSession): OrchestrationExpectedSession {
@@ -55,6 +60,41 @@ function expectedSessionFrom(session: OrchestrationSession): OrchestrationExpect
   };
 }
 
+function providerInstanceFor(thread: OrchestrationThread): ProviderInstanceId {
+  return thread.session?.providerInstanceId ?? thread.modelSelection.instanceId;
+}
+
+function hasMatchingLiveTurn(
+  sample: ProviderLivenessSample,
+  providerInstanceId: ProviderInstanceId,
+  turnId: string,
+): boolean {
+  return (
+    sample.state === "present" &&
+    sample.session.providerInstanceId === providerInstanceId &&
+    sample.session.activeTurnId === turnId &&
+    (sample.session.status === "connecting" ||
+      sample.session.status === "ready" ||
+      sample.session.status === "running")
+  );
+}
+
+function hasConflictingLiveTurn(
+  sample: ProviderLivenessSample,
+  providerInstanceId: ProviderInstanceId,
+  turnId: string | null,
+): boolean {
+  return (
+    sample.state === "present" &&
+    (sample.session.providerInstanceId !== providerInstanceId ||
+      (sample.session.activeTurnId !== undefined &&
+        sample.session.activeTurnId !== turnId &&
+        (sample.session.status === "connecting" ||
+          sample.session.status === "ready" ||
+          sample.session.status === "running")))
+  );
+}
+
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const deliveries = yield* OrchestrationReactorDeliveries;
@@ -63,6 +103,7 @@ const make = Effect.gen(function* () {
   const providerReactor = yield* ProviderCommandReactor;
   const checkpointReactor = yield* CheckpointReactor;
   const deletionReactor = yield* ThreadDeletionReactor;
+  const providerService = yield* ProviderService;
   const bootId = (yield* ServerBootIdentity).id;
   const drainLock = yield* Semaphore.make(1);
   const liveSourceEventIds = new Set<string>();
@@ -170,6 +211,31 @@ const make = Effect.gen(function* () {
     }
   });
 
+  const deferUncertainDelivery = Effect.fn("deferUncertainDelivery")(function* (
+    delivery: OrchestrationReactorDelivery,
+    claimToken: string,
+  ) {
+    const deferredAtValue = yield* DateTime.now;
+    const deferredAt = DateTime.formatIso(deferredAtValue);
+    const deferred = yield* deliveries.deferUncertain(
+      delivery.deliveryId,
+      claimToken,
+      deferredAt,
+      DateTime.formatIso(DateTime.add(deferredAtValue, { seconds: 1 })),
+      "Provider liveness or projected target was not safe to settle; awaiting another barrier-confirmed classification.",
+    );
+    if (!deferred) {
+      return yield* Effect.die(
+        `uncertain delivery claim was lost before it could be retained for reconciliation`,
+      );
+    }
+    yield* Effect.logWarning("retained uncertain delivery for barrier-confirmed reconciliation", {
+      deliveryId: delivery.deliveryId,
+      threadId: delivery.threadId,
+    });
+    return false;
+  });
+
   const cancelUncertainExecution = Effect.fn("cancelUncertainExecution")(function* (
     delivery: OrchestrationReactorDelivery,
     recovery: {
@@ -185,6 +251,151 @@ const make = Effect.gen(function* () {
       yield* appendNonReplayCancellationEvidence(delivery, recovery.checkpointDetail, detectedAt);
       return "cancelled" as const;
     }
+
+    if (
+      delivery.deliveryKind === "turn-start" &&
+      delivery.sourceBootId === bootId &&
+      event.type === "thread.turn-start-requested"
+    ) {
+      const inspectTarget = providerService.inspectTarget;
+      if (inspectTarget === undefined) {
+        yield* Effect.logWarning("retaining uncertain turn-start delivery without liveness probe", {
+          deliveryId: delivery.deliveryId,
+          threadId: delivery.threadId,
+        });
+        return "retained" as const;
+      }
+
+      for (let attempt = 0; attempt < SAME_BOOT_RECOVERY_RECLASSIFY_LIMIT; attempt += 1) {
+        const beforeBarrier = yield* snapshots
+          .getThreadDetailById(delivery.threadId)
+          .pipe(Effect.map(Option.getOrUndefined));
+        if (beforeBarrier === undefined) {
+          yield* Effect.logWarning("retaining uncertain turn-start delivery without thread state", {
+            deliveryId: delivery.deliveryId,
+            threadId: delivery.threadId,
+          });
+          return "retained" as const;
+        }
+        const inspectedProviderInstanceId = providerInstanceFor(beforeBarrier);
+        const sample = yield* inspectTarget({
+          providerInstanceId: inspectedProviderInstanceId,
+          threadId: delivery.threadId,
+        }).pipe(
+          Effect.timeout("3 seconds"),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("retaining uncertain turn-start delivery without liveness barrier", {
+              deliveryId: delivery.deliveryId,
+              threadId: delivery.threadId,
+              providerInstanceId: inspectedProviderInstanceId,
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as({ state: "unknown", reason: "unavailable" } as const)),
+          ),
+        );
+        if (sample.state === "unknown") {
+          return "retained" as const;
+        }
+
+        const thread = yield* snapshots
+          .getThreadDetailById(delivery.threadId)
+          .pipe(Effect.map(Option.getOrUndefined));
+        if (thread === undefined) return "retained" as const;
+
+        const providerInstanceId = providerInstanceFor(thread);
+        if (providerInstanceId !== inspectedProviderInstanceId) {
+          continue;
+        }
+
+        const latestTurn = thread.latestTurn;
+        if (
+          latestTurn !== null &&
+          latestTurn.state !== "running" &&
+          latestTurn.retrySourceMessageId === event.payload.messageId
+        ) {
+          return "delivered" as const;
+        }
+        const exactRunningTurn =
+          latestTurn?.state === "running" &&
+          latestTurn.retrySourceMessageId === event.payload.messageId &&
+          thread.session !== null &&
+          thread.session.activeTurnId === latestTurn.turnId;
+        if (
+          exactRunningTurn &&
+          hasMatchingLiveTurn(sample, providerInstanceId, latestTurn.turnId)
+        ) {
+          return "delivered" as const;
+        }
+
+        let target: OrchestrationRecoveryTarget;
+        if (exactRunningTurn) {
+          if (hasConflictingLiveTurn(sample, providerInstanceId, latestTurn.turnId)) {
+            return "retained" as const;
+          }
+          target = {
+            kind: "turn",
+            turnId: latestTurn.turnId,
+            retrySourceMessageId: latestTurn.retrySourceMessageId ?? null,
+            expectedSession: expectedSessionFrom(thread.session),
+          };
+        } else {
+          const sampleActiveTurnId =
+            sample.state === "present" ? (sample.session.activeTurnId ?? null) : null;
+          if (
+            latestTurn?.state === "running" ||
+            (sample.state === "present" &&
+              sample.session.providerInstanceId !== providerInstanceId) ||
+            sampleActiveTurnId !== null
+          ) {
+            return "retained" as const;
+          }
+          target = {
+            kind: "pendingStart",
+            pendingMessageId: event.payload.messageId,
+            deliveryId: delivery.deliveryId,
+            sourceEventId: delivery.sourceEventId,
+            expectedSession:
+              thread.session === null ? { kind: "absent" } : expectedSessionFrom(thread.session),
+          };
+        }
+
+        const detectedAt = DateTime.formatIso(yield* DateTime.now);
+        const settled = yield* engine
+          .dispatchInternal({
+            type: "thread.session.interrupt-if-active",
+            commandId: recoveryCommandId({
+              threadId: delivery.threadId,
+              target,
+              serverBootId: bootId,
+              reason: recovery.reason,
+            }),
+            threadId: delivery.threadId,
+            target,
+            reason: recovery.reason,
+            interruptionCode: recovery.interruptionCode,
+            serverBootId: bootId,
+            detectedAt,
+            createdAt: detectedAt,
+          })
+          .pipe(
+            Effect.as(true),
+            Effect.catchTag(
+              ["OrchestrationCommandInvariantError", "OrchestrationCommandPreviouslyRejectedError"],
+              () => Effect.succeed(false),
+            ),
+          );
+        if (settled) return "cancelled" as const;
+      }
+
+      yield* Effect.logWarning(
+        "retaining uncertain turn-start delivery after state kept changing",
+        {
+          deliveryId: delivery.deliveryId,
+          threadId: delivery.threadId,
+        },
+      );
+      return "retained" as const;
+    }
+
     const thread = yield* snapshots
       .getThreadDetailById(delivery.threadId)
       .pipe(Effect.map(Option.getOrUndefined));
@@ -265,7 +476,7 @@ const make = Effect.gen(function* () {
       !liveSourceEventIds.has(delivery.sourceEventId);
     const hasUncertainExecution =
       delivery.replayPolicy === "cancel-with-recovery" && delivery.executionStartedAt !== null;
-    let resolution: "delivered" | "cancelled";
+    let resolution: "delivered" | "cancelled" | "retained";
     if (shouldCancelPriorExecution) {
       resolution = yield* cancelUncertainExecution(delivery, {
         reason: "server-restarted",
@@ -303,6 +514,9 @@ const make = Effect.gen(function* () {
       }
       resolution = yield* dispatchClaimed(delivery);
     }
+    if (resolution === "retained") {
+      return yield* deferUncertainDelivery(delivery, claimToken);
+    }
     const completedAt = DateTime.formatIso(yield* DateTime.now);
     const transitioned =
       resolution === "delivered"
@@ -312,6 +526,7 @@ const make = Effect.gen(function* () {
       return yield* Effect.die(`delivery claim was lost before terminal transition`);
     }
     liveSourceEventIds.delete(delivery.sourceEventId);
+    return true;
   });
 
   const processNext: Effect.Effect<boolean, unknown> = Effect.gen(function* () {
@@ -332,19 +547,34 @@ const make = Effect.gen(function* () {
     const succeeded = yield* processClaimed(claimed.value, () => {
       executionMayHaveStarted = true;
     }).pipe(
-      Effect.as(true),
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause);
         return Effect.gen(function* () {
           const failedAtValue = yield* DateTime.now;
           const failedAt = DateTime.formatIso(failedAtValue);
           if (claimed.value.replayPolicy === "cancel-with-recovery" && executionMayHaveStarted) {
-            yield* cancelUncertainExecution(claimed.value, {
+            const resolution = yield* cancelUncertainExecution(claimed.value, {
               reason: "provider-state-mismatch",
               interruptionCode: "provider_state_mismatch",
               checkpointDetail: `Checkpoint rollback execution may have succeeded before durable completion failed; replay was suppressed. ${Cause.pretty(cause)}`,
               genericDetail: `External execution may have succeeded before durable completion failed; replay was suppressed. ${Cause.pretty(cause)}`,
             });
+            if (resolution === "retained") {
+              return yield* deferUncertainDelivery(claimed.value, claimToken);
+            }
+            if (resolution === "delivered") {
+              const delivered = yield* deliveries.markDelivered(
+                claimed.value.deliveryId,
+                claimToken,
+                failedAt,
+              );
+              if (!delivered) {
+                return yield* Effect.die(
+                  `non-replay delivery claim was lost before completion could be retained`,
+                );
+              }
+              return true;
+            }
             const cancelled = yield* deliveries.markCancelled(
               claimed.value.deliveryId,
               failedAt,
@@ -355,7 +585,7 @@ const make = Effect.gen(function* () {
                 `non-replay delivery claim was lost before cancellation could be retained`,
               );
             }
-            return false;
+            return true;
           }
           const backoffMs =
             RETRY_BACKOFF_MILLIS[
