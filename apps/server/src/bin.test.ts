@@ -27,6 +27,7 @@ import { Command } from "effect/unstable/cli";
 
 import { cli, makeCli } from "./bin.ts";
 import * as ServerConfig from "./config.ts";
+import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
@@ -44,6 +45,16 @@ import { environmentAuthenticatedAuthLayer } from "./auth/http.ts";
 
 const CliRuntimeLayer = Layer.mergeAll(NodeServices.layer, NetService.layer);
 class ProjectCliHttpApi extends HttpApi.make("environment").add(EnvironmentOrchestrationHttpApi) {}
+const ReadyServerRuntimeStartupLayer = Layer.succeed(
+  ServerRuntimeStartup.ServerRuntimeStartup,
+  ServerRuntimeStartup.ServerRuntimeStartup.of({
+    awaitCommandReady: Effect.void,
+    ensureCommandReady: Effect.void,
+    markHttpListening: Effect.void,
+    closeCommandAdmission: Effect.void,
+    enqueueCommand: (effect) => effect,
+  }),
+);
 
 const connectCli = makeCli({ cloudEnabled: true });
 const noConnectCli = makeCli({ cloudEnabled: false });
@@ -119,6 +130,7 @@ const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Ef
     const routesLayer = HttpApiBuilder.layer(ProjectCliHttpApi).pipe(
       Layer.provide(orchestrationHttpApiLayer),
       Layer.provide(environmentAuthenticatedAuthLayer),
+      Layer.provide(ReadyServerRuntimeStartupLayer),
     );
     const appLayer = HttpRouter.serve(routesLayer, {
       disableListenLog: true,
