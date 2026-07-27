@@ -3,7 +3,6 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Ref from "effect/Ref";
 import * as Fiber from "effect/Fiber";
-import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
@@ -175,7 +174,7 @@ it.effect("reuses a graceful reactor close fiber across the forced handoff", () 
   }),
 );
 
-it.effect("bounds a forced handoff waiting on the graceful reactor close fiber", () =>
+it.effect("signals a forced timeout while retaining the graceful reactor close fiber", () =>
   Effect.gen(function* () {
     const scope = yield* Scope.make("sequential");
     const enterFinalizer = yield* Deferred.make<void>();
@@ -220,10 +219,11 @@ it.effect("bounds a forced handoff waiting on the graceful reactor close fiber",
     yield* Deferred.await(forcedStarted);
     yield* TestClock.adjust("2 seconds");
     yield* Deferred.await(forcedTimedOut);
-    yield* Fiber.join(fiber);
+    assert.equal(fiber.pollUnsafe(), undefined);
     assert.equal(yield* Ref.get(starts), 1);
 
     yield* Deferred.succeed(allowFinalizer, undefined);
+    yield* Fiber.join(fiber);
     yield* close;
     assert.equal(yield* Ref.get(starts), 1);
   }),
@@ -267,12 +267,23 @@ it.effect("forces engine sealing and reactor closure when the graceful barrier t
   }),
 );
 
-it.effect("awaits forced worker termination before awaiting reactor finalizers", () =>
+it.effect("awaits the forced worker and shared reactor finalizers before provider teardown", () =>
   Effect.gen(function* () {
     const order = yield* Ref.make<ReadonlyArray<string>>([]);
     const workerStopped = yield* Deferred.make<void>();
-    const scopeClosed = yield* Deferred.make<void>();
+    const finalizerStarted = yield* Deferred.make<void>();
+    const allowFinalizer = yield* Deferred.make<void>();
+    const providerStarted = yield* Deferred.make<void>();
+    const scope = yield* Scope.make("sequential");
     const step = (name: string) => Ref.update(order, (current) => [...current, name]);
+    yield* Scope.addFinalizer(
+      scope,
+      step("scope-finalizer").pipe(
+        Effect.andThen(Deferred.succeed(finalizerStarted, undefined)),
+        Effect.andThen(Deferred.await(allowFinalizer)),
+      ),
+    );
+    const { close } = yield* makeReactorScopeCloser(scope);
     const fiber = yield* runShutdownWithBudget({
       actions: {
         closeExternalAdmission: step("admission"),
@@ -284,38 +295,46 @@ it.effect("awaits forced worker termination before awaiting reactor finalizers",
         internalEngineBarrier: Effect.void,
         interruptActiveTargets: Effect.void,
         sealAndStopEngine: Effect.void,
-        closeReactorScope: Effect.void,
+        closeReactorScope: close,
       },
       forced: step("forced-seal").pipe(
         Effect.andThen(step("worker-await")),
         Effect.andThen(Deferred.await(workerStopped)),
         Effect.andThen(step("worker-stopped")),
         Effect.andThen(step("scope-await")),
-        Effect.andThen(Deferred.await(scopeClosed)),
+        Effect.andThen(close),
         Effect.andThen(step("scope-closed")),
       ),
       budgetMs: 4_000,
       forcedBudgetMs: 2_000,
-    }).pipe(Effect.forkChild);
+    }).pipe(
+      Effect.ensuring(
+        step("provider-started").pipe(Effect.andThen(Deferred.succeed(providerStarted, undefined))),
+      ),
+      Effect.forkChild,
+    );
 
     yield* Effect.yieldNow;
     yield* TestClock.adjust("4 seconds");
     yield* Effect.yieldNow;
     assert.deepStrictEqual(yield* Ref.get(order), ["admission", "forced-seal", "worker-await"]);
     assert.equal(fiber.pollUnsafe(), undefined);
+    assert.equal(yield* Deferred.isDone(providerStarted), false);
 
     yield* Deferred.succeed(workerStopped, undefined);
-    yield* Effect.yieldNow;
+    yield* Deferred.await(finalizerStarted);
     assert.deepStrictEqual(yield* Ref.get(order), [
       "admission",
       "forced-seal",
       "worker-await",
       "worker-stopped",
       "scope-await",
+      "scope-finalizer",
     ]);
     assert.equal(fiber.pollUnsafe(), undefined);
+    assert.equal(yield* Deferred.isDone(providerStarted), false);
 
-    yield* Deferred.succeed(scopeClosed, undefined);
+    yield* Deferred.succeed(allowFinalizer, undefined);
     yield* Fiber.join(fiber);
     assert.deepStrictEqual(yield* Ref.get(order), [
       "admission",
@@ -323,14 +342,18 @@ it.effect("awaits forced worker termination before awaiting reactor finalizers",
       "worker-await",
       "worker-stopped",
       "scope-await",
+      "scope-finalizer",
       "scope-closed",
+      "provider-started",
     ]);
   }),
 );
 
-it.effect("returns at the secondary budget when forced worker termination never completes", () =>
+it.effect("escalates but keeps awaiting forced worker termination after the secondary budget", () =>
   Effect.gen(function* () {
     const order = yield* Ref.make<ReadonlyArray<string>>([]);
+    const allowWorker = yield* Deferred.make<void>();
+    const providerStarted = yield* Deferred.make<void>();
     const step = (name: string) => Ref.update(order, (current) => [...current, name]);
     const fiber = yield* runShutdownWithBudget({
       actions: {
@@ -345,27 +368,55 @@ it.effect("returns at the secondary budget when forced worker termination never 
         sealAndStopEngine: Effect.void,
         closeReactorScope: Effect.void,
       },
-      forced: step("forced-seal").pipe(Effect.andThen(Effect.never)),
+      forced: step("forced-seal").pipe(Effect.andThen(Deferred.await(allowWorker))),
       onForcedTimeout: step("systemd-fallback"),
       budgetMs: 4_000,
       forcedBudgetMs: 2_000,
-    }).pipe(Effect.forkChild);
+    }).pipe(
+      Effect.ensuring(
+        step("provider-started").pipe(Effect.andThen(Deferred.succeed(providerStarted, undefined))),
+      ),
+      Effect.forkChild,
+    );
 
     yield* Effect.yieldNow;
     yield* TestClock.adjust("4 seconds");
     yield* Effect.yieldNow;
     yield* TestClock.adjust("2 seconds");
-    yield* Fiber.join(fiber);
+    yield* Effect.yieldNow;
+    assert.equal(fiber.pollUnsafe(), undefined);
+    assert.equal(yield* Deferred.isDone(providerStarted), false);
     assert.deepStrictEqual(yield* Ref.get(order), ["admission", "forced-seal", "systemd-fallback"]);
+
+    yield* Deferred.succeed(allowWorker, undefined);
+    yield* Fiber.join(fiber);
+    assert.deepStrictEqual(yield* Ref.get(order), [
+      "admission",
+      "forced-seal",
+      "systemd-fallback",
+      "provider-started",
+    ]);
   }),
 );
 
-it.effect("returns at the secondary budget when reactor finalizers never complete", () =>
+it.effect("escalates but keeps provider teardown behind an uninterruptible reactor finalizer", () =>
   Effect.gen(function* () {
     const order = yield* Ref.make<ReadonlyArray<string>>([]);
     const step = (name: string) => Ref.update(order, (current) => [...current, name]);
     const scope = yield* Scope.make("sequential");
-    yield* Scope.addFinalizer(scope, step("finalizer-entered").pipe(Effect.andThen(Effect.never)));
+    const allowFinalizer = yield* Deferred.make<void>();
+    const providerStarted = yield* Deferred.make<void>();
+    const starts = yield* Ref.make(0);
+    yield* Scope.addFinalizer(
+      scope,
+      Effect.uninterruptible(
+        Ref.update(starts, (count) => count + 1).pipe(
+          Effect.andThen(step("finalizer-entered")),
+          Effect.andThen(Deferred.await(allowFinalizer)),
+        ),
+      ),
+    );
+    const { close } = yield* makeReactorScopeCloser(scope);
     const fiber = yield* runShutdownWithBudget({
       actions: {
         closeExternalAdmission: step("admission"),
@@ -377,29 +428,50 @@ it.effect("returns at the secondary budget when reactor finalizers never complet
         internalEngineBarrier: Effect.void,
         interruptActiveTargets: Effect.void,
         sealAndStopEngine: Effect.void,
-        closeReactorScope: Effect.void,
+        closeReactorScope: close,
       },
       forced: step("forced-seal").pipe(
         Effect.andThen(step("worker-stopped")),
-        Effect.andThen(Scope.close(scope, Exit.void)),
+        Effect.andThen(close),
       ),
       onForcedTimeout: step("systemd-fallback"),
       budgetMs: 4_000,
       forcedBudgetMs: 2_000,
-    }).pipe(Effect.forkChild);
+    }).pipe(
+      Effect.ensuring(
+        step("provider-started").pipe(Effect.andThen(Deferred.succeed(providerStarted, undefined))),
+      ),
+      Effect.forkChild,
+    );
 
     yield* Effect.yieldNow;
     yield* TestClock.adjust("4 seconds");
     yield* Effect.yieldNow;
     yield* TestClock.adjust("2 seconds");
-    yield* Fiber.join(fiber);
+    yield* Effect.yieldNow;
     assert.equal(scope.state._tag, "Closed");
+    assert.equal(fiber.pollUnsafe(), undefined);
+    assert.equal(yield* Deferred.isDone(providerStarted), false);
+    assert.equal(yield* Ref.get(starts), 1);
     assert.deepStrictEqual(yield* Ref.get(order), [
       "admission",
       "forced-seal",
       "worker-stopped",
       "finalizer-entered",
       "systemd-fallback",
+    ]);
+
+    yield* Deferred.succeed(allowFinalizer, undefined);
+    yield* Fiber.join(fiber);
+    yield* close;
+    assert.equal(yield* Ref.get(starts), 1);
+    assert.deepStrictEqual(yield* Ref.get(order), [
+      "admission",
+      "forced-seal",
+      "worker-stopped",
+      "finalizer-entered",
+      "systemd-fallback",
+      "provider-started",
     ]);
   }),
 );

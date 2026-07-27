@@ -77,11 +77,11 @@ export const runShutdownWithBudget = Effect.fn("ShutdownCoordinator.runShutdownW
             Effect.timeout(
               `${input.forcedBudgetMs ?? SHUTDOWN_COORDINATOR_FORCE_BUDGET_MS} millis`,
             ),
-            Effect.catchCause(() => {
-              forcedFiber.interruptUnsafe();
-              return input.onForcedTimeout ?? Effect.void;
-            }),
+            Effect.catchCause(() => input.onForcedTimeout ?? Effect.void),
           );
+          // The secondary deadline escalates to systemd, but provider teardown
+          // must stay behind the same engine-stop/reactor-close operation.
+          yield* Fiber.join(forcedFiber);
         }),
       ),
     );
