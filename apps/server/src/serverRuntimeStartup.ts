@@ -470,8 +470,17 @@ export const make = Effect.gen(function* () {
         yield* providerRuntimeIngestion.start().pipe(Scope.provide(reactorScope));
         const reconciliation = yield* orphanTurnReconciler.reconcileStartup;
         if (reconciliation.status === "unresolved") {
+          const legacyDiagnostic =
+            reconciliation.legacyPending.count === 0
+              ? ""
+              : `; ${reconciliation.legacyPending.count} legacy pending start(s) lack exact delivery/event identity: ${reconciliation.legacyPending.issues
+                  .map(
+                    (issue) =>
+                      `row=${issue.rowId},thread=${issue.threadId},message=${issue.messageId},session=${issue.sessionStatus ?? "absent"}`,
+                  )
+                  .join(" | ")}${reconciliation.legacyPending.truncated ? " | …" : ""}`;
           return yield* Effect.die(
-            `startup reconciliation left ${reconciliation.candidateCount} unresolved candidate(s)`,
+            `startup reconciliation left ${reconciliation.candidateCount} unresolved candidate(s)${legacyDiagnostic}`,
           );
         }
         yield* deliveryRuntime.start().pipe(Scope.provide(reactorScope));

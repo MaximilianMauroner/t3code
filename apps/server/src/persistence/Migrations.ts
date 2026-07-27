@@ -52,6 +52,7 @@ import Migration0036 from "./Migrations/036_OrchestrationReactorDeliveryLeases.t
 import Migration0037 from "./Migrations/037_OrchestrationReactorDeliveryRetrySchedule.ts";
 import Migration0038 from "./Migrations/038_OrchestrationReactorDeliveryClaimOwnership.ts";
 import Migration0039 from "./Migrations/039_BackfillLegacyPendingTurnStarts.ts";
+import Migration0040 from "./Migrations/040_LegacyPendingTurnReadinessIndex.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -103,6 +104,7 @@ export const migrationEntries = [
   [37, "OrchestrationReactorDeliveryRetrySchedule", Migration0037],
   [38, "OrchestrationReactorDeliveryClaimOwnership", Migration0038],
   [39, "BackfillLegacyPendingTurnStarts", Migration0039],
+  [40, "LegacyPendingTurnReadinessIndex", Migration0040],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

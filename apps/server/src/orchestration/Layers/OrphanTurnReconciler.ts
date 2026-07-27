@@ -27,6 +27,7 @@ import {
   type OrphanTurnReconcilerShape,
 } from "../Services/OrphanTurnReconciler.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import type { LegacyPendingTurnReadiness } from "../Services/ProjectionSnapshotQuery.ts";
 import { recoveryCommandId } from "../recoveryCommandId.ts";
 
 const PROBE_TIMEOUT = Duration.seconds(3);
@@ -134,8 +135,19 @@ export function latestEligibleRecoveryObservation(
     .toSorted((left, right) => right.localeCompare(left))[0];
 }
 
-export function startupReconciliationResult(candidateCount: number): OrphanTurnStartupResult {
-  return candidateCount === 0 ? { status: "settled" } : { status: "unresolved", candidateCount };
+const noLegacyPending: LegacyPendingTurnReadiness = {
+  count: 0,
+  issues: [],
+  truncated: false,
+};
+
+export function startupReconciliationResult(
+  candidateCount: number,
+  legacyPending: LegacyPendingTurnReadiness = noLegacyPending,
+): OrphanTurnStartupResult {
+  return candidateCount === 0 && legacyPending.count === 0
+    ? { status: "settled" }
+    : { status: "unresolved", candidateCount, legacyPending };
 }
 
 export function isRecoveryCandidateMatch(
@@ -366,14 +378,35 @@ const make = Effect.gen(function* () {
       Effect.forkScoped,
       Effect.asVoid,
     );
+  const readLegacyPendingReadiness = Effect.fn("OrphanTurnReconciler.readLegacyPendingReadiness")(
+    function* () {
+      const read = snapshots.getLegacyPendingTurnReadiness;
+      if (read === undefined) {
+        return yield* Effect.die(
+          "legacy pending-turn readiness query is unavailable; refusing command readiness",
+        );
+      }
+      return yield* read();
+    },
+  );
   const reconcileStartup: OrphanTurnReconcilerShape["reconcileStartup"] = Effect.gen(function* () {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       if (attempt > 0) yield* Effect.sleep(SWEEP_INTERVAL);
+      const beforeSweep = yield* readLegacyPendingReadiness();
+      if (beforeSweep.count > 0) {
+        return startupReconciliationResult((yield* collectCandidates()).length, beforeSweep);
+      }
       yield* runSweep("server-restarted");
-      const result = startupReconciliationResult((yield* collectCandidates()).length);
+      const result = startupReconciliationResult(
+        (yield* collectCandidates()).length,
+        yield* readLegacyPendingReadiness(),
+      );
       if (result.status === "settled") return result;
     }
-    return startupReconciliationResult((yield* collectCandidates()).length);
+    return startupReconciliationResult(
+      (yield* collectCandidates()).length,
+      yield* readLegacyPendingReadiness(),
+    );
   });
   const snapshotAndInterrupt: OrphanTurnReconcilerShape["snapshotAndInterrupt"] = () =>
     collectCandidates().pipe(

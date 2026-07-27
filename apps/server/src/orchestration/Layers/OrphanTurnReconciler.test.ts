@@ -9,9 +9,24 @@ import {
   type ProviderSession,
   type OrchestrationThread,
 } from "@t3tools/contracts";
+import { it as effectIt } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import { describe, expect, it } from "vite-plus/test";
 
+import { PersistenceSqlError } from "../../persistence/Errors.ts";
+import { OrchestrationReactorDeliveries } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
+import { ServerBootIdentity } from "../../serverBootId.ts";
+import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
+import { OrphanTurnReconciler } from "../Services/OrphanTurnReconciler.ts";
 import {
+  ProjectionSnapshotQuery,
+  type LegacyPendingTurnReadiness,
+} from "../Services/ProjectionSnapshotQuery.ts";
+import {
+  OrphanTurnReconcilerLive,
   isPriorBootRecoveryCandidate,
   isRecoveryCandidateMatch,
   latestEligibleRecoveryObservation,
@@ -23,6 +38,47 @@ import {
 const threadId = ThreadId.make("thread-recovery");
 const instanceId = ProviderInstanceId.make("cursor");
 const turnId = TurnId.make("turn-recovery");
+const noLegacyPending: LegacyPendingTurnReadiness = {
+  count: 0,
+  issues: [],
+  truncated: false,
+};
+
+function liveReconcilerLayer(
+  readLegacyPending: () => Effect.Effect<LegacyPendingTurnReadiness, PersistenceSqlError>,
+) {
+  return OrphanTurnReconcilerLive.pipe(
+    Layer.provideMerge(Layer.mock(ProviderService)({})),
+    Layer.provideMerge(
+      Layer.mock(ProviderSessionDirectory)({
+        listBindings: () => Effect.succeed([]),
+      }),
+    ),
+    Layer.provideMerge(
+      Layer.mock(ProjectionSnapshotQuery)({
+        getCommandReadModel: () =>
+          Effect.succeed({
+            snapshotSequence: 0,
+            projects: [],
+            threads: [],
+            updatedAt: "1970-01-01T00:00:00.000Z",
+          }),
+        getLegacyPendingTurnReadiness: readLegacyPending,
+      }),
+    ),
+    Layer.provideMerge(
+      Layer.mock(OrchestrationReactorDeliveries)({
+        listPendingOrdered: () => Effect.succeed([]),
+      }),
+    ),
+    Layer.provideMerge(
+      Layer.mock(OrchestrationEngineService)({
+        dispatchInternal: () => Effect.succeed({ sequence: 1 }),
+      }),
+    ),
+    Layer.provideMerge(Layer.succeed(ServerBootIdentity, { id: "boot-current" })),
+  );
+}
 
 function session(input: {
   readonly status: ProviderSession["status"];
@@ -178,7 +234,89 @@ describe("OrphanTurnReconciler liveness matching", () => {
     expect(startupReconciliationResult(3)).toEqual({
       status: "unresolved",
       candidateCount: 3,
+      legacyPending: {
+        count: 0,
+        issues: [],
+        truncated: false,
+      },
     });
+    expect(
+      startupReconciliationResult(0, {
+        count: 2,
+        issues: [
+          {
+            rowId: 41,
+            threadId,
+            messageId: "message-legacy",
+            requestedAt: "2026-07-26T00:00:00.000Z",
+            pendingDeliveryId: null,
+            pendingEventId: null,
+            sessionStatus: "starting",
+          },
+        ],
+        truncated: true,
+      }),
+    ).toEqual({
+      status: "unresolved",
+      candidateCount: 0,
+      legacyPending: {
+        count: 2,
+        issues: [
+          {
+            rowId: 41,
+            threadId,
+            messageId: "message-legacy",
+            requestedAt: "2026-07-26T00:00:00.000Z",
+            pendingDeliveryId: null,
+            pendingEventId: null,
+            sessionStatus: "starting",
+          },
+        ],
+        truncated: true,
+      },
+    });
+  });
+
+  effectIt.effect(
+    "keeps startup closed until legacy pending rows are explicitly cleaned up",
+    () => {
+      let readiness: LegacyPendingTurnReadiness = {
+        count: 1,
+        issues: [
+          {
+            rowId: 7,
+            threadId,
+            messageId: "message-legacy",
+            requestedAt: "2026-07-26T00:00:00.000Z",
+            pendingDeliveryId: null,
+            pendingEventId: null,
+            sessionStatus: null,
+          },
+        ],
+        truncated: false,
+      };
+      return Effect.gen(function* () {
+        const reconciler = yield* OrphanTurnReconciler;
+        expect(yield* reconciler.reconcileStartup).toEqual({
+          status: "unresolved",
+          candidateCount: 0,
+          legacyPending: readiness,
+        });
+
+        readiness = noLegacyPending;
+        expect(yield* reconciler.reconcileStartup).toEqual({ status: "settled" });
+      }).pipe(Effect.provide(liveReconcilerLayer(() => Effect.sync(() => readiness))));
+    },
+  );
+
+  effectIt.effect("fails startup closed when the legacy readiness query fails", () => {
+    const failure = new PersistenceSqlError({
+      operation: "ProjectionSnapshotQuery.getLegacyPendingTurnReadiness:query",
+    });
+    return Effect.gen(function* () {
+      const reconciler = yield* OrphanTurnReconciler;
+      expect(yield* Effect.flip(reconciler.reconcileStartup)).toBe(failure);
+    }).pipe(Effect.provide(liveReconcilerLayer(() => Effect.fail(failure))));
   });
 
   it("matches a pending start only to connecting or ready with no active turn", () => {

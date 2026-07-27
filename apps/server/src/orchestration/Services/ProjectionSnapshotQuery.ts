@@ -56,6 +56,22 @@ export interface ProjectionTurnRecoveryEvidence {
   readonly observedAt: ReadonlyArray<string>;
 }
 
+export interface LegacyPendingTurnReadinessIssue {
+  readonly rowId: number;
+  readonly threadId: ThreadId;
+  readonly messageId: string;
+  readonly requestedAt: string;
+  readonly pendingDeliveryId: string | null;
+  readonly pendingEventId: string | null;
+  readonly sessionStatus: string | null;
+}
+
+export interface LegacyPendingTurnReadiness {
+  readonly count: number;
+  readonly issues: ReadonlyArray<LegacyPendingTurnReadinessIssue>;
+  readonly truncated: boolean;
+}
+
 /**
  * ProjectionSnapshotQueryShape - Service API for read-model snapshots.
  */
@@ -179,6 +195,15 @@ export interface ProjectionSnapshotQueryShape {
     threadId: ThreadId,
     turnId: TurnId,
   ) => Effect.Effect<ProjectionTurnRecoveryEvidence, ProjectionRepositoryError>;
+
+  /**
+   * Lists a bounded diagnostic sample of legacy pending-start placeholders
+   * that migration 039 could not attach to an exact source event/delivery.
+   */
+  readonly getLegacyPendingTurnReadiness?: () => Effect.Effect<
+    LegacyPendingTurnReadiness,
+    ProjectionRepositoryError
+  >;
 }
 
 /**

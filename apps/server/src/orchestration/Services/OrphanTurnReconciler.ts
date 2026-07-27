@@ -3,10 +3,15 @@ import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 import type { ProjectionRepositoryError } from "../../persistence/Errors.ts";
 import type { ProviderSessionDirectoryPersistenceError } from "../../provider/Errors.ts";
+import type { LegacyPendingTurnReadiness } from "./ProjectionSnapshotQuery.ts";
 
 export type OrphanTurnStartupResult =
   | { readonly status: "settled" }
-  | { readonly status: "unresolved"; readonly candidateCount: number };
+  | {
+      readonly status: "unresolved";
+      readonly candidateCount: number;
+      readonly legacyPending: LegacyPendingTurnReadiness;
+    };
 
 export interface OrphanTurnReconcilerShape {
   /** One non-overlapping sweep using barrier-confirmed provider evidence. */

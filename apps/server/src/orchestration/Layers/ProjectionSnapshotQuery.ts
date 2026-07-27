@@ -55,10 +55,13 @@ import {
   ProjectionSnapshotQuery,
   type ProjectionFullThreadDiffContext,
   type ProjectionSnapshotCounts,
+  type LegacyPendingTurnReadiness,
   type ProjectionTurnRecoveryEvidence,
   type ProjectionThreadCheckpointContext,
   type ProjectionSnapshotQueryShape,
 } from "../Services/ProjectionSnapshotQuery.ts";
+
+export const LEGACY_PENDING_TURN_DIAGNOSTIC_LIMIT = 100;
 
 const decodeReadModel = Schema.decodeUnknownEffect(OrchestrationReadModel);
 const decodeShellSnapshot = Schema.decodeUnknownEffect(OrchestrationShellSnapshot);
@@ -88,6 +91,16 @@ const ProjectionThreadActivityDbRowSchema = ProjectionThreadActivity.mapFields(
     sequence: Schema.NullOr(NonNegativeInt),
   }),
 );
+const LegacyPendingTurnReadinessRowSchema = Schema.Struct({
+  rowId: Schema.Number,
+  threadId: ThreadId,
+  messageId: MessageId,
+  requestedAt: IsoDateTime,
+  pendingDeliveryId: Schema.NullOr(Schema.String),
+  pendingEventId: Schema.NullOr(Schema.String),
+  sessionStatus: Schema.NullOr(Schema.String),
+  totalCount: Schema.Number,
+});
 const ProjectionThreadSessionDbRowSchema = ProjectionThreadSession;
 const ProjectionCheckpointDbRowSchema = ProjectionCheckpoint.mapFields(
   Struct.assign({
@@ -689,6 +702,33 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           last_applied_sequence AS "lastAppliedSequence",
           updated_at AS "updatedAt"
         FROM projection_state
+      `,
+  });
+
+  const listLegacyPendingTurnReadinessRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: LegacyPendingTurnReadinessRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          turns.row_id AS "rowId",
+          turns.thread_id AS "threadId",
+          turns.pending_message_id AS "messageId",
+          turns.requested_at AS "requestedAt",
+          turns.pending_delivery_id AS "pendingDeliveryId",
+          turns.pending_event_id AS "pendingEventId",
+          sessions.status AS "sessionStatus",
+          COUNT(*) OVER () AS "totalCount"
+        FROM projection_turns AS turns
+        LEFT JOIN projection_thread_sessions AS sessions
+          ON sessions.thread_id = turns.thread_id
+        WHERE turns.turn_id IS NULL
+          AND turns.state = 'pending'
+          AND turns.pending_message_id IS NOT NULL
+          AND turns.checkpoint_turn_count IS NULL
+          AND (turns.pending_delivery_id IS NULL OR turns.pending_event_id IS NULL)
+        ORDER BY turns.row_id ASC
+        LIMIT ${LEGACY_PENDING_TURN_DIAGNOSTIC_LIMIT}
       `,
   });
 
@@ -2403,6 +2443,26 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       ),
     );
 
+  const getLegacyPendingTurnReadiness: NonNullable<
+    ProjectionSnapshotQueryShape["getLegacyPendingTurnReadiness"]
+  > = () =>
+    listLegacyPendingTurnReadinessRows(undefined).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.getLegacyPendingTurnReadiness:query",
+          "ProjectionSnapshotQuery.getLegacyPendingTurnReadiness:decodeRows",
+        ),
+      ),
+      Effect.map((rows) => {
+        const count = rows[0]?.totalCount ?? 0;
+        return {
+          count,
+          issues: rows.map(({ totalCount: _, ...issue }) => issue),
+          truncated: count > rows.length,
+        } satisfies LegacyPendingTurnReadiness;
+      }),
+    );
+
   return {
     getCommandReadModel,
     getSnapshot,
@@ -2419,6 +2479,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getThreadDetailById,
     getThreadDetailSnapshot,
     getTurnRecoveryEvidence,
+    getLegacyPendingTurnReadiness,
   } satisfies ProjectionSnapshotQueryShape;
 });
 
