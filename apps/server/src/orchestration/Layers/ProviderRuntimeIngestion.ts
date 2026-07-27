@@ -2,7 +2,9 @@ import {
   ApprovalRequestId,
   type AssistantDeliveryMode,
   CommandId,
+  EventId,
   MessageId,
+  type OrchestrationExpectedSession,
   type OrchestrationEvent,
   type OrchestrationMessage,
   type OrchestrationProposedPlanId,
@@ -21,15 +23,28 @@ import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as Duration from "effect/Duration";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import {
+  isProviderIngestionBarrier,
+  isProviderLivenessMarker,
+  type ProviderIngestionBarrier,
+  type ProviderLivenessMarker,
+} from "../../provider/Services/ProviderAdapter.ts";
+import { OutputPressureMonitor } from "../../diagnostics/OutputPressureMonitor.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { OrchestrationReactorDeliveries } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import { OrchestrationReactorDeliveriesLive } from "../../persistence/Layers/OrchestrationReactorDeliveries.ts";
 import { isGitRepository } from "../../git/Utils.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -38,6 +53,8 @@ import {
   type ProviderRuntimeIngestionShape,
 } from "../Services/ProviderRuntimeIngestion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { ServerBootIdentity } from "../../serverBootId.ts";
+import { recoveryCommandId } from "../recoveryCommandId.ts";
 
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 const providerTaskKey = (threadId: ThreadId, taskId: string) => `${threadId}:${taskId}`;
@@ -107,6 +124,14 @@ type RuntimeIngestionInput =
   | {
       source: "domain";
       event: TurnStartRequestedDomainEvent;
+    }
+  | {
+      source: "marker";
+      marker: ProviderLivenessMarker;
+    }
+  | {
+      source: "barrier";
+      barrier: ProviderIngestionBarrier;
     };
 
 function toTurnId(value: TurnId | string | undefined): TurnId | undefined {
@@ -122,6 +147,24 @@ function sameId(left: string | null | undefined, right: string | null | undefine
     return false;
   }
   return left === right;
+}
+
+function expectedSessionForRecovery(
+  thread: Pick<OrchestrationThread, "session">,
+): OrchestrationExpectedSession {
+  const session = thread.session;
+  return session === null
+    ? { kind: "absent" }
+    : {
+        kind: "present",
+        status: session.status,
+        activeTurnId: session.activeTurnId,
+        updatedAt: session.updatedAt,
+        providerName: session.providerName,
+        ...(session.providerInstanceId !== undefined
+          ? { providerInstanceId: session.providerInstanceId }
+          : {}),
+      };
 }
 
 function hasAssistantMessageForTurn(
@@ -686,12 +729,46 @@ export function runtimeEventToActivities(
   return [];
 }
 
-const make = Effect.gen(function* () {
+export interface ProviderRuntimeIngestionLiveOptions {
+  readonly beforeProcessRuntimeEvent?: (
+    event: ProviderRuntimeEvent,
+  ) => Effect.Effect<void, unknown>;
+}
+
+export function latestEligibleProviderExitObservation(
+  observedAt: ReadonlyArray<string>,
+  startedAt: string,
+  detectedAt: string,
+): string | undefined {
+  const startedAtMs = Date.parse(startedAt);
+  const detectedAtMs = Date.parse(detectedAt);
+  let latest: { readonly value: string; readonly time: number } | undefined;
+  for (const candidate of observedAt) {
+    const time = Date.parse(candidate);
+    if (
+      !Number.isFinite(time) ||
+      time < startedAtMs ||
+      time > detectedAtMs ||
+      (latest !== undefined && time <= latest.time)
+    ) {
+      continue;
+    }
+    latest = { value: candidate, time };
+  }
+  return latest?.value;
+}
+
+const makeProviderRuntimeIngestion = Effect.fn("makeProviderRuntimeIngestion")(function* (
+  options: ProviderRuntimeIngestionLiveOptions = {},
+) {
   const crypto = yield* Crypto.Crypto;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
+  const outputPressureMonitor = yield* OutputPressureMonitor;
+  const serverBootId = (yield* ServerBootIdentity).id;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
+  const reactorDeliveries = yield* OrchestrationReactorDeliveries;
   const serverSettingsService = yield* ServerSettingsService;
   const providerCommandId = (event: ProviderRuntimeEvent, tag: string) =>
     crypto.randomUUIDv4.pipe(
@@ -1292,6 +1369,9 @@ const make = Effect.gen(function* () {
 
   const processRuntimeEvent = (event: ProviderRuntimeEvent) =>
     Effect.gen(function* () {
+      if (options.beforeProcessRuntimeEvent !== undefined) {
+        yield* options.beforeProcessRuntimeEvent(event);
+      }
       const thread = yield* resolveThreadShell(event.threadId);
       if (!thread) return;
 
@@ -1313,6 +1393,124 @@ const make = Effect.gen(function* () {
       });
       const hasPendingTurnStart =
         Option.isSome(pendingTurnStart) && thread.session?.status === "starting";
+
+      const pendingExpectedTurnId = Option.isSome(pendingTurnStart)
+        ? yield* getExpectedProviderTurnIdForThread(thread.id)
+        : undefined;
+      const isAcceptedNewTurnStart =
+        event.type === "turn.started" &&
+        Option.isSome(pendingTurnStart) &&
+        sameId(pendingExpectedTurnId, eventTurnId);
+      const isLateInterruptedTargetEvent =
+        thread.latestTurn?.state === "interrupted" &&
+        !isAcceptedNewTurnStart &&
+        (event.type === "session.started" ||
+          event.type === "session.state.changed" ||
+          event.type === "session.exited" ||
+          event.type === "thread.started" ||
+          ((event.type === "turn.started" || event.type === "turn.completed") &&
+            sameId(thread.latestTurn.turnId, eventTurnId)));
+      if (isLateInterruptedTargetEvent) {
+        yield* Effect.logDebug("ignored late provider lifecycle event for interrupted turn", {
+          threadId: thread.id,
+          turnId: eventTurnId,
+          interruptedTurnId: thread.latestTurn?.turnId,
+          eventId: event.eventId,
+          eventType: event.type,
+        });
+        return;
+      }
+
+      let providerExitRecovered = false;
+      if (event.type === "session.exited") {
+        const expectedSession = expectedSessionForRecovery(thread);
+        const pendingDelivery =
+          Option.isSome(pendingTurnStart) &&
+          pendingTurnStart.value.pendingDeliveryId !== undefined &&
+          pendingTurnStart.value.pendingDeliveryId !== null
+            ? yield* reactorDeliveries.getById(pendingTurnStart.value.pendingDeliveryId)
+            : Option.none();
+        const target =
+          thread.latestTurn?.state === "running" &&
+          thread.session?.activeTurnId === thread.latestTurn.turnId
+            ? {
+                kind: "turn" as const,
+                turnId: thread.latestTurn.turnId,
+                retrySourceMessageId: thread.latestTurn.retrySourceMessageId ?? null,
+                expectedSession,
+              }
+            : Option.isSome(pendingTurnStart) &&
+                pendingTurnStart.value.pendingDeliveryId !== undefined &&
+                pendingTurnStart.value.pendingDeliveryId !== null &&
+                pendingTurnStart.value.pendingEventId !== undefined &&
+                pendingTurnStart.value.pendingEventId !== null &&
+                Option.isSome(pendingDelivery) &&
+                pendingDelivery.value.status === "pending"
+              ? {
+                  kind: "pendingStart" as const,
+                  pendingMessageId: pendingTurnStart.value.messageId,
+                  deliveryId: pendingTurnStart.value.pendingDeliveryId,
+                  sourceEventId: EventId.make(pendingTurnStart.value.pendingEventId),
+                  expectedSession,
+                  expectedDeliveryOwnership: { status: "pending" as const },
+                }
+              : undefined;
+        if (target !== undefined) {
+          const readRecoveryEvidence = projectionSnapshotQuery.getTurnRecoveryEvidence;
+          const executionLastObservedAt =
+            target.kind === "turn" && readRecoveryEvidence !== undefined
+              ? yield* readRecoveryEvidence(thread.id, target.turnId).pipe(
+                  Effect.map(({ observedAt }) =>
+                    latestEligibleProviderExitObservation(
+                      observedAt,
+                      thread.latestTurn?.startedAt ?? thread.latestTurn?.requestedAt ?? now,
+                      now,
+                    ),
+                  ),
+                  Effect.catchCause((cause) =>
+                    Effect.logWarning("failed to read persisted provider exit evidence", {
+                      threadId: thread.id,
+                      turnId: target.turnId,
+                      cause,
+                    }).pipe(Effect.as(undefined)),
+                  ),
+                )
+              : undefined;
+          yield* orchestrationEngine
+            .dispatchInternal({
+              type: "thread.session.interrupt-if-active",
+              commandId: recoveryCommandId({
+                threadId: thread.id,
+                target,
+                serverBootId,
+                reason: "provider-exited",
+              }),
+              threadId: thread.id,
+              target,
+              reason: "provider-exited",
+              interruptionCode: "provider_exit",
+              serverBootId,
+              detectedAt: now,
+              ...(executionLastObservedAt !== undefined ? { executionLastObservedAt } : {}),
+              createdAt: now,
+            })
+            .pipe(
+              Effect.catchTag(
+                [
+                  "OrchestrationCommandInvariantError",
+                  "OrchestrationCommandPreviouslyRejectedError",
+                ],
+                (cause) =>
+                  Effect.logDebug("provider exit recovery target changed before dispatch", {
+                    threadId: thread.id,
+                    eventId: event.eventId,
+                    cause,
+                  }),
+              ),
+            );
+          providerExitRecovered = true;
+        }
+      }
 
       const conflictsWithActiveTurn =
         activeTurnId !== null && eventTurnId !== undefined && !sameId(activeTurnId, eventTurnId);
@@ -1411,7 +1609,7 @@ const make = Effect.gen(function* () {
                 ? null
                 : (thread.session?.lastError ?? null);
 
-        if (shouldApplyThreadLifecycle) {
+        if (shouldApplyThreadLifecycle && !providerExitRecovered) {
           if (event.type === "turn.started" && acceptedTurnStartedSourcePlan !== null) {
             yield* markSourceProposedPlanImplemented(
               acceptedTurnStartedSourcePlan.sourceThreadId,
@@ -1782,50 +1980,119 @@ const make = Effect.gen(function* () {
 
   const processDomainEvent = (_event: TurnStartRequestedDomainEvent) => Effect.void;
 
-  const processInput = (input: RuntimeIngestionInput) =>
-    input.source === "runtime" ? processRuntimeEvent(input.event) : processDomainEvent(input.event);
+  const processInput = (input: RuntimeIngestionInput) => {
+    switch (input.source) {
+      case "runtime":
+        return processRuntimeEvent(input.event);
+      case "domain":
+        return processDomainEvent(input.event);
+      case "marker":
+        return Deferred.succeed(input.marker.acknowledged, input.marker.sample).pipe(Effect.asVoid);
+      case "barrier":
+        return Deferred.succeed(input.barrier.acknowledged, undefined).pipe(Effect.asVoid);
+    }
+  };
 
-  const processInputSafely = (input: RuntimeIngestionInput) =>
-    processInput(input).pipe(
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterruptsOnly(cause)) {
-          return Effect.failCause(cause);
-        }
-        return Effect.logWarning("provider runtime ingestion failed to process event", {
-          source: input.source,
-          eventId: input.event.eventId,
-          eventType: input.event.type,
-          cause: Cause.pretty(cause),
-        });
-      }),
-    );
+  const processInputDurably = Effect.fn("ProviderRuntimeIngestion.processInputDurably")(function* (
+    input: RuntimeIngestionInput,
+  ) {
+    while (true) {
+      const result = yield* Effect.exit(processInput(input));
+      if (Exit.isSuccess(result)) return;
+      if (Cause.hasInterrupts(result.cause)) {
+        return yield* Effect.failCause(result.cause);
+      }
+      yield* Effect.logWarning("provider runtime ingestion failed to process event; retrying", {
+        source: input.source,
+        eventId:
+          input.source === "marker"
+            ? input.marker.markerId
+            : input.source === "barrier"
+              ? input.barrier.barrierId
+              : input.event.eventId,
+        eventType:
+          input.source === "marker"
+            ? "provider.liveness-marker"
+            : input.source === "barrier"
+              ? "provider.ingestion-barrier"
+              : input.event.type,
+        cause: Cause.pretty(result.cause),
+      });
+      yield* Effect.sleep("100 millis");
+    }
+  });
 
-  const worker = yield* makeDrainableWorker(processInputSafely);
+  let recordWorkerPressure: Effect.Effect<void> = Effect.void;
+  const worker = yield* makeDrainableWorker((input: RuntimeIngestionInput) =>
+    processInputDurably(input).pipe(Effect.ensuring(recordWorkerPressure)),
+  );
+  recordWorkerPressure = worker.pressure.pipe(
+    Effect.flatMap((pressure) =>
+      outputPressureMonitor.recordWorkerPressure("provider-runtime-ingestion", pressure),
+    ),
+  );
+  const enqueue = (input: RuntimeIngestionInput) =>
+    worker.enqueue(input).pipe(Effect.andThen(recordWorkerPressure));
+  const providerIngressFiber = yield* Ref.make<Option.Option<Fiber.Fiber<void, never>>>(
+    Option.none(),
+  );
 
   const start: ProviderRuntimeIngestionShape["start"] = () =>
     Effect.gen(function* () {
-      yield* Effect.forkScoped(
-        Stream.runForEach(providerService.streamEvents, (event) =>
-          worker.enqueue({ source: "runtime", event }),
+      const ingressFiber = yield* Effect.forkScoped(
+        Stream.runForEach(
+          providerService.streamIngestion ?? providerService.streamEvents,
+          (output) =>
+            isProviderLivenessMarker(output)
+              ? enqueue({ source: "marker", marker: output })
+              : isProviderIngestionBarrier(output)
+                ? enqueue({ source: "barrier", barrier: output })
+                : enqueue({ source: "runtime", event: output }),
         ),
       );
+      yield* Ref.set(providerIngressFiber, Option.some(ingressFiber));
       yield* Effect.forkScoped(
         Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
           if (event.type !== "thread.turn-start-requested") {
             return Effect.void;
           }
-          return worker.enqueue({ source: "domain", event });
+          return enqueue({ source: "domain", event });
         }),
       );
     });
 
   return {
     start,
-    drain: worker.drain,
+    drain: worker.drain.pipe(Effect.andThen(recordWorkerPressure)),
+    closeProviderIngress: Effect.gen(function* () {
+      if (providerService.closeIngestionSource !== undefined) {
+        yield* providerService.closeIngestionSource;
+      }
+      yield* Ref.get(providerIngressFiber).pipe(
+        Effect.flatMap(
+          Option.match({
+            onNone: () => Effect.void,
+            onSome: Fiber.interrupt,
+          }),
+        ),
+      );
+      yield* worker.drain;
+      yield* recordWorkerPressure;
+    }),
   } satisfies ProviderRuntimeIngestionShape;
 });
 
 export const ProviderRuntimeIngestionLive = Layer.effect(
   ProviderRuntimeIngestionService,
-  make,
-).pipe(Layer.provide(ProjectionTurnRepositoryLive));
+  makeProviderRuntimeIngestion(),
+).pipe(
+  Layer.provide(ProjectionTurnRepositoryLive),
+  Layer.provide(OrchestrationReactorDeliveriesLive),
+);
+
+export function makeProviderRuntimeIngestionLive(options: ProviderRuntimeIngestionLiveOptions) {
+  return Layer.effect(ProviderRuntimeIngestionService, makeProviderRuntimeIngestion(options)).pipe(
+    Layer.provide(ProjectionTurnRepositoryLive),
+    Layer.provide(OrchestrationReactorDeliveriesLive),
+  );
+}

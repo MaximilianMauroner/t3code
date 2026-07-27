@@ -12,23 +12,30 @@ import {
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { describe, expect, it } from "vite-plus/test";
 
 import { PersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
+import { OrchestrationReactorDeliveriesLive } from "../../persistence/Layers/OrchestrationReactorDeliveries.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
   OrchestrationEventStore,
   type OrchestrationEventStoreShape,
 } from "../../persistence/Services/OrchestrationEventStore.ts";
+import { OrchestrationReactorDeliveries } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
@@ -42,7 +49,10 @@ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts"
 import { ServerConfig } from "../../config.ts";
 import { OrchestrationCommandInvariantError } from "../Errors.ts";
 import * as UpdateMaintenanceGate from "../UpdateMaintenanceGate.ts";
-import type { UpdateMaintenanceGateService } from "../UpdateMaintenanceGate.ts";
+import type {
+  UpdateDispatchReservation,
+  UpdateMaintenanceGateService,
+} from "../UpdateMaintenanceGate.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
@@ -52,6 +62,7 @@ const asCheckpointRef = (value: string): CheckpointRef => CheckpointRef.make(val
 async function createOrchestrationSystem(
   gateService: UpdateMaintenanceGateService | null = null,
   projectionPipelineService: OrchestrationProjectionPipelineShape | null = null,
+  openAdmission = true,
 ) {
   const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-orchestration-engine-test-",
@@ -72,23 +83,32 @@ async function createOrchestrationSystem(
       Layer.provide(maintenanceGateLayer),
     ),
     OrchestrationProjectionSnapshotQueryLive,
+    OrchestrationReactorDeliveriesLive,
+    ProjectionTurnRepositoryLive,
   ).pipe(
     Layer.provide(OrchestrationEventStoreLive),
     Layer.provide(OrchestrationCommandReceiptRepositoryLive),
     Layer.provide(RepositoryIdentityResolver.layer),
-    Layer.provide(SqlitePersistenceMemory),
+    Layer.provideMerge(SqlitePersistenceMemory),
     Layer.provideMerge(ServerConfigLayer),
     Layer.provideMerge(NodeServices.layer),
   );
   const runtime = ManagedRuntime.make(orchestrationLayer);
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
+  if (openAdmission) await runtime.runPromise(engine.openExternalAdmission);
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
   const maintenanceGate = await runtime.runPromise(
     Effect.service(UpdateMaintenanceGate.UpdateMaintenanceGate),
   );
+  const deliveries = await runtime.runPromise(Effect.service(OrchestrationReactorDeliveries));
+  const turns = await runtime.runPromise(Effect.service(ProjectionTurnRepository));
+  const sql = await runtime.runPromise(Effect.service(SqlClient.SqlClient));
   return {
     engine,
     maintenanceGate,
+    deliveries,
+    turns,
+    sql,
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
     dispose: () => runtime.dispose(),
@@ -111,6 +131,1337 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
+  it("starts with authoritative hot admission closed and preserves explicit pure commands", async () => {
+    const system = await createOrchestrationSystem(null, null, false);
+    const projectId = asProjectId("project-admission-gate");
+    const threadId = ThreadId.make("thread-admission-gate");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-admission-project"),
+        projectId,
+        title: "Admission gate",
+        workspaceRoot: "/tmp/project-admission-gate",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-admission-thread"),
+        threadId,
+        projectId,
+        title: "Admission gate",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    const start = {
+      type: "thread.turn.start" as const,
+      commandId: CommandId.make("cmd-admission-start"),
+      threadId,
+      message: {
+        messageId: asMessageId("message-admission"),
+        role: "user" as const,
+        text: "start",
+        attachments: [],
+      },
+      runtimeMode: "approval-required" as const,
+      interactionMode: "default" as const,
+      createdAt: now(),
+    };
+    await expect(system.run(system.engine.dispatchExternal(start))).rejects.toMatchObject({
+      _tag: "orchestration_not_ready",
+      phase: "quiescing",
+    });
+    await system.run(system.engine.openExternalAdmission);
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("cmd-admission-runtime-mode"),
+        threadId,
+        runtimeMode: "approval-required",
+        createdAt: now(),
+      }),
+    );
+    expect(
+      (await system.run(system.deliveries.listPendingOrdered())).map(
+        (delivery) => delivery.deliveryKind,
+      ),
+    ).toContain("runtime-mode-change");
+    await expect(system.run(system.engine.dispatchExternal(start))).resolves.toEqual({
+      sequence: expect.any(Number),
+    });
+    await system.run(system.engine.closeExternalAdmission);
+    await expect(
+      system.run(
+        system.engine.dispatchExternal({
+          ...start,
+          commandId: CommandId.make("cmd-admission-start-after-poison"),
+        }),
+      ),
+    ).rejects.toMatchObject({ _tag: "orchestration_not_ready" });
+    await system.dispose();
+  });
+
+  it("reference-counts uncertain predecessors while preserving pure external commands", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-uncertain-admission");
+    const threadId = ThreadId.make("thread-uncertain-admission");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-uncertain-project"),
+        projectId,
+        title: "Uncertain admission",
+        workspaceRoot: "/tmp/project-uncertain-admission",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-uncertain-thread"),
+        threadId,
+        projectId,
+        title: "Uncertain admission",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    const hotCommand = {
+      type: "thread.turn.start" as const,
+      commandId: CommandId.make("cmd-uncertain-start"),
+      threadId,
+      message: {
+        messageId: asMessageId("message-uncertain"),
+        role: "user" as const,
+        text: "must wait",
+        attachments: [],
+      },
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      createdAt: now(),
+    };
+
+    await system.run(system.engine.blockExternalHotAdmission("delivery-a"));
+    await system.run(system.engine.blockExternalHotAdmission("delivery-b"));
+    await system.run(system.engine.blockExternalHotAdmission("delivery-a"));
+    await expect(system.run(system.engine.dispatchExternal(hotCommand))).rejects.toMatchObject({
+      _tag: "orchestration_not_ready",
+      phase: "reconciling",
+      retryable: true,
+    });
+    await expect(
+      system.run(
+        system.engine.dispatchExternal({
+          type: "thread.meta.update",
+          commandId: CommandId.make("cmd-uncertain-safe-meta"),
+          threadId,
+          title: "Safe update",
+        }),
+      ),
+    ).resolves.toEqual({ sequence: expect.any(Number) });
+
+    await system.run(system.engine.openExternalAdmission);
+    await system.run(system.engine.releaseExternalHotAdmissionBlocker("delivery-a"));
+    await expect(system.run(system.engine.dispatchExternal(hotCommand))).rejects.toMatchObject({
+      phase: "reconciling",
+    });
+    await system.run(system.engine.releaseExternalHotAdmissionBlocker("delivery-b"));
+    await expect(system.run(system.engine.dispatchExternal(hotCommand))).resolves.toEqual({
+      sequence: expect.any(Number),
+    });
+    await system.dispose();
+  });
+
+  it("atomically cancels an absent-session pending start and preserves its message", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-pending-recovery");
+    const threadId = ThreadId.make("thread-pending-recovery");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-pending-project"),
+        projectId,
+        title: "Pending recovery",
+        workspaceRoot: "/tmp/project-pending-recovery",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-pending-thread"),
+        threadId,
+        projectId,
+        title: "Pending recovery",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-pending-start"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-pending"),
+          role: "user",
+          text: "preserve me",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: now(),
+      }),
+    );
+    const pending = (await system.run(system.deliveries.listPendingOrdered()))[0]!;
+    const recovery = {
+      type: "thread.session.interrupt-if-active" as const,
+      commandId: CommandId.make("recovery-pending-boot-2"),
+      threadId,
+      target: {
+        kind: "pendingStart" as const,
+        pendingMessageId: asMessageId("message-pending"),
+        deliveryId: pending.deliveryId,
+        sourceEventId: pending.sourceEventId,
+        expectedSession: { kind: "absent" as const },
+        expectedDeliveryOwnership: { status: "pending" as const },
+      },
+      reason: "server-restarted" as const,
+      interruptionCode: "server_restart" as const,
+      serverBootId: "boot-2",
+      detectedAt: "2026-01-01T00:00:03.000Z",
+      createdAt: "2026-01-01T00:00:03.000Z",
+    };
+    const first = await system.run(system.engine.dispatchInternal(recovery));
+    const duplicate = await system.run(system.engine.dispatchInternal(recovery));
+    expect(duplicate.sequence).toBe(first.sequence);
+    expect(
+      Option.getOrThrow(await system.run(system.deliveries.getById(pending.deliveryId))).status,
+    ).toBe("cancelled");
+    const snapshot = await system.readModel();
+    const thread = snapshot.threads.find((candidate) => candidate.id === threadId)!;
+    expect(thread.messages.map((message) => message.id)).toEqual(["message-pending"]);
+    expect(thread.latestTurn).toBeNull();
+    expect(thread.session).toBeNull();
+    expect(
+      thread.activities.filter((activity) => activity.kind === "session.start.interrupted"),
+    ).toHaveLength(1);
+
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-claimed-pending-start"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-claimed-pending"),
+          role: "user",
+          text: "preserve exact ownership",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: "2026-01-01T00:00:04.000Z",
+      }),
+    );
+    const claimedPending = (await system.run(system.deliveries.listPendingOrdered()))[0]!;
+    const claimToken = "current-recovery-claim";
+    expect(
+      Option.getOrThrow(
+        await system.run(
+          system.deliveries.claimNext({
+            claimToken,
+            currentBootId: "boot-current",
+            claimedAt: "2026-01-01T00:00:05.000Z",
+            leaseExpiresAt: "2026-01-01T00:05:05.000Z",
+          }),
+        ),
+      ).deliveryId,
+    ).toBe(claimedPending.deliveryId);
+    const claimedRecoveryBase = {
+      ...recovery,
+      commandId: CommandId.make("recovery-claimed-base"),
+      target: {
+        ...recovery.target,
+        pendingMessageId: asMessageId("message-claimed-pending"),
+        deliveryId: claimedPending.deliveryId,
+        sourceEventId: claimedPending.sourceEventId,
+      },
+      detectedAt: "2026-01-01T00:00:06.000Z",
+      createdAt: "2026-01-01T00:00:06.000Z",
+    };
+    const sequenceBeforeOwnershipChecks = await system.run(system.engine.latestSequence);
+    await expect(
+      system.run(
+        system.engine.dispatchInternal({
+          ...claimedRecoveryBase,
+          commandId: CommandId.make("recovery-stale-pending-owner"),
+          target: {
+            ...claimedRecoveryBase.target,
+            expectedDeliveryOwnership: { status: "pending" },
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({
+      _tag: "OrchestrationCommandInvariantError",
+      detail: "Recovery start delivery no longer matches pending durable state.",
+    });
+    await expect(
+      system.run(
+        system.engine.dispatchInternal({
+          ...claimedRecoveryBase,
+          commandId: CommandId.make("recovery-wrong-claim-owner"),
+          target: {
+            ...claimedRecoveryBase.target,
+            expectedDeliveryOwnership: {
+              status: "delivering",
+              claimToken: "stale-recovery-claim",
+            },
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({
+      _tag: "OrchestrationCommandInvariantError",
+      detail: "Recovery start delivery no longer matches pending durable state.",
+    });
+    expect(await system.run(system.engine.latestSequence)).toBe(sequenceBeforeOwnershipChecks);
+
+    const exactClaimRecovery = {
+      ...claimedRecoveryBase,
+      commandId: CommandId.make("recovery-exact-claim-owner"),
+      target: {
+        ...claimedRecoveryBase.target,
+        expectedDeliveryOwnership: { status: "delivering" as const, claimToken },
+      },
+    };
+    await system.run(
+      system.sql.unsafe(`
+        CREATE TRIGGER fail_atomic_pending_recovery
+        BEFORE UPDATE OF status ON orchestration_reactor_deliveries
+        WHEN NEW.status = 'cancelled'
+        BEGIN
+          SELECT RAISE(ABORT, 'injected recovery terminal fault');
+        END
+      `),
+    );
+    await expect(
+      system.run(system.engine.dispatchInternal(exactClaimRecovery)),
+    ).rejects.toBeDefined();
+    expect(await system.run(system.engine.latestSequence)).toBe(sequenceBeforeOwnershipChecks);
+    expect(
+      Option.getOrThrow(await system.run(system.deliveries.getById(claimedPending.deliveryId)))
+        .status,
+    ).toBe("delivering");
+    await system.run(system.sql.unsafe("DROP TRIGGER fail_atomic_pending_recovery"));
+    await system.run(system.engine.dispatchInternal(exactClaimRecovery));
+    expect(
+      Option.getOrThrow(await system.run(system.deliveries.getById(claimedPending.deliveryId)))
+        .status,
+    ).toBe("cancelled");
+    await system.dispose();
+  });
+
+  it("rejects recovery after the durable pending start is replaced without appending an event", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-replaced-pending-recovery");
+    const threadId = ThreadId.make("thread-replaced-pending-recovery");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-replaced-pending-project"),
+        projectId,
+        title: "Replaced pending recovery",
+        workspaceRoot: "/tmp/project-replaced-pending-recovery",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-replaced-pending-thread"),
+        threadId,
+        projectId,
+        title: "Replaced pending recovery",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-replaced-pending-start"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-original-pending"),
+          role: "user",
+          text: "preserve the replacement",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: now(),
+      }),
+    );
+    const originalDelivery = (await system.run(system.deliveries.listPendingOrdered()))[0]!;
+    await system.run(
+      system.turns.replacePendingTurnStart({
+        threadId,
+        messageId: asMessageId("message-replacement-pending"),
+        sourceProposedPlanThreadId: null,
+        sourceProposedPlanId: null,
+        requestedAt: "2026-01-01T00:00:02.000Z",
+        pendingDeliveryId: "delivery-replacement",
+        pendingEventId: "event-replacement",
+      }),
+    );
+    const sequenceBeforeRecovery = await system.run(system.engine.latestSequence);
+
+    await expect(
+      system.run(
+        system.engine.dispatchInternal({
+          type: "thread.session.interrupt-if-active",
+          commandId: CommandId.make("recovery-replaced-pending"),
+          threadId,
+          target: {
+            kind: "pendingStart",
+            pendingMessageId: asMessageId("message-original-pending"),
+            deliveryId: originalDelivery.deliveryId,
+            sourceEventId: originalDelivery.sourceEventId,
+            expectedSession: { kind: "absent" },
+            expectedDeliveryOwnership: { status: "pending" },
+          },
+          reason: "server-restarted",
+          interruptionCode: "server_restart",
+          serverBootId: "boot-2",
+          detectedAt: "2026-01-01T00:00:03.000Z",
+          createdAt: "2026-01-01T00:00:03.000Z",
+        }),
+      ),
+    ).rejects.toMatchObject({
+      _tag: "OrchestrationCommandInvariantError",
+      detail: "Recovery target no longer matches the durable pending turn start.",
+    });
+
+    expect(await system.run(system.engine.latestSequence)).toBe(sequenceBeforeRecovery);
+    expect(
+      Option.getOrThrow(await system.run(system.deliveries.getById(originalDelivery.deliveryId)))
+        .status,
+    ).toBe("pending");
+    expect(
+      Option.getOrThrow(await system.run(system.turns.getPendingTurnStartByThreadId({ threadId }))),
+    ).toMatchObject({
+      messageId: "message-replacement-pending",
+      pendingDeliveryId: "delivery-replacement",
+      pendingEventId: "event-replacement",
+    });
+    const snapshot = await system.readModel();
+    const thread = snapshot.threads.find((candidate) => candidate.id === threadId)!;
+    expect(thread.activities).toEqual([]);
+    expect(thread.session).toBeNull();
+    await system.dispose();
+  });
+
+  it("persists concrete interruption evidence across later session writes and snapshots", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-concrete-recovery");
+    const threadId = ThreadId.make("thread-concrete-recovery");
+    const turnId = asTurnId("turn-concrete-recovery");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-concrete-project"),
+        projectId,
+        title: "Concrete recovery",
+        workspaceRoot: "/tmp/project-concrete-recovery",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-concrete-thread"),
+        threadId,
+        projectId,
+        title: "Concrete recovery",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-concrete-start"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-concrete"),
+          role: "user",
+          text: "preserve retry source",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: now(),
+      }),
+    );
+    const runningAt = "2026-01-01T00:00:01.000Z";
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-concrete-running"),
+        threadId,
+        session: {
+          threadId,
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "full-access",
+          activeTurnId: turnId,
+          lastError: null,
+          updatedAt: runningAt,
+        },
+        createdAt: runningAt,
+      }),
+    );
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.session.interrupt-if-active",
+        commandId: CommandId.make("recovery-concrete-boot-2"),
+        threadId,
+        target: {
+          kind: "turn",
+          turnId,
+          retrySourceMessageId: asMessageId("message-concrete"),
+          expectedSession: {
+            kind: "present",
+            status: "running",
+            activeTurnId: turnId,
+            updatedAt: runningAt,
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+          },
+        },
+        reason: "server-restarted",
+        interruptionCode: "server_restart",
+        serverBootId: "boot-2",
+        detectedAt: "2026-01-01T00:00:03.000Z",
+        executionLastObservedAt: "2026-01-01T00:00:02.000Z",
+        createdAt: "2026-01-01T00:00:03.000Z",
+      }),
+    );
+    expect(
+      Option.getOrThrow(await system.run(system.turns.getByTurnId({ threadId, turnId }))),
+    ).toMatchObject({
+      interruptionCode: "server_restart",
+      retrySourceMessageId: "message-concrete",
+    });
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-concrete-ready-late"),
+        threadId,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: "2026-01-01T00:00:04.000Z",
+        },
+        createdAt: "2026-01-01T00:00:04.000Z",
+      }),
+    );
+    expect(
+      Option.getOrThrow(await system.run(system.turns.getByTurnId({ threadId, turnId }))),
+    ).toMatchObject({
+      interruptionCode: "server_restart",
+      retrySourceMessageId: "message-concrete",
+    });
+    const snapshot = await system.readModel();
+    expect(
+      snapshot.threads.find((candidate) => candidate.id === threadId)?.latestTurn,
+    ).toMatchObject({
+      turnId,
+      state: "interrupted",
+      completedAt: "2026-01-01T00:00:02.000Z",
+      interruptionCode: "server_restart",
+      interruptionDetectedAt: "2026-01-01T00:00:03.000Z",
+      executionLastObservedAt: "2026-01-01T00:00:02.000Z",
+      interruptionTimestampFallback: false,
+      retrySourceMessageId: "message-concrete",
+    });
+    await system.dispose();
+  });
+
+  it("barrier covers delivery insertion and sealing rejects later dispatch", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-barrier");
+    const threadId = ThreadId.make("thread-barrier");
+    await system.run(
+      system.engine
+        .dispatchInternal({
+          type: "thread.session.set",
+          commandId: CommandId.make("unused-session-before-thread"),
+          threadId,
+          session: {
+            threadId,
+            status: "idle",
+            providerName: null,
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now(),
+          },
+          createdAt: now(),
+        })
+        .pipe(Effect.flip),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-barrier-project"),
+        projectId,
+        title: "Barrier",
+        workspaceRoot: "/tmp/project-barrier",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-barrier-thread"),
+        threadId,
+        projectId,
+        title: "Barrier",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    const start = await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-barrier-start"),
+        threadId,
+        message: {
+          messageId: asMessageId("msg-barrier"),
+          role: "user",
+          text: "hello",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: now(),
+      }),
+    );
+    const barrier = await system.run(system.engine.barrier);
+    expect(barrier.sequence).toBe(start.sequence);
+    const pending = await system.run(system.deliveries.listPendingOrdered());
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.deliveryKind).toBe("turn-start");
+
+    await system.run(system.engine.closeExternalAdmission ?? Effect.void);
+    await expect(
+      system.run(
+        system.engine.dispatchExternal({
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-during-quiesce"),
+          threadId,
+        }),
+      ),
+    ).rejects.toMatchObject({ _tag: "orchestration_not_ready", phase: "quiescing" });
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.archive",
+        commandId: CommandId.make("cmd-internal-during-quiesce"),
+        threadId,
+      }),
+    );
+
+    await system.run(system.engine.sealAndStop);
+    expect(await system.run(system.engine.isSealed)).toBe(true);
+    await expect(
+      system.run(
+        system.engine.dispatchExternal({
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-after-seal"),
+          threadId,
+        }),
+      ),
+    ).rejects.toMatchObject({ _tag: "orchestration_not_ready", phase: "sealed" });
+    await system.dispose();
+  });
+
+  it("holds a bootstrap reservation across admission close until enqueue or cancellation", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-bootstrap-reservation");
+    const threadId = ThreadId.make("thread-bootstrap-reservation");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-bootstrap-reservation-project"),
+        projectId,
+        title: "Bootstrap reservation",
+        workspaceRoot: "/tmp/project-bootstrap-reservation",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-bootstrap-reservation-thread"),
+        threadId,
+        projectId,
+        title: "Bootstrap reservation",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+
+    const reservedTurnCommand = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-bootstrap-reservation-start"),
+      threadId,
+      message: {
+        messageId: asMessageId("msg-bootstrap-reservation"),
+        role: "user",
+        text: "hello",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+    const reservation = await system.run(
+      system.engine.reserveExternalHotAdmission(reservedTurnCommand),
+    );
+    const updateFiber = await system.run(
+      system.maintenanceGate.acquire.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Effect.yieldNow);
+    expect(updateFiber.pollUnsafe()).toBeUndefined();
+    await system.run(system.engine.closeExternalAdmission);
+    await expect(
+      system.run(system.engine.reserveExternalHotAdmission(reservedTurnCommand)),
+    ).rejects.toMatchObject({
+      _tag: "orchestration_not_ready",
+      phase: "quiescing",
+    });
+    const barrierFiber = await system.run(
+      system.engine.barrier.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    expect(barrierFiber.pollUnsafe()).toBeUndefined();
+
+    await expect(
+      system.run(
+        reservation.dispatch({
+          ...reservedTurnCommand,
+          message: { ...reservedTurnCommand.message, text: "different command" },
+        }),
+      ),
+    ).rejects.toThrow("exact command");
+    expect(barrierFiber.pollUnsafe()).toBeUndefined();
+
+    const dispatched = await system.run(reservation.dispatch(reservedTurnCommand));
+    await system.run(Fiber.join(updateFiber));
+    await system.run(system.maintenanceGate.release);
+    expect((await system.run(Fiber.join(barrierFiber))).sequence).toBe(dispatched.sequence);
+
+    await system.run(system.engine.openExternalAdmission);
+    const cancelledReservation = await system.run(
+      system.engine.reserveExternalHotAdmission({
+        ...reservedTurnCommand,
+        commandId: CommandId.make("cmd-bootstrap-reservation-cancelled"),
+      }),
+    );
+    await system.run(system.engine.closeExternalAdmission);
+    const cancelledBarrier = await system.run(
+      system.engine.barrier.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    expect(cancelledBarrier.pollUnsafe()).toBeUndefined();
+    await system.run(cancelledReservation.cancel);
+    await system.run(Fiber.join(cancelledBarrier));
+    await system.dispose();
+  });
+
+  it("releases engine admission when bootstrap reservation is interrupted behind maintenance", async () => {
+    const system = await createOrchestrationSystem();
+    const command = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-bootstrap-interrupted-maintenance"),
+      threadId: ThreadId.make("thread-bootstrap-interrupted-maintenance"),
+      message: {
+        messageId: asMessageId("msg-bootstrap-interrupted-maintenance"),
+        role: "user",
+        text: "interrupted",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+    const acceptance = await system.run(system.maintenanceGate.ensureDispatchAllowed(command));
+    const maintenanceEntered = Deferred.makeUnsafe<void>();
+    const releaseMaintenance = Deferred.makeUnsafe<void>();
+    const maintenanceFiber = await system.run(
+      system.maintenanceGate
+        .withDispatchAllowed(
+          command,
+          acceptance,
+          Deferred.succeed(maintenanceEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseMaintenance)),
+          ),
+        )
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(maintenanceEntered));
+
+    const reservationFiber = await system.run(
+      system.engine
+        .reserveExternalHotAdmission(command)
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Effect.yieldNow);
+    const barrierFiber = await system.run(
+      system.engine.barrier.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    expect(barrierFiber.pollUnsafe()).toBeUndefined();
+
+    reservationFiber.interruptUnsafe();
+    await system.run(Fiber.await(reservationFiber));
+    await system.run(Deferred.succeed(releaseMaintenance, undefined));
+    await system.run(Fiber.join(maintenanceFiber));
+    await expect(system.run(Fiber.join(barrierFiber))).resolves.toEqual({ sequence: 0 });
+    await expect(system.run(system.maintenanceGate.acquire)).resolves.toMatchObject({
+      pid: process.pid,
+    });
+    await system.run(system.maintenanceGate.release);
+    await system.dispose();
+  });
+
+  it("releases both admissions when interrupted at maintenance reservation completion", async () => {
+    const reservationCompleting = Deferred.makeUnsafe<void>();
+    const allowReservationCompletion = Deferred.makeUnsafe<void>();
+    const reservationCancelled = Deferred.makeUnsafe<void>();
+    let maintenanceReservationActive = false;
+    const cancelMaintenanceReservation = Effect.sync(() => {
+      maintenanceReservationActive = false;
+    }).pipe(Effect.andThen(Deferred.succeed(reservationCancelled, undefined)));
+    const maintenanceReservation: UpdateDispatchReservation = {
+      withDispatchAllowed: (_command, effect) =>
+        effect.pipe(Effect.ensuring(cancelMaintenanceReservation)),
+      cancel: cancelMaintenanceReservation,
+    };
+    const gateService: UpdateMaintenanceGateService = {
+      acquire: Effect.suspend(() =>
+        maintenanceReservationActive
+          ? Deferred.await(reservationCancelled).pipe(
+              Effect.as({ pid: process.pid, token: "test-maintenance-token" }),
+            )
+          : Effect.succeed({ pid: process.pid, token: "test-maintenance-token" }),
+      ),
+      release: Effect.void,
+      isHeld: Effect.succeed(false),
+      ensureDispatchAllowed: () => Effect.succeed({ generation: 0 }),
+      reserveDispatchAllowed: (_command, ownerScope) =>
+        Effect.gen(function* () {
+          maintenanceReservationActive = true;
+          yield* Scope.addFinalizer(ownerScope, cancelMaintenanceReservation);
+          yield* Deferred.succeed(reservationCompleting, undefined);
+          yield* Deferred.await(allowReservationCompletion);
+          return maintenanceReservation;
+        }).pipe(Effect.uninterruptible),
+      withDispatchAllowed: (_command, _acceptance, effect) => effect,
+    };
+    const system = await createOrchestrationSystem(gateService);
+    const command = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-bootstrap-interrupted-completion"),
+      threadId: ThreadId.make("thread-bootstrap-interrupted-completion"),
+      message: {
+        messageId: asMessageId("msg-bootstrap-interrupted-completion"),
+        role: "user",
+        text: "interrupted",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+
+    const reservationFiber = await system.run(
+      system.engine
+        .reserveExternalHotAdmission(command)
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(reservationCompleting).pipe(Effect.timeout("2 seconds")));
+    reservationFiber.interruptUnsafe();
+    await system.run(Deferred.succeed(allowReservationCompletion, undefined));
+    await system.run(Fiber.await(reservationFiber).pipe(Effect.timeout("2 seconds")));
+    await system.run(Deferred.await(reservationCancelled).pipe(Effect.timeout("2 seconds")));
+    await expect(
+      system.run(system.engine.barrier.pipe(Effect.timeout("2 seconds"))),
+    ).resolves.toEqual({ sequence: 0 });
+    await expect(
+      system.run(system.maintenanceGate.acquire.pipe(Effect.timeout("2 seconds"))),
+    ).resolves.toMatchObject({ pid: process.pid });
+    await system.dispose();
+  });
+
+  it("rejects a bootstrap reservation that completes after force-stop", async () => {
+    const reservationEntered = Deferred.makeUnsafe<void>();
+    const allowReservation = Deferred.makeUnsafe<void>();
+    const reservationCancelled = Deferred.makeUnsafe<void>();
+    const cancelReservation = Deferred.succeed(reservationCancelled, undefined);
+    const maintenanceReservation: UpdateDispatchReservation = {
+      withDispatchAllowed: (_command, effect) => effect.pipe(Effect.ensuring(cancelReservation)),
+      cancel: cancelReservation,
+    };
+    const gateService: UpdateMaintenanceGateService = {
+      acquire: Effect.succeed({ pid: process.pid, token: "test-maintenance-token" }),
+      release: Effect.void,
+      isHeld: Effect.succeed(false),
+      ensureDispatchAllowed: () => Effect.succeed({ generation: 0 }),
+      reserveDispatchAllowed: (_command, ownerScope) =>
+        Scope.addFinalizer(ownerScope, cancelReservation).pipe(
+          Effect.andThen(Deferred.succeed(reservationEntered, undefined)),
+          Effect.andThen(Deferred.await(allowReservation)),
+          Effect.as(maintenanceReservation),
+        ),
+      withDispatchAllowed: (_command, _acceptance, effect) => effect,
+    };
+    const system = await createOrchestrationSystem(gateService);
+    const command = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-bootstrap-force-stop-gap"),
+      threadId: ThreadId.make("thread-bootstrap-force-stop-gap"),
+      message: {
+        messageId: asMessageId("msg-bootstrap-force-stop-gap"),
+        role: "user",
+        text: "force stop",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+    const reservationFiber = await system.run(
+      system.engine
+        .reserveExternalHotAdmission(command)
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(reservationEntered));
+
+    await system.run(system.engine.forceStop.pipe(Effect.timeout("250 millis")));
+    await system.run(Deferred.succeed(allowReservation, undefined));
+    const exit = await system.run(Fiber.await(reservationFiber).pipe(Effect.timeout("250 millis")));
+    expect(Exit.isFailure(exit)).toBe(true);
+    await system.run(Deferred.await(reservationCancelled).pipe(Effect.timeout("250 millis")));
+    await system.dispose();
+  });
+
+  it("does not await stuck maintenance cancellation after force-stop wins publication", async () => {
+    const reservationEntered = Deferred.makeUnsafe<void>();
+    const allowReservation = Deferred.makeUnsafe<void>();
+    const maintenanceReservation: UpdateDispatchReservation = {
+      withDispatchAllowed: (_command, effect) => effect,
+      cancel: Effect.never,
+    };
+    const gateService: UpdateMaintenanceGateService = {
+      acquire: Effect.succeed({ pid: process.pid, token: "test-maintenance-token" }),
+      release: Effect.void,
+      isHeld: Effect.succeed(false),
+      ensureDispatchAllowed: () => Effect.succeed({ generation: 0 }),
+      reserveDispatchAllowed: (_command, ownerScope) =>
+        Scope.addFinalizer(ownerScope, maintenanceReservation.cancel).pipe(
+          Effect.andThen(Deferred.succeed(reservationEntered, undefined)),
+          Effect.andThen(Deferred.await(allowReservation)),
+          Effect.as(maintenanceReservation),
+        ),
+      withDispatchAllowed: (_command, _acceptance, effect) => effect,
+    };
+    const system = await createOrchestrationSystem(gateService);
+    const command = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-bootstrap-force-stop-stuck-cancel"),
+      threadId: ThreadId.make("thread-bootstrap-force-stop-stuck-cancel"),
+      message: {
+        messageId: asMessageId("msg-bootstrap-force-stop-stuck-cancel"),
+        role: "user",
+        text: "force stop",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+    const reservationFiber = await system.run(
+      system.engine
+        .reserveExternalHotAdmission(command)
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(reservationEntered));
+
+    await expect(
+      system.run(system.engine.forceStop.pipe(Effect.timeout("250 millis"))),
+    ).resolves.toBeUndefined();
+    await system.run(Deferred.succeed(allowReservation, undefined));
+    const exit = await system.run(Fiber.await(reservationFiber).pipe(Effect.timeout("250 millis")));
+    expect(Exit.isFailure(exit)).toBe(true);
+    await system.dispose();
+  });
+
+  it("keeps maintenance reserved after an enqueued bootstrap caller is interrupted", async () => {
+    const projectionEntered = Deferred.makeUnsafe<void>();
+    const allowProjection = Deferred.makeUnsafe<void>();
+    const pipeline: OrchestrationProjectionPipelineShape = {
+      bootstrap: Effect.void,
+      projectEvent: (event) =>
+        event.type === "thread.turn-start-requested"
+          ? Deferred.succeed(projectionEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(allowProjection)),
+            )
+          : Effect.void,
+    };
+    const system = await createOrchestrationSystem(null, pipeline);
+    const projectId = asProjectId("project-bootstrap-interrupted-after-enqueue");
+    const threadId = ThreadId.make("thread-bootstrap-interrupted-after-enqueue");
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-bootstrap-interrupted-after-enqueue-project"),
+        projectId,
+        title: "Interrupted bootstrap",
+        workspaceRoot: "/tmp/project-bootstrap-interrupted-after-enqueue",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-bootstrap-interrupted-after-enqueue-thread"),
+        threadId,
+        projectId,
+        title: "Interrupted bootstrap",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    const command = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-bootstrap-interrupted-after-enqueue-start"),
+      threadId,
+      message: {
+        messageId: asMessageId("msg-bootstrap-interrupted-after-enqueue"),
+        role: "user",
+        text: "persist me",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+    const reservation = await system.run(system.engine.reserveExternalHotAdmission(command));
+    const dispatchFiber = await system.run(
+      reservation
+        .dispatch(command)
+        .pipe(Effect.ensuring(reservation.cancel), Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(projectionEntered));
+    dispatchFiber.interruptUnsafe();
+    await system.run(Fiber.await(dispatchFiber));
+
+    const updateFiber = await system.run(
+      system.maintenanceGate.acquire.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Effect.yieldNow);
+    expect(updateFiber.pollUnsafe()).toBeUndefined();
+    await system.run(Deferred.succeed(allowProjection, undefined));
+    await system.run(Fiber.join(updateFiber));
+    await system.run(system.maintenanceGate.release);
+    await system.dispose();
+  });
+
+  it("forced sealing retains committed delivery work without publishing after the seal", async () => {
+    const projectionEntered = Deferred.makeUnsafe<void>();
+    const allowProjection = Deferred.makeUnsafe<void>();
+    const pipeline: OrchestrationProjectionPipelineShape = {
+      bootstrap: Effect.void,
+      projectEvent: (event) =>
+        event.type === "thread.turn-start-requested"
+          ? Deferred.succeed(projectionEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(allowProjection)),
+            )
+          : Effect.void,
+    };
+    const system = await createOrchestrationSystem(null, pipeline);
+    const projectId = asProjectId("project-forced-seal");
+    const threadId = ThreadId.make("thread-forced-seal");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-forced-seal-project"),
+        projectId,
+        title: "Forced seal",
+        workspaceRoot: "/tmp/project-forced-seal",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-forced-seal-thread"),
+        threadId,
+        projectId,
+        title: "Forced seal",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+
+    const published: OrchestrationEvent[] = [];
+    await system.run(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* Stream.runForEach(system.engine.streamDomainEvents, (event) =>
+            Effect.sync(() => {
+              published.push(event);
+            }),
+          ).pipe(Effect.forkScoped);
+          const dispatchFiber = yield* system.engine
+            .dispatchExternal({
+              type: "thread.turn.start",
+              commandId: CommandId.make("cmd-forced-seal-start"),
+              threadId,
+              message: {
+                messageId: asMessageId("message-forced-seal"),
+                role: "user",
+                text: "retain this",
+                attachments: [],
+              },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              createdAt: now(),
+            })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(projectionEntered);
+          const sealFiber = yield* system.engine.sealAndStop.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          expect(yield* system.engine.isSealed).toBe(true);
+          yield* Deferred.succeed(allowProjection, undefined);
+          yield* Fiber.join(dispatchFiber);
+          yield* Fiber.join(sealFiber);
+        }),
+      ),
+    );
+
+    expect(published).toEqual([]);
+    const pending = await system.run(system.deliveries.listPendingOrdered());
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.deliveryKind).toBe("turn-start");
+    await system.dispose();
+  });
+
+  it("force-stops without waiting for a hung command envelope", async () => {
+    const projectionEntered = Deferred.makeUnsafe<void>();
+    const allowProjection = Deferred.makeUnsafe<void>();
+    const pipeline: OrchestrationProjectionPipelineShape = {
+      bootstrap: Effect.void,
+      projectEvent: (event) =>
+        event.type === "thread.turn-start-requested"
+          ? Deferred.succeed(projectionEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(allowProjection)),
+            )
+          : Effect.void,
+    };
+    const system = await createOrchestrationSystem(null, pipeline);
+    const projectId = asProjectId("project-force-stop-hung");
+    const threadId = ThreadId.make("thread-force-stop-hung");
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-force-stop-hung-project"),
+        projectId,
+        title: "Force stop hung",
+        workspaceRoot: "/tmp/project-force-stop-hung",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchInternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-force-stop-hung-thread"),
+        threadId,
+        projectId,
+        title: "Force stop hung",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+
+    const dispatchFiber = await system.run(
+      system.engine
+        .dispatchExternal({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-force-stop-hung-start"),
+          threadId,
+          message: {
+            messageId: asMessageId("message-force-stop-hung"),
+            role: "user",
+            text: "hang",
+            attachments: [],
+          },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdAt: now(),
+        })
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(projectionEntered));
+
+    await system.run(system.engine.forceStop);
+    expect(await system.run(system.engine.isSealed)).toBe(true);
+    const dispatchExit = await system.run(Fiber.await(dispatchFiber));
+    expect(Exit.isFailure(dispatchExit)).toBe(true);
+    await expect(
+      system.run(
+        system.engine.dispatchInternal({
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-force-stop-after"),
+          threadId,
+        }),
+      ),
+    ).rejects.toMatchObject({ phase: "sealed" });
+    await system.run(Deferred.succeed(allowProjection, undefined));
+    await system.dispose();
+  });
+
+  it("force-stops while a producer is paused before final admission", async () => {
+    const producerEntered = Deferred.makeUnsafe<void>();
+    const allowProducer = Deferred.makeUnsafe<void>();
+    const gateService: UpdateMaintenanceGateService = {
+      acquire: Effect.succeed({ pid: process.pid, token: "test-maintenance-token" }),
+      release: Effect.void,
+      isHeld: Effect.succeed(false),
+      ensureDispatchAllowed: () =>
+        Deferred.succeed(producerEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowProducer)),
+          Effect.as({ generation: 0 }),
+        ),
+      reserveDispatchAllowed: (_command, ownerScope) => {
+        const reservation: UpdateDispatchReservation = {
+          withDispatchAllowed: (_command, effect) => effect,
+          cancel: Effect.void,
+        };
+        return Scope.addFinalizer(ownerScope, reservation.cancel).pipe(Effect.as(reservation));
+      },
+      withDispatchAllowed: (_command, _acceptance, effect) => effect,
+    };
+    const system = await createOrchestrationSystem(gateService);
+    const dispatchFiber = await system.run(
+      system.engine
+        .dispatchInternal({
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-paused-before-force-stop"),
+          threadId: ThreadId.make("thread-paused-before-force-stop"),
+        })
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(producerEntered));
+
+    await expect(
+      system.run(system.engine.forceStop.pipe(Effect.timeout("250 millis"))),
+    ).resolves.toBeUndefined();
+    await system.run(Deferred.succeed(allowProducer, undefined));
+    const exit = await system.run(Fiber.await(dispatchFiber).pipe(Effect.timeout("250 millis")));
+    expect(Exit.isFailure(exit)).toBe(true);
+    await system.dispose();
+  });
+
+  it("force-stops without awaiting a stuck maintenance reservation cancellation", async () => {
+    const gateService: UpdateMaintenanceGateService = {
+      acquire: Effect.succeed({ pid: process.pid, token: "test-maintenance-token" }),
+      release: Effect.void,
+      isHeld: Effect.succeed(false),
+      ensureDispatchAllowed: () => Effect.succeed({ generation: 0 }),
+      reserveDispatchAllowed: (_command, ownerScope) => {
+        const reservation: UpdateDispatchReservation = {
+          withDispatchAllowed: (_command, effect) => effect,
+          cancel: Effect.never,
+        };
+        return Scope.addFinalizer(ownerScope, reservation.cancel).pipe(Effect.as(reservation));
+      },
+      withDispatchAllowed: (_command, _acceptance, effect) => effect,
+    };
+    const system = await createOrchestrationSystem(gateService);
+    const command = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-force-stop-stuck-reservation"),
+      threadId: ThreadId.make("thread-force-stop-stuck-reservation"),
+      message: {
+        messageId: asMessageId("msg-force-stop-stuck-reservation"),
+        role: "user",
+        text: "stuck reservation",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+    await system.run(system.engine.reserveExternalHotAdmission(command));
+
+    await expect(
+      system.run(system.engine.forceStop.pipe(Effect.timeout("250 millis"))),
+    ).resolves.toBeUndefined();
+    await expect(
+      system.run(system.engine.awaitStopped.pipe(Effect.timeout("250 millis"))),
+    ).resolves.toBeUndefined();
+    expect(await system.run(system.engine.isSealed)).toBe(true);
+    await system.dispose();
+  });
+
   it("blocks turn dispatch while the shared update maintenance gate is held", async () => {
     const system = await createOrchestrationSystem();
     await system.run(system.maintenanceGate.acquire);
@@ -256,6 +1607,14 @@ describe("OrchestrationEngine", () => {
               )
             : Effect.succeed({ generation: 0 });
         }),
+      reserveDispatchAllowed: (command) =>
+        gateService.ensureDispatchAllowed(command).pipe(
+          Effect.map(() => ({
+            withDispatchAllowed: (reservedCommand, effect) =>
+              gateService.ensureDispatchAllowed(reservedCommand).pipe(Effect.andThen(effect)),
+            cancel: Effect.void,
+          })),
+        ),
       withDispatchAllowed: (command, _acceptance, effect) =>
         gateService.ensureDispatchAllowed(command).pipe(Effect.andThen(effect)),
     };

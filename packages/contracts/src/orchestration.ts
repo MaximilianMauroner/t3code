@@ -340,6 +340,11 @@ export const OrchestrationLatestTurn = Schema.Struct({
   completedAt: Schema.NullOr(IsoDateTime),
   assistantMessageId: Schema.NullOr(MessageId),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  interruptionCode: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  interruptionDetectedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  executionLastObservedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  interruptionTimestampFallback: Schema.optional(Schema.Boolean),
+  retrySourceMessageId: Schema.optional(Schema.NullOr(MessageId)),
 });
 export type OrchestrationLatestTurn = typeof OrchestrationLatestTurn.Type;
 
@@ -492,6 +497,8 @@ export type OrchestrationSubscribeShellInput = typeof OrchestrationSubscribeShel
 
 export const OrchestrationSubscribeThreadInput = Schema.Struct({
   threadId: ThreadId,
+  /** Opts this subscriber into dedicated recovery-event variants. */
+  threadRecoveryEventsV1: Schema.optionalKey(Schema.Boolean),
   /**
    * When provided, the server skips the initial snapshot frame and instead
    * replays events after this sequence before streaming live events. Clients
@@ -804,6 +811,107 @@ const ThreadSessionSetCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+export const OrchestrationRecoveryReason = Schema.Literals([
+  "server-restarted",
+  "provider-exited",
+  "provider-state-mismatch",
+  "shutdown",
+]);
+export type OrchestrationRecoveryReason = typeof OrchestrationRecoveryReason.Type;
+
+export const OrchestrationInterruptionCode = Schema.Literals([
+  "server_restart",
+  "provider_exit",
+  "provider_state_mismatch",
+  "server_shutdown",
+]);
+export type OrchestrationInterruptionCode = typeof OrchestrationInterruptionCode.Type;
+
+export const OrchestrationReactorDeliveryStatus = Schema.Literals([
+  "pending",
+  "delivering",
+  "delivered",
+  "cancelled",
+  "dead-letter",
+]);
+export type OrchestrationReactorDeliveryStatus = typeof OrchestrationReactorDeliveryStatus.Type;
+
+export const OrchestrationReactorDeliveryReplayPolicy = Schema.Literals([
+  "replay-idempotent",
+  "cancel-with-recovery",
+]);
+export type OrchestrationReactorDeliveryReplayPolicy =
+  typeof OrchestrationReactorDeliveryReplayPolicy.Type;
+
+export const OrchestrationReactorDeliveryKind = Schema.Literals([
+  "runtime-mode-change",
+  "turn-start",
+  "turn-interrupt",
+  "approval-response",
+  "user-input-response",
+  "checkpoint-revert",
+  "session-stop",
+  "archive-cleanup",
+  "thread-delete",
+]);
+export type OrchestrationReactorDeliveryKind = typeof OrchestrationReactorDeliveryKind.Type;
+
+export const OrchestrationExpectedSession = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("absent") }),
+  Schema.Struct({
+    kind: Schema.Literal("present"),
+    status: OrchestrationSessionStatus,
+    activeTurnId: Schema.NullOr(TurnId),
+    updatedAt: IsoDateTime,
+    providerName: Schema.NullOr(TrimmedNonEmptyString),
+    providerInstanceId: Schema.optional(Schema.NullOr(ProviderInstanceId)),
+  }),
+]);
+export type OrchestrationExpectedSession = typeof OrchestrationExpectedSession.Type;
+
+export const OrchestrationExpectedDeliveryOwnership = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("pending") }),
+  Schema.Struct({
+    status: Schema.Literal("delivering"),
+    claimToken: TrimmedNonEmptyString,
+  }),
+]);
+export type OrchestrationExpectedDeliveryOwnership =
+  typeof OrchestrationExpectedDeliveryOwnership.Type;
+
+export const OrchestrationRecoveryTarget = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("turn"),
+    turnId: TurnId,
+    retrySourceMessageId: Schema.NullOr(MessageId),
+    expectedSession: OrchestrationExpectedSession,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("pendingStart"),
+    pendingMessageId: MessageId,
+    deliveryId: TrimmedNonEmptyString,
+    sourceEventId: EventId,
+    expectedSession: OrchestrationExpectedSession,
+    expectedDeliveryOwnership: OrchestrationExpectedDeliveryOwnership,
+  }),
+]);
+export type OrchestrationRecoveryTarget = typeof OrchestrationRecoveryTarget.Type;
+
+export const ThreadSessionInterruptIfActiveCommand = Schema.Struct({
+  type: Schema.Literal("thread.session.interrupt-if-active"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  target: OrchestrationRecoveryTarget,
+  reason: OrchestrationRecoveryReason,
+  interruptionCode: OrchestrationInterruptionCode,
+  serverBootId: TrimmedNonEmptyString,
+  detectedAt: IsoDateTime,
+  executionLastObservedAt: Schema.optional(IsoDateTime),
+  createdAt: IsoDateTime,
+});
+export type ThreadSessionInterruptIfActiveCommand =
+  typeof ThreadSessionInterruptIfActiveCommand.Type;
+
 const ThreadMessageAssistantDeltaCommand = Schema.Struct({
   type: Schema.Literal("thread.message.assistant.delta"),
   commandId: CommandId,
@@ -869,6 +977,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadTurnDiffCompleteCommand,
   ThreadActivityAppendCommand,
   ThreadRevertCompleteCommand,
+  ThreadSessionInterruptIfActiveCommand,
 ]);
 export type InternalOrchestrationCommand = typeof InternalOrchestrationCommand.Type;
 
@@ -902,6 +1011,8 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.reverted",
   "thread.session-stop-requested",
   "thread.session-set",
+  "thread.session-interrupted",
+  "thread.session-start-interrupted",
   "thread.proposed-plan-upserted",
   "thread.turn-diff-completed",
   "thread.activity-appended",
@@ -1087,6 +1198,32 @@ export const ThreadSessionSetPayload = Schema.Struct({
   session: OrchestrationSession,
 });
 
+export const ThreadSessionInterruptedPayload = Schema.Struct({
+  threadId: ThreadId,
+  turnId: TurnId,
+  interruptionCode: OrchestrationInterruptionCode,
+  reason: OrchestrationRecoveryReason,
+  detectedAt: IsoDateTime,
+  executionLastObservedAt: Schema.optional(IsoDateTime),
+  timestampFallback: Schema.Boolean,
+  retrySourceMessageId: Schema.NullOr(MessageId),
+  serverBootId: TrimmedNonEmptyString,
+});
+
+export const ThreadSessionStartInterruptedPayload = Schema.Struct({
+  threadId: ThreadId,
+  pendingMessageId: MessageId,
+  deliveryId: TrimmedNonEmptyString,
+  sourceEventId: EventId,
+  interruptionCode: OrchestrationInterruptionCode,
+  reason: OrchestrationRecoveryReason,
+  detectedAt: IsoDateTime,
+  executionLastObservedAt: Schema.optional(IsoDateTime),
+  expectedSession: Schema.optional(OrchestrationExpectedSession),
+  expectedDeliveryOwnership: Schema.optional(OrchestrationExpectedDeliveryOwnership),
+  serverBootId: TrimmedNonEmptyString,
+});
+
 export const ThreadProposedPlanUpsertedPayload = Schema.Struct({
   threadId: ThreadId,
   proposedPlan: OrchestrationProposedPlan,
@@ -1247,6 +1384,16 @@ export const OrchestrationEvent = Schema.Union([
   }),
   Schema.Struct({
     ...EventBaseFields,
+    type: Schema.Literal("thread.session-interrupted"),
+    payload: ThreadSessionInterruptedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.session-start-interrupted"),
+    payload: ThreadSessionStartInterruptedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
     type: Schema.Literal("thread.proposed-plan-upserted"),
     payload: ThreadProposedPlanUpsertedPayload,
   }),
@@ -1366,6 +1513,7 @@ export type OrchestrationGetFullThreadDiffResult = typeof OrchestrationGetFullTh
 
 export const OrchestrationReplayEventsInput = Schema.Struct({
   fromSequenceExclusive: NonNegativeInt,
+  threadRecoveryEventsV1: Schema.optionalKey(Schema.Boolean),
 });
 export type OrchestrationReplayEventsInput = typeof OrchestrationReplayEventsInput.Type;
 
@@ -1416,6 +1564,24 @@ export class OrchestrationDispatchCommandError extends Schema.TaggedErrorClass<O
   {
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
+export const OrchestrationNotReadyPhase = Schema.Literals([
+  "starting",
+  "reconciling",
+  "quiescing",
+  "sealed",
+]);
+export type OrchestrationNotReadyPhase = typeof OrchestrationNotReadyPhase.Type;
+
+export class OrchestrationNotReadyError extends Schema.TaggedErrorClass<OrchestrationNotReadyError>()(
+  "orchestration_not_ready",
+  {
+    message: TrimmedNonEmptyString,
+    retryable: Schema.Boolean,
+    retryAfterMs: NonNegativeInt,
+    phase: OrchestrationNotReadyPhase,
   },
 ) {}
 

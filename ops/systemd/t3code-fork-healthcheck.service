@@ -10,3 +10,5 @@ Environment=T3CODE_CURRENT_LINK=/home/codex/.t3code/userdata/fork-current
 Environment=T3CODE_RELEASES_DIR=/home/codex/.t3code/userdata/fork-releases
 Environment=T3CODE_SERVICE_NAME=t3code.service
 Environment=T3CODE_RUN_USER=codex
+Environment=T3CODE_WATCHDOG_RUNTIME_DIR=/run/t3code-watchdog
+TimeoutStartSec=30s

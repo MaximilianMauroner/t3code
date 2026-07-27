@@ -133,6 +133,75 @@ it.layer(TestLayer)("ProjectFaviconResolverLive", (it) => {
       }),
     );
 
+    it.effect("discovers an Orderly-style monorepo favicon", () =>
+      Effect.gen(function* () {
+        const resolver = yield* ProjectFaviconResolver.ProjectFaviconResolver;
+        const cwd = yield* makeTempDir;
+        yield* writeTextFile(cwd, "apps/web/public/favicon.ico", "favicon");
+
+        const resolved = yield* resolver.resolvePath(cwd);
+
+        expect(resolved).not.toBeNull();
+        expect(resolved).toContain("apps/web/public/favicon.ico");
+      }),
+    );
+
+    it.effect("discovers an Auto Cron-style nested monorepo favicon", () =>
+      Effect.gen(function* () {
+        const resolver = yield* ProjectFaviconResolver.ProjectFaviconResolver;
+        const cwd = yield* makeTempDir;
+        yield* writeTextFile(cwd, "apps/web/public/brand/auto-cron/favicon.png", "favicon");
+
+        const resolved = yield* resolver.resolvePath(cwd);
+
+        expect(resolved).not.toBeNull();
+        expect(resolved).toContain("apps/web/public/brand/auto-cron/favicon.png");
+      }),
+    );
+
+    it.effect("prefers the web app and exact favicon names during monorepo discovery", () =>
+      Effect.gen(function* () {
+        const resolver = yield* ProjectFaviconResolver.ProjectFaviconResolver;
+        const cwd = yield* makeTempDir;
+        yield* writeTextFile(cwd, "apps/admin/public/favicon.svg", "<svg>admin</svg>");
+        yield* writeTextFile(cwd, "apps/web/public/favicon-64.png", "large favicon");
+        yield* writeTextFile(cwd, "apps/web/public/brand/favicon.ico", "nested favicon");
+        yield* writeTextFile(cwd, "apps/web/public/favicon.png", "favicon");
+
+        const resolved = yield* resolver.resolvePath(cwd);
+
+        expect(resolved).not.toBeNull();
+        expect(resolved).toContain("apps/web/public/favicon.png");
+      }),
+    );
+
+    it.effect("prefers root icon metadata over monorepo fallback discovery", () =>
+      Effect.gen(function* () {
+        const resolver = yield* ProjectFaviconResolver.ProjectFaviconResolver;
+        const cwd = yield* makeTempDir;
+        yield* writeTextFile(cwd, "index.html", '<link rel="icon" href="/brand/logo.svg">');
+        yield* writeTextFile(cwd, "public/brand/logo.svg", "<svg>brand</svg>");
+        yield* writeTextFile(cwd, "apps/web/public/favicon.ico", "favicon");
+
+        const resolved = yield* resolver.resolvePath(cwd);
+
+        expect(resolved).not.toBeNull();
+        expect(resolved).toContain("public/brand/logo.svg");
+      }),
+    );
+
+    it.effect("ignores non-directory entries directly under apps", () =>
+      Effect.gen(function* () {
+        const resolver = yield* ProjectFaviconResolver.ProjectFaviconResolver;
+        const cwd = yield* makeTempDir;
+        yield* writeTextFile(cwd, "apps/README.md", "not an app directory");
+
+        const resolved = yield* resolver.resolvePath(cwd);
+
+        expect(resolved).toBeNull();
+      }),
+    );
+
     it.effect("returns null when no icon is present", () =>
       Effect.gen(function* () {
         const resolver = yield* ProjectFaviconResolver.ProjectFaviconResolver;

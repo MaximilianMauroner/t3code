@@ -3,6 +3,7 @@ import {
   CommandId,
   EnvironmentId,
   MessageId,
+  OrchestrationProposedPlanId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -92,6 +93,10 @@ describe("thread outbox", () => {
       },
       runtimeMode: "approval-required",
       interactionMode: "plan",
+      sourceProposedPlan: {
+        threadId: ThreadId.make("plan-thread"),
+        planId: OrchestrationProposedPlanId.make("plan-1"),
+      },
     } satisfies QueuedThreadMessage;
 
     expect(decodeQueuedThreadMessage(encodeQueuedThreadMessage(selectedMessage))).toEqual(
@@ -108,6 +113,41 @@ describe("thread outbox", () => {
       runtimeMode: selectedMessage.runtimeMode,
       interactionMode: selectedMessage.interactionMode,
     });
+  });
+
+  it("round-trips recovery context through durable storage while offline", async () => {
+    const original = {
+      ...queuedMessage({
+        messageId: "recovery-retry",
+        createdAt: "2026-07-26T10:10:00.000Z",
+      }),
+      sourceProposedPlan: {
+        threadId: ThreadId.make("source-thread"),
+        planId: OrchestrationProposedPlanId.make("source-plan"),
+      },
+    } satisfies QueuedThreadMessage;
+    let persisted: unknown = null;
+    const storage: ThreadOutboxStorage = {
+      load: async () => (persisted === null ? [] : [decodeQueuedThreadMessage(persisted)]),
+      write: async (message) => {
+        persisted = encodeQueuedThreadMessage(message);
+      },
+      remove: async () => {
+        persisted = null;
+      },
+    };
+    const firstRegistry = AtomRegistry.make();
+    const firstManager = createThreadOutboxManager({ registry: firstRegistry, storage });
+    await firstManager.enqueue(original);
+    firstRegistry.dispose();
+
+    const reloadedRegistry = AtomRegistry.make();
+    const reloadedManager = createThreadOutboxManager({ registry: reloadedRegistry, storage });
+    await reloadedManager.load();
+    expect(reloadedRegistry.get(reloadedManager.queuedMessagesByThreadKeyAtom)).toEqual({
+      "environment-1:thread-1": [original],
+    });
+    reloadedRegistry.dispose();
   });
 
   it("compares model options as part of the queued settings change", () => {

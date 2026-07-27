@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vite-plus/test";
+import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Metric from "effect/Metric";
+import * as TestClock from "effect/testing/TestClock";
+import { it as effectIt } from "@effect/vitest";
 
-import { isLoopbackHostname, resolveDevRedirectUrl } from "./http.ts";
+import {
+  isLoopbackHostname,
+  resolveDevRedirectUrl,
+  withEnvironmentDescriptorHealthMetrics,
+} from "./http.ts";
 
 describe("http dev routing", () => {
   it("treats localhost and loopback addresses as local", () => {
@@ -24,4 +34,31 @@ describe("http dev routing", () => {
       "http://127.0.0.1:5173/pair?token=test-token",
     );
   });
+});
+
+describe("environment descriptor health metrics", () => {
+  effectIt.effect("records the watchdog endpoint with a bounded label", () =>
+    Effect.gen(function* () {
+      const duration = Duration.millis(25);
+      const fiber = yield* Effect.sleep(duration).pipe(
+        withEnvironmentDescriptorHealthMetrics,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(duration);
+      yield* Fiber.join(fiber);
+
+      const snapshots = yield* Metric.snapshot;
+      const sample = snapshots.find(
+        (entry) =>
+          entry.type === "Histogram" &&
+          entry.id === "t3_health_probe_duration" &&
+          entry.attributes?.probe === "environment-descriptor",
+      );
+      expect(sample?.type).toBe("Histogram");
+      if (sample?.type !== "Histogram") return;
+      expect(sample.state.count).toBe(1);
+      expect(sample.state.sum).toBe(25);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
 });

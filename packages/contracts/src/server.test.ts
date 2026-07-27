@@ -1,12 +1,13 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { ServerForkUpdateStatus, ServerProvider } from "./server.ts";
+import { ServerConfig, ServerForkUpdateStatus, ServerProvider } from "./server.ts";
 import { OrchestrationThreadActivity } from "./orchestration.ts";
 
 const decodeServerProvider = Schema.decodeUnknownSync(ServerProvider);
 const encodeThreadActivity = Schema.encodeUnknownSync(OrchestrationThreadActivity);
 const decodeThreadActivity = Schema.decodeUnknownSync(OrchestrationThreadActivity);
+const decodeForkUpdateStatus = Schema.decodeUnknownSync(ServerForkUpdateStatus);
 
 it("round-trips omitted persisted activity payload markers", () => {
   const activity = {
@@ -94,7 +95,7 @@ describe("ServerProvider", () => {
 
 describe("ServerForkUpdateStatus", () => {
   it("decodes persisted terminal status", () => {
-    const decoded = Schema.decodeUnknownSync(ServerForkUpdateStatus)({
+    const decoded = decodeForkUpdateStatus({
       stage: "failed",
       message: "The current release was kept.",
       startedAt: "2026-07-24T10:00:00.000Z",
@@ -109,7 +110,7 @@ describe("ServerForkUpdateStatus", () => {
 
   it("rejects unknown workflow stages", () => {
     expect(() =>
-      Schema.decodeUnknownSync(ServerForkUpdateStatus)({
+      decodeForkUpdateStatus({
         stage: "running-arbitrary-command",
         message: "Unsafe",
         startedAt: null,
@@ -120,4 +121,9 @@ describe("ServerForkUpdateStatus", () => {
       }),
     ).toThrow();
   });
+});
+
+it("keeps recovery capability advertisement optional for historical configs", () => {
+  const fields = ServerConfig.fields;
+  expect(fields.threadRecoveryEventsV1).toBeDefined();
 });

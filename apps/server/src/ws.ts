@@ -25,6 +25,7 @@ import {
   type DiscoveredLocalServerList,
   EventId,
   type OrchestrationCommand,
+  type DispatchableClientOrchestrationCommand,
   type GitActionProgressEvent,
   type GitManagerServiceError,
   OrchestrationDispatchCommandError,
@@ -47,6 +48,7 @@ import {
   RelayClientInstallFailedError,
   type RelayClientInstallProgressEvent,
   OrchestrationReplayEventsError,
+  OrchestrationNotReadyError,
   type FilesystemBrowseFailure,
   FilesystemBrowseError,
   AssetWorkspaceContextNotFoundError,
@@ -114,10 +116,12 @@ import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
 import * as VcsProjectConfig from "./vcs/VcsProjectConfig.ts";
 import * as VcsProcess from "./vcs/VcsProcess.ts";
 import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
+import { downconvertRecoveryEventForLegacyClient } from "./orchestration/recoveryEventCompatibility.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
+const isOrchestrationNotReadyError = Schema.is(OrchestrationNotReadyError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -264,7 +268,9 @@ function isThreadDetailEvent(event: OrchestrationEvent): event is Extract<
       | "thread.activity-appended"
       | "thread.turn-diff-completed"
       | "thread.reverted"
-      | "thread.session-set";
+      | "thread.session-set"
+      | "thread.session-interrupted"
+      | "thread.session-start-interrupted";
   }
 > {
   return (
@@ -273,7 +279,9 @@ function isThreadDetailEvent(event: OrchestrationEvent): event is Extract<
     event.type === "thread.activity-appended" ||
     event.type === "thread.turn-diff-completed" ||
     event.type === "thread.reverted" ||
-    event.type === "thread.session-set"
+    event.type === "thread.session-set" ||
+    event.type === "thread.session-interrupted" ||
+    event.type === "thread.session-start-interrupted"
   );
 }
 
@@ -847,6 +855,13 @@ const makeWsRpcLayer = (
         Effect.gen(function* () {
           const bootstrap = command.bootstrap;
           const { bootstrap: _bootstrap, ...finalTurnStartCommand } = command;
+          const admissionReservation = yield* orchestrationEngine
+            .reserveExternalHotAdmission(finalTurnStartCommand)
+            .pipe(
+              Effect.mapError((cause) =>
+                toDispatchCommandError(cause, "Failed to reserve bootstrap command admission."),
+              ),
+            );
           let createdThread = false;
           let targetProjectId = bootstrap?.createThread?.projectId;
           let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
@@ -1033,7 +1048,7 @@ const makeWsRpcLayer = (
 
             yield* runSetupProgram();
 
-            return yield* orchestrationEngine.dispatch(finalTurnStartCommand);
+            return yield* admissionReservation.dispatch(finalTurnStartCommand);
           });
 
           return yield* bootstrapProgram.pipe(
@@ -1044,17 +1059,18 @@ const makeWsRpcLayer = (
               }
               return cleanupCreatedThread().pipe(Effect.flatMap(() => Effect.fail(dispatchError)));
             }),
+            Effect.ensuring(admissionReservation.cancel),
           );
         });
 
       const dispatchNormalizedCommand = (
-        normalizedCommand: OrchestrationCommand,
-      ): Effect.Effect<{ readonly sequence: number }, OrchestrationDispatchCommandError> => {
+        normalizedCommand: DispatchableClientOrchestrationCommand,
+      ) => {
         const dispatchEffect =
           normalizedCommand.type === "thread.turn.start" && normalizedCommand.bootstrap
             ? dispatchBootstrapTurnStart(normalizedCommand)
             : orchestrationEngine
-                .dispatch(normalizedCommand)
+                .dispatchExternal(normalizedCommand)
                 .pipe(
                   Effect.mapError((cause) =>
                     toDispatchCommandError(cause, "Failed to dispatch orchestration command"),
@@ -1062,10 +1078,15 @@ const makeWsRpcLayer = (
                 );
 
         return startup
-          .enqueueCommand(dispatchEffect)
+          .enqueueCommand(dispatchEffect, {
+            requestId: normalizedCommand.commandId,
+            connectionId: currentSessionId,
+          })
           .pipe(
             Effect.mapError((cause) =>
-              toDispatchCommandError(cause, "Failed to dispatch orchestration command"),
+              isOrchestrationNotReadyError(cause)
+                ? cause
+                : toDispatchCommandError(cause, "Failed to dispatch orchestration command"),
             ),
           );
       };
@@ -1101,6 +1122,7 @@ const makeWsRpcLayer = (
           settings,
           shellResumeCompletionMarker: true,
           threadResumeCompletionMarker: true,
+          threadRecoveryEventsV1: true,
         };
       });
 
@@ -1115,58 +1137,10 @@ const makeWsRpcLayer = (
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
               const normalizedCommand = yield* normalizeDispatchCommand(command);
-              const shouldStopSessionAfterArchive =
-                normalizedCommand.type === "thread.archive"
-                  ? yield* projectionSnapshotQuery
-                      .getThreadShellById(normalizedCommand.threadId)
-                      .pipe(
-                        Effect.map(
-                          Option.match({
-                            onNone: () => false,
-                            onSome: (thread) =>
-                              thread.session !== null && thread.session.status !== "stopped",
-                          }),
-                        ),
-                        Effect.orElseSucceed(() => false),
-                      )
-                  : false;
-              const result = yield* dispatchNormalizedCommand(normalizedCommand);
-              if (normalizedCommand.type === "thread.archive") {
-                if (shouldStopSessionAfterArchive) {
-                  yield* Effect.gen(function* () {
-                    const stopCommand = yield* normalizeDispatchCommand({
-                      type: "thread.session.stop",
-                      commandId: CommandId.make(
-                        `session-stop-for-archive:${normalizedCommand.commandId}`,
-                      ),
-                      threadId: normalizedCommand.threadId,
-                      createdAt: yield* nowIso,
-                    });
-
-                    yield* dispatchNormalizedCommand(stopCommand);
-                  }).pipe(
-                    Effect.catchCause((cause) =>
-                      Effect.logWarning("failed to stop provider session during archive", {
-                        threadId: normalizedCommand.threadId,
-                        cause,
-                      }),
-                    ),
-                  );
-                }
-
-                yield* terminalManager.close({ threadId: normalizedCommand.threadId }).pipe(
-                  Effect.catch((error) =>
-                    Effect.logWarning("failed to close thread terminals after archive", {
-                      threadId: normalizedCommand.threadId,
-                      error: error.message,
-                    }),
-                  ),
-                );
-              }
-              return result;
+              return yield* dispatchNormalizedCommand(normalizedCommand);
             }).pipe(
               Effect.mapError((cause) =>
-                isOrchestrationDispatchCommandError(cause)
+                isOrchestrationDispatchCommandError(cause) || isOrchestrationNotReadyError(cause)
                   ? cause
                   : new OrchestrationDispatchCommandError({
                       message: "Failed to dispatch orchestration command",
@@ -1217,6 +1191,11 @@ const makeWsRpcLayer = (
             ).pipe(
               Effect.map((events) => Array.from(events)),
               Effect.flatMap(enrichOrchestrationEvents),
+              Effect.map((events) =>
+                input.threadRecoveryEventsV1 === true
+                  ? events
+                  : events.map(downconvertRecoveryEventForLegacyClient),
+              ),
               Effect.mapError(
                 (cause) =>
                   new OrchestrationReplayEventsError({
@@ -1362,6 +1341,11 @@ const makeWsRpcLayer = (
 
               const liveStream = orchestrationEngine.streamDomainEvents.pipe(
                 Stream.filter(isThisThreadDetailEvent),
+                Stream.map((event) =>
+                  input.threadRecoveryEventsV1 === true
+                    ? event
+                    : downconvertRecoveryEventForLegacyClient(event),
+                ),
                 Stream.map((event) => ({
                   kind: "event" as const,
                   event,
@@ -1399,6 +1383,11 @@ const makeWsRpcLayer = (
                   .readEvents(afterSequence, Number.MAX_SAFE_INTEGER)
                   .pipe(
                     Stream.filter(isThisThreadDetailEvent),
+                    Stream.map((event) =>
+                      input.threadRecoveryEventsV1 === true
+                        ? event
+                        : downconvertRecoveryEventForLegacyClient(event),
+                    ),
                     Stream.map((event) => ({ kind: "event" as const, event })),
                     Stream.mapError(
                       (cause) =>

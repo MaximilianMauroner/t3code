@@ -26,14 +26,18 @@ import {
 } from "@t3tools/contracts";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import {
   increment,
@@ -46,7 +50,13 @@ import {
   withMetrics,
 } from "../../observability/Metrics.ts";
 import { type ProviderAdapterError, ProviderValidationError } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import {
+  isProviderLivenessMarker,
+  type ProviderAdapterShape,
+  type ProviderIngestionBarrier,
+  type ProviderIngestionOutput,
+  type ProviderLivenessMarker,
+} from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -213,6 +223,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const ingestionPubSub = yield* PubSub.unbounded<ProviderIngestionOutput>();
+  const ingestionSourceScope = yield* Scope.make("sequential");
+  yield* Effect.addFinalizer(() =>
+    Scope.close(ingestionSourceScope, Exit.void).pipe(Effect.ignore),
+  );
+  const ingestionSourceClosed = yield* Ref.make(false);
+  const ingestionSourceCloseAcknowledged = yield* Deferred.make<void>();
+  const startTokens = yield* SynchronizedRef.make(new Map<string, ReadonlySet<number>>());
+  const nextStartToken = yield* Ref.make(0);
+  const nextMarker = yield* Ref.make(0);
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
     McpSessionRegistry.issueActiveMcpCredential({ threadId, providerInstanceId }).pipe(
@@ -234,9 +254,44 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ? canonicalEventLogger.write(canonicalEvent, canonicalEvent.threadId)
           : Effect.void,
       ),
-      Effect.flatMap((canonicalEvent) => PubSub.publish(runtimeEventPubSub, canonicalEvent)),
+      Effect.flatMap((canonicalEvent) =>
+        Effect.all([
+          PubSub.publish(runtimeEventPubSub, canonicalEvent),
+          PubSub.publish(ingestionPubSub, canonicalEvent),
+        ]),
+      ),
       Effect.asVoid,
     );
+
+  const startTokenKey = (providerInstanceId: ProviderInstanceId, threadId: ThreadId) =>
+    `${providerInstanceId}\u0000${threadId}`;
+
+  const withStartToken = <A, E, R>(
+    providerInstanceId: ProviderInstanceId,
+    threadId: ThreadId,
+    effect: Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, E, R> =>
+    Effect.gen(function* () {
+      const token = yield* Ref.updateAndGet(nextStartToken, (value) => value + 1);
+      const key = startTokenKey(providerInstanceId, threadId);
+      yield* SynchronizedRef.update(startTokens, (current) => {
+        const next = new Map(current);
+        next.set(key, new Set([...(current.get(key) ?? []), token]));
+        return next;
+      });
+      return yield* effect.pipe(
+        Effect.ensuring(
+          SynchronizedRef.update(startTokens, (current) => {
+            const remaining = new Set(current.get(key) ?? []);
+            remaining.delete(token);
+            const next = new Map(current);
+            if (remaining.size === 0) next.delete(key);
+            else next.set(key, remaining);
+            return next;
+          }),
+        ),
+      );
+    });
 
   const requireBindingInstanceId = (
     operation: string,
@@ -281,21 +336,23 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
     });
 
-  const processRuntimeEvent = (
+  const processAdapterOutput = (
     source: {
       readonly instanceId: ProviderInstanceId;
       readonly provider: ProviderDriverKind;
     },
-    event: ProviderRuntimeEvent,
+    output: ProviderRuntimeEvent | ProviderLivenessMarker,
   ): Effect.Effect<void> =>
-    Effect.sync(() => correlateRuntimeEventWithInstance(source, event)).pipe(
-      Effect.flatMap((canonicalEvent) =>
-        increment(providerRuntimeEventsTotal, {
-          provider: canonicalEvent.provider,
-          eventType: canonicalEvent.type,
-        }).pipe(Effect.andThen(publishRuntimeEvent(canonicalEvent))),
-      ),
-    );
+    isProviderLivenessMarker(output)
+      ? PubSub.publish(ingestionPubSub, output).pipe(Effect.asVoid)
+      : Effect.sync(() => correlateRuntimeEventWithInstance(source, output)).pipe(
+          Effect.flatMap((canonicalEvent) =>
+            increment(providerRuntimeEventsTotal, {
+              provider: canonicalEvent.provider,
+              eventType: canonicalEvent.type,
+            }).pipe(Effect.andThen(publishRuntimeEvent(canonicalEvent))),
+          ),
+        );
 
   // `subscribedAdapters` is our source-of-truth for "which instance adapters
   // are currently wired into the runtime event bus". It both tracks the set
@@ -331,15 +388,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const adapter = adapterOption.value;
       next.set(id, adapter);
       if (previous.get(id) !== adapter) {
-        yield* Stream.runForEach(adapter.streamEvents, (event) =>
-          processRuntimeEvent(
+        yield* Stream.runForEach(adapter.streamOutput ?? adapter.streamEvents, (event) =>
+          processAdapterOutput(
             {
               instanceId: id,
               provider: adapter.provider,
             },
             event,
-          ),
-        ).pipe(Effect.forkScoped);
+          ).pipe(Effect.uninterruptible),
+        ).pipe(Effect.forkScoped, Scope.provide(ingestionSourceScope));
       }
     }
     yield* Ref.set(subscribedAdapters, next);
@@ -350,7 +407,24 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   yield* Stream.runForEach(
     Stream.fromSubscription(instanceChanges),
     () => reconcileInstanceSubscriptions,
-  ).pipe(Effect.forkScoped);
+  ).pipe(Effect.forkScoped, Scope.provide(ingestionSourceScope));
+
+  const closeIngestionSource: NonNullable<ProviderServiceMethod<"closeIngestionSource">> =
+    Effect.gen(function* () {
+      const shouldClose = yield* Ref.modify(ingestionSourceClosed, (closed) =>
+        closed ? ([false, true] as const) : ([true, true] as const),
+      );
+      if (shouldClose) {
+        yield* Scope.close(ingestionSourceScope, Exit.void);
+        const barrier = {
+          _tag: "ProviderIngestionBarrier",
+          barrierId: `provider-source-close:${yield* Ref.updateAndGet(nextMarker, (value) => value + 1)}`,
+          acknowledged: ingestionSourceCloseAcknowledged,
+        } satisfies ProviderIngestionBarrier;
+        yield* PubSub.publish(ingestionPubSub, barrier);
+      }
+      yield* Deferred.await(ingestionSourceCloseAcknowledged);
+    });
 
   const recoverSessionForThread = Effect.fn("recoverSessionForThread")(function* (input: {
     readonly binding: ProviderSessionDirectory.ProviderRuntimeBinding;
@@ -398,8 +472,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
       yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
-      const resumed = yield* adapter
-        .startSession({
+      const resumed = yield* withStartToken(
+        bindingInstanceId,
+        input.binding.threadId,
+        adapter.startSession({
           threadId: input.binding.threadId,
           provider: input.binding.provider,
           providerInstanceId: bindingInstanceId,
@@ -407,8 +483,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
           ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
           runtimeMode: input.binding.runtimeMode ?? "full-access",
-        })
-        .pipe(Effect.onError(() => clearMcpSession(input.binding.threadId)));
+        }),
+      ).pipe(Effect.onError(() => clearMcpSession(input.binding.threadId)));
       if (resumed.provider !== adapter.provider) {
         yield* clearMcpSession(input.binding.threadId);
         return yield* toValidationError(
@@ -591,14 +667,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         });
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
-        const session = yield* adapter
-          .startSession({
+        const session = yield* withStartToken(
+          resolvedInstanceId,
+          threadId,
+          adapter.startSession({
             ...input,
             providerInstanceId: resolvedInstanceId,
             ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
             ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
-          })
-          .pipe(Effect.onError(() => clearMcpSession(threadId)));
+          }),
+        ).pipe(Effect.onError(() => clearMcpSession(threadId)));
 
         if (session.provider !== adapter.provider) {
           yield* clearMcpSession(threadId);
@@ -967,6 +1045,41 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const getInstanceInfo: ProviderServiceMethod<"getInstanceInfo"> = (instanceId) =>
     registry.getInstanceInfo(instanceId);
 
+  const inspectTarget: NonNullable<ProviderServiceMethod<"inspectTarget">> = Effect.fn(
+    "ProviderService.inspectTarget",
+  )(function* (input) {
+    const key = startTokenKey(input.providerInstanceId, input.threadId);
+    const tokens = yield* SynchronizedRef.get(startTokens);
+    if ((tokens.get(key)?.size ?? 0) > 0) {
+      return { state: "unknown", reason: "start-in-flight" } as const;
+    }
+    const adapter = yield* registry.getByInstance(input.providerInstanceId);
+    if (adapter.requestLivenessSample === undefined) {
+      return { state: "unknown", reason: "unavailable" } as const;
+    }
+    const markerNumber = yield* Ref.updateAndGet(nextMarker, (value) => value + 1);
+    const acknowledged =
+      yield* Deferred.make<import("../Services/ProviderAdapter.ts").ProviderLivenessSample>();
+    const markerId = `${input.providerInstanceId}:${input.threadId}:${markerNumber}`;
+    yield* adapter.requestLivenessSample(input.threadId, markerId, acknowledged);
+    const sample = yield* Deferred.await(acknowledged);
+    if (
+      sample.threadId !== input.threadId ||
+      (sample.state === "present" && sample.session.threadId !== input.threadId)
+    ) {
+      return { state: "unknown", reason: "unavailable" } as const;
+    }
+    const markerTokens = yield* SynchronizedRef.get(startTokens);
+    if ((markerTokens.get(key)?.size ?? 0) > 0) {
+      return { state: "unknown", reason: "start-in-flight" } as const;
+    }
+    const currentAdapter = yield* registry.getByInstance(input.providerInstanceId);
+    if (currentAdapter !== adapter) {
+      return { state: "unknown", reason: "unavailable" } as const;
+    }
+    return sample;
+  });
+
   const rollbackConversation: ProviderServiceMethod<"rollbackConversation"> = Effect.fn(
     "rollbackConversation",
   )(function* (rawInput) {
@@ -1078,6 +1191,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     listSessions,
     getCapabilities,
     getInstanceInfo,
+    inspectTarget,
     rollbackConversation,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each
@@ -1085,6 +1199,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     get streamEvents(): ProviderServiceMethod<"streamEvents"> {
       return Stream.fromPubSub(runtimeEventPubSub);
     },
+    get streamIngestion(): NonNullable<ProviderServiceMethod<"streamIngestion">> {
+      return Stream.fromPubSub(ingestionPubSub);
+    },
+    closeIngestionSource,
   } satisfies ProviderService.ProviderService["Service"];
 });
 

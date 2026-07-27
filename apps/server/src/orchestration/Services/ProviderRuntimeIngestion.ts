@@ -30,6 +30,9 @@ export interface ProviderRuntimeIngestionShape {
    * Intended for test use to replace timing-sensitive sleeps.
    */
   readonly drain: Effect.Effect<void>;
+
+  /** Stop admitting provider runtime items; queued items remain drainable. */
+  readonly closeProviderIngress?: Effect.Effect<void>;
 }
 
 /**

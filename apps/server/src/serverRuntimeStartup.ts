@@ -6,6 +6,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  OrchestrationNotReadyError,
 } from "@t3tools/contracts";
 import * as Console from "effect/Console";
 import * as Context from "effect/Context";
@@ -28,6 +29,10 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as OrchestrationReactor from "./orchestration/Services/OrchestrationReactor.ts";
+import * as OrchestrationDeliveryRuntime from "./orchestration/Services/OrchestrationDeliveryRuntime.ts";
+import * as OrphanTurnReconciler from "./orchestration/Services/OrphanTurnReconciler.ts";
+import * as ProviderRuntimeIngestion from "./orchestration/Services/ProviderRuntimeIngestion.ts";
+import * as ShutdownCoordinator from "./orchestration/Services/ShutdownCoordinator.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
@@ -59,26 +64,45 @@ export class ServerRuntimeStartup extends Context.Service<
   ServerRuntimeStartup,
   {
     readonly awaitCommandReady: Effect.Effect<void, ServerRuntimeStartupError>;
+    readonly ensureCommandReady: Effect.Effect<void, OrchestrationNotReadyError>;
     readonly markHttpListening: Effect.Effect<void>;
+    readonly closeCommandAdmission: Effect.Effect<void>;
     readonly enqueueCommand: <A, E>(
       effect: Effect.Effect<A, E>,
-    ) => Effect.Effect<A, E | ServerRuntimeStartupError>;
+      identity?: CommandRequestIdentity,
+    ) => Effect.Effect<A, E | ServerRuntimeStartupError | OrchestrationNotReadyError>;
   }
 >()("t3/serverRuntimeStartup") {}
 
 interface QueuedCommand {
+  readonly identity: CommandRequestIdentity;
+  readonly cancelled: Ref.Ref<boolean>;
   readonly run: Effect.Effect<void, never>;
 }
 
-type CommandReadinessState = "pending" | "ready" | ServerRuntimeStartupError;
+export interface CommandRequestIdentity {
+  readonly requestId: string;
+  readonly connectionId?: string;
+}
+
+type CommandReadinessState =
+  | "pending"
+  | "reconciling"
+  | "ready"
+  | ServerRuntimeStartupError
+  | OrchestrationNotReadyError;
 
 interface CommandGate {
   readonly awaitCommandReady: Effect.Effect<void, ServerRuntimeStartupError>;
+  readonly ensureCommandReady: Effect.Effect<void, OrchestrationNotReadyError>;
   readonly signalCommandReady: Effect.Effect<void>;
+  readonly markReconciling: Effect.Effect<void>;
   readonly failCommandReady: (error: ServerRuntimeStartupError) => Effect.Effect<void>;
+  readonly closeCommandAdmission: Effect.Effect<void>;
   readonly enqueueCommand: <A, E>(
     effect: Effect.Effect<A, E>,
-  ) => Effect.Effect<A, E | ServerRuntimeStartupError>;
+    identity?: CommandRequestIdentity,
+  ) => Effect.Effect<A, E | ServerRuntimeStartupError | OrchestrationNotReadyError>;
 }
 
 const settleQueuedCommand = <A, E>(deferred: Deferred.Deferred<A, E>, exit: Exit.Exit<A, E>) =>
@@ -88,44 +112,133 @@ const settleQueuedCommand = <A, E>(deferred: Deferred.Deferred<A, E>, exit: Exit
 
 export const makeCommandGate = Effect.gen(function* () {
   const commandReady = yield* Deferred.make<void, ServerRuntimeStartupError>();
-  const commandQueue = yield* Queue.unbounded<QueuedCommand>();
+  const admissionClosed = yield* Deferred.make<void>();
+  const commandQueue = yield* Queue.bounded<QueuedCommand>(100);
+  const queuedCount = yield* Ref.make(0);
   const commandReadinessState = yield* Ref.make<CommandReadinessState>("pending");
+  const isOrchestrationNotReadyError = Schema.is(OrchestrationNotReadyError);
 
   const commandWorker = Effect.forever(
-    Queue.take(commandQueue).pipe(Effect.flatMap((command) => command.run)),
+    Queue.take(commandQueue).pipe(
+      Effect.flatMap((command) =>
+        Ref.get(command.cancelled).pipe(
+          Effect.flatMap((cancelled) => (cancelled ? Effect.void : command.run)),
+        ),
+      ),
+    ),
   );
   yield* Effect.forkScoped(commandWorker);
 
   return {
     awaitCommandReady: Deferred.await(commandReady),
+    ensureCommandReady: Ref.get(commandReadinessState).pipe(
+      Effect.flatMap((state) => {
+        if (state === "ready") return Effect.void;
+        if (isOrchestrationNotReadyError(state)) return Effect.fail(state);
+        return Effect.fail(
+          new OrchestrationNotReadyError({
+            message: "Orchestration is not accepting commands yet.",
+            retryable: true,
+            retryAfterMs: 1_000,
+            phase: state === "reconciling" ? "reconciling" : "starting",
+          }),
+        );
+      }),
+    ),
     signalCommandReady: Effect.gen(function* () {
       yield* Ref.set(commandReadinessState, "ready");
       yield* Deferred.succeed(commandReady, undefined).pipe(Effect.orDie);
     }),
+    markReconciling: Ref.set(commandReadinessState, "reconciling"),
     failCommandReady: (error) =>
       Effect.gen(function* () {
         yield* Ref.set(commandReadinessState, error);
         yield* Deferred.fail(commandReady, error).pipe(Effect.orDie);
       }),
-    enqueueCommand: <A, E>(effect: Effect.Effect<A, E>) =>
+    closeCommandAdmission: Effect.gen(function* () {
+      yield* Ref.set(
+        commandReadinessState,
+        new OrchestrationNotReadyError({
+          message: "Orchestration is shutting down.",
+          retryable: true,
+          retryAfterMs: 1_000,
+          phase: "quiescing",
+        }),
+      );
+      yield* Deferred.succeed(admissionClosed, undefined);
+    }),
+    enqueueCommand: <A, E>(effect: Effect.Effect<A, E>, identity?: CommandRequestIdentity) =>
       Effect.gen(function* () {
         const readinessState = yield* Ref.get(commandReadinessState);
         if (readinessState === "ready") {
           return yield* effect;
         }
-        if (readinessState !== "pending") {
+        if (readinessState !== "pending" && readinessState !== "reconciling") {
           return yield* readinessState;
         }
 
-        const result = yield* Deferred.make<A, E | ServerRuntimeStartupError>();
+        const admitted = yield* Ref.modify(queuedCount, (count) =>
+          count >= 100 ? ([false, count] as const) : ([true, count + 1] as const),
+        );
+        if (!admitted) {
+          return yield* new OrchestrationNotReadyError({
+            message: "Orchestration startup queue is full.",
+            retryable: true,
+            retryAfterMs: 1_000,
+            phase: readinessState === "reconciling" ? "reconciling" : "starting",
+          });
+        }
+
+        const result = yield* Deferred.make<
+          A,
+          E | ServerRuntimeStartupError | OrchestrationNotReadyError
+        >();
+        const cancelled = yield* Ref.make(false);
         yield* Queue.offer(commandQueue, {
-          run: Deferred.await(commandReady).pipe(
-            Effect.flatMap(() => effect),
-            Effect.exit,
-            Effect.flatMap((exit) => settleQueuedCommand(result, exit)),
-          ),
+          identity: identity ?? { requestId: "anonymous" },
+          cancelled,
+          run: Effect.gen(function* () {
+            if (yield* Ref.get(cancelled)) return;
+            const exit = yield* Effect.exit(
+              Effect.gen(function* () {
+                yield* Effect.raceFirst(
+                  Deferred.await(commandReady),
+                  Deferred.await(admissionClosed).pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new OrchestrationNotReadyError({
+                          message: "Orchestration is shutting down.",
+                          retryable: true,
+                          retryAfterMs: 1_000,
+                          phase: "quiescing",
+                        }),
+                      ),
+                    ),
+                  ),
+                );
+                if (yield* Ref.get(cancelled)) return yield* Effect.interrupt;
+                return yield* effect;
+              }),
+            );
+            yield* settleQueuedCommand(result, exit);
+          }),
         });
-        return yield* Deferred.await(result);
+        const expired = Effect.sleep("30 seconds").pipe(
+          Effect.andThen(
+            Effect.fail(
+              new OrchestrationNotReadyError({
+                message: "Orchestration did not become ready before the request deadline.",
+                retryable: true,
+                retryAfterMs: 1_000,
+                phase: readinessState === "reconciling" ? "reconciling" : "starting",
+              }),
+            ),
+          ),
+        );
+        return yield* Effect.raceFirst(Deferred.await(result), expired).pipe(
+          Effect.ensuring(Ref.set(cancelled, true)),
+          Effect.ensuring(Ref.update(queuedCount, (count) => Math.max(0, count - 1))),
+        );
       }),
   } satisfies CommandGate;
 });
@@ -292,6 +405,11 @@ export const make = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const keybindings = yield* Keybindings.Keybindings;
   const orchestrationReactor = yield* OrchestrationReactor.OrchestrationReactor;
+  const deliveryRuntime = yield* OrchestrationDeliveryRuntime.OrchestrationDeliveryRuntime;
+  const orphanTurnReconciler = yield* OrphanTurnReconciler.OrphanTurnReconciler;
+  const providerRuntimeIngestion = yield* ProviderRuntimeIngestion.ProviderRuntimeIngestionService;
+  const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
+  const shutdownCoordinator = yield* ShutdownCoordinator.ShutdownCoordinator;
   const providerSessionReaper = yield* ProviderSessionReaper.ProviderSessionReaper;
   const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -302,7 +420,12 @@ export const make = Effect.gen(function* () {
   const httpListening = yield* Deferred.make<void>();
   const reactorScope = yield* Scope.make("sequential");
 
-  yield* Effect.addFinalizer(() => Scope.close(reactorScope, Exit.void));
+  yield* Effect.addFinalizer(() =>
+    shutdownCoordinator.shutdown({
+      reactorScope,
+      closeExternalAdmission: commandGate.closeCommandAdmission,
+    }),
+  );
 
   const startup = Effect.gen(function* () {
     yield* Effect.logDebug("startup phase: starting keybindings runtime");
@@ -337,12 +460,41 @@ export const make = Effect.gen(function* () {
       ),
     );
 
+    yield* Effect.logDebug("startup phase: reconciling prior-boot orchestration state");
+    yield* commandGate.markReconciling;
+    yield* runStartupPhase(
+      "orchestration.reconcile",
+      Effect.gen(function* () {
+        // This is the only provider path allowed before recovery settles. It
+        // projects markers/events but does not execute command side effects.
+        yield* providerRuntimeIngestion.start().pipe(Scope.provide(reactorScope));
+        const reconciliation = yield* orphanTurnReconciler.reconcileStartup;
+        if (reconciliation.status === "unresolved") {
+          const legacyDiagnostic =
+            reconciliation.legacyPending.count === 0
+              ? ""
+              : `; ${reconciliation.legacyPending.count} legacy pending start(s) lack exact delivery/event identity: ${reconciliation.legacyPending.issues
+                  .map(
+                    (issue) =>
+                      `row=${issue.rowId},thread=${issue.threadId},message=${issue.messageId},session=${issue.sessionStatus ?? "absent"}`,
+                  )
+                  .join(" | ")}${reconciliation.legacyPending.truncated ? " | …" : ""}`;
+          return yield* Effect.die(
+            `startup reconciliation left ${reconciliation.candidateCount} unresolved candidate(s)${legacyDiagnostic}`,
+          );
+        }
+        yield* deliveryRuntime.start().pipe(Scope.provide(reactorScope));
+        yield* deliveryRuntime.recoverStartup;
+      }),
+    );
+
     yield* Effect.logDebug("startup phase: starting orchestration reactors");
     yield* runStartupPhase(
       "reactors.start",
       Effect.gen(function* () {
         yield* orchestrationReactor.start().pipe(Scope.provide(reactorScope));
         yield* providerSessionReaper.start().pipe(Scope.provide(reactorScope));
+        yield* orphanTurnReconciler.startPeriodic().pipe(Scope.provide(reactorScope));
       }),
     );
 
@@ -404,6 +556,11 @@ export const make = Effect.gen(function* () {
         ),
       );
     }
+
+    // Linearizes reactor startup and all internal recovery work before hot
+    // external commands can enter the authoritative engine queue.
+    yield* orchestrationEngine.barrier;
+    yield* orchestrationEngine.openExternalAdmission;
   }).pipe(
     Effect.annotateSpans({
       "server.mode": serverConfig.mode,
@@ -470,7 +627,9 @@ export const make = Effect.gen(function* () {
 
   return {
     awaitCommandReady: commandGate.awaitCommandReady,
+    ensureCommandReady: commandGate.ensureCommandReady,
     markHttpListening: Deferred.succeed(httpListening, undefined),
+    closeCommandAdmission: commandGate.closeCommandAdmission,
     enqueueCommand: commandGate.enqueueCommand,
   } satisfies ServerRuntimeStartup["Service"];
 });

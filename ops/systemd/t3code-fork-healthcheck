@@ -11,7 +11,34 @@ verification_file="${state_dir}/fork-update-verification.json"
 healthy_since_file="${state_dir}/fork-update-healthy-since"
 status_file="${state_dir}/fork-update.json"
 lock_helper="${T3CODE_LOCK_HELPER:-/usr/local/sbin/t3code-fork-lock}"
-failure_file="${T3CODE_FAILURE_FILE:-/run/t3code-healthcheck.failures}"
+watchdog_runtime_dir="${T3CODE_WATCHDOG_RUNTIME_DIR:-/run/t3code-watchdog}"
+fork_checker_lock="${watchdog_runtime_dir}/fork-checker.lock"
+authority_lock="${watchdog_runtime_dir}/authority.lock"
+
+[ -d "$watchdog_runtime_dir" ] && [ ! -L "$watchdog_runtime_dir" ] || {
+  printf '%s\n' "Watchdog runtime directory is unsafe." >&2
+  exit 1
+}
+
+validate_watchdog_file() {
+  candidate="$1"
+  [ -f "$candidate" ] && [ ! -L "$candidate" ] || {
+    printf '%s\n' "Watchdog lock is missing or unsafe: $candidate" >&2
+    exit 1
+  }
+  [ "$(stat -c '%h' "$candidate")" -eq 1 ] || {
+    printf '%s\n' "Watchdog lock has unexpected hard links: $candidate" >&2
+    exit 1
+  }
+}
+
+validate_watchdog_file "$fork_checker_lock"
+validate_watchdog_file "$authority_lock"
+exec 8<>"$fork_checker_lock"
+flock -n 8 || exit 0
+# Global order: participant-local, shared authority, then fork-update guard.
+exec 9<>"$authority_lock"
+flock -x 9
 
 atomic_user_write() {
   target="$1"
@@ -50,7 +77,7 @@ write_status() {
 
 clear_update_guard() {
   "$lock_helper" release "$state_dir" "$lock_owner_pid" "$lock_owner_token"
-  rm -f "$verification_file" "$healthy_since_file" "$failure_file"
+  rm -f "$verification_file" "$healthy_since_file"
 }
 
 prune_releases() {
@@ -142,19 +169,6 @@ if [ -f "$verification_file" ]; then
   exit 1
 fi
 
-if curl --fail --silent --show-error --max-time 10 "$health_url" >/dev/null; then
-  rm -f "$failure_file"
-  exit 0
-fi
-
-failures=0
-if [ -f "$failure_file" ]; then
-  failures="$(cat "$failure_file" 2>/dev/null || printf '0')"
-fi
-failures=$((failures + 1))
-printf '%s\n' "$failures" >"$failure_file"
-if [ "$failures" -ge 3 ]; then
-  printf '0\n' >"$failure_file"
-  systemctl restart "$service_name"
-fi
-exit 1
+# General availability is intentionally owned by t3code-availability-healthcheck.
+# This checker only verifies or rolls back an in-progress fork deployment.
+exit 0

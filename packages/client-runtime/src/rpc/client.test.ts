@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  type OrchestrationReplayEventsInput,
   type RelayClientInstallProgressEvent,
   WS_METHODS,
 } from "@t3tools/contracts";
@@ -25,7 +26,15 @@ import {
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
-import { EnvironmentRpcRequestObserver, request, runStream, subscribe } from "./client.ts";
+import { makeReplayEventsTestRpcClient } from "../test/rpcClient.ts";
+import { makeTestServerConfig } from "../test/serverConfig.ts";
+import {
+  EnvironmentRpcRequestObserver,
+  replayOrchestrationEvents,
+  request,
+  runStream,
+  subscribe,
+} from "./client.ts";
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -77,6 +86,45 @@ const makeHarness = Effect.fn("TestEnvironmentRpc.makeHarness")(function* () {
 });
 
 describe("environment RPC", () => {
+  it.effect("independently negotiates recovery events for raw replay", () =>
+    Effect.gen(function* () {
+      const inputs: OrchestrationReplayEventsInput[] = [];
+      const client = makeReplayEventsTestRpcClient((input: OrchestrationReplayEventsInput) => {
+        inputs.push(input);
+        return Effect.succeed([]);
+      });
+      const { activeSession, supervisor } = yield* makeHarness();
+      yield* SubscriptionRef.set(
+        activeSession,
+        Option.some({
+          ...session(client),
+          initialConfig: Effect.succeed(
+            makeTestServerConfig(TARGET.environmentId, { threadRecoveryEventsV1: true }),
+          ),
+        }),
+      );
+
+      yield* replayOrchestrationEvents(9).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+      );
+      yield* SubscriptionRef.set(
+        activeSession,
+        Option.some({
+          ...session(client),
+          initialConfig: Effect.succeed(makeTestServerConfig(TARGET.environmentId)),
+        }),
+      );
+      yield* replayOrchestrationEvents(10).pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+      );
+
+      expect(inputs).toEqual([
+        { fromSequenceExclusive: 9, threadRecoveryEventsV1: true },
+        { fromSequenceExclusive: 10 },
+      ]);
+    }),
+  );
+
   it.effect("observes unary requests until they complete", () =>
     Effect.gen(function* () {
       const observations: string[] = [];

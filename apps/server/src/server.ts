@@ -49,6 +49,9 @@ import { ProviderRuntimeIngestionLive } from "./orchestration/Layers/ProviderRun
 import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderCommandReactor.ts";
 import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.ts";
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
+import { OrchestrationDeliveryRuntimeLive } from "./orchestration/Layers/OrchestrationDeliveryRuntime.ts";
+import { OrphanTurnReconcilerLive } from "./orchestration/Layers/OrphanTurnReconciler.ts";
+import { composeReactorLayer } from "./orchestration/reactorLayer.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
@@ -84,6 +87,8 @@ import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ForkUpdate from "./cloud/forkUpdate.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
+import * as OutputPressureMonitor from "./diagnostics/OutputPressureMonitor.ts";
+import * as ActiveTurnCountPublisher from "./diagnostics/ActiveTurnCountPublisher.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import {
@@ -159,14 +164,19 @@ const PlatformServicesLive = Layer.unwrap(
   }),
 );
 
-const ReactorLayerLive = Layer.empty.pipe(
-  Layer.provideMerge(OrchestrationReactorLive),
-  Layer.provideMerge(ProviderRuntimeIngestionLive),
-  Layer.provideMerge(ProviderCommandReactorLive),
-  Layer.provideMerge(CheckpointReactorLive),
-  Layer.provideMerge(ThreadDeletionReactorLive),
-  Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
-  Layer.provideMerge(RuntimeReceiptBusLive),
+const ReactorLeafServicesLayerLive = Layer.mergeAll(
+  ProviderRuntimeIngestionLive,
+  ProviderCommandReactorLive,
+  CheckpointReactorLive.pipe(Layer.provideMerge(RuntimeReceiptBusLive)),
+  ThreadDeletionReactorLive,
+  OrphanTurnReconcilerLive,
+  AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer)),
+);
+
+const ReactorLayerLive = composeReactorLayer(
+  ReactorLeafServicesLayerLive,
+  OrchestrationReactorLive,
+  OrchestrationDeliveryRuntimeLive,
 );
 
 const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
@@ -339,6 +349,8 @@ const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
   // Misc.
   Layer.provideMerge(ProcessDiagnostics.layer),
   Layer.provideMerge(ProcessResourceMonitor.layer),
+  Layer.provideMerge(OutputPressureMonitor.layer),
+  Layer.provideMerge(ActiveTurnCountPublisher.layer),
   Layer.provideMerge(TraceDiagnostics.layer),
   Layer.provideMerge(AnalyticsService.layer),
   Layer.provideMerge(ExternalLauncher.layer),

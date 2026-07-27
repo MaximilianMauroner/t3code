@@ -124,6 +124,31 @@ export const request = Effect.fn("EnvironmentRpc.request")(function* <
   return yield* method(input).pipe(Effect.ensuring(completeObservation));
 });
 
+/** Replays raw orchestration events with an opt-in independent from thread subscriptions. */
+export const replayOrchestrationEvents = Effect.fn("EnvironmentRpc.replayOrchestrationEvents")(
+  function* (fromSequenceExclusive: number) {
+    const supervisor = yield* EnvironmentSupervisor;
+    yield* Effect.annotateCurrentSpan({
+      "environment.id": supervisor.target.environmentId,
+      "rpc.method": ORCHESTRATION_WS_METHODS.replayEvents,
+    });
+    const session = yield* currentSession();
+    const supportsRecoveryEvents = yield* session.initialConfig.pipe(
+      Effect.map((config) => config.threadRecoveryEventsV1 === true),
+      Effect.orElseSucceed(() => false),
+    );
+    const observer = yield* EnvironmentRpcRequestObserver;
+    const completeObservation = yield* observer.observe({
+      environmentId: supervisor.target.environmentId,
+      method: ORCHESTRATION_WS_METHODS.replayEvents,
+    });
+    return yield* session.client[ORCHESTRATION_WS_METHODS.replayEvents]({
+      fromSequenceExclusive,
+      ...(supportsRecoveryEvents ? { threadRecoveryEventsV1: true as const } : {}),
+    }).pipe(Effect.ensuring(completeObservation));
+  },
+);
+
 export function runStream<TTag extends EnvironmentStreamCommandRpcTag>(
   tag: TTag,
   input: EnvironmentRpcInput<TTag>,

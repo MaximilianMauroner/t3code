@@ -7,6 +7,7 @@ import { ThreadId } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Logger from "effect/Logger";
+import * as Metric from "effect/Metric";
 import * as Schema from "effect/Schema";
 
 import { makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
@@ -126,7 +127,7 @@ describe("EventNdjsonLogger", () => {
           }
 
           yield* logger.write({ id: "evt-no-thread" }, null);
-          yield* logger.write({ id: "evt-invalid-thread" }, "!!!" as unknown as ThreadId);
+          yield* logger.write({ id: "evt-invalid-thread" }, ThreadId.make("!!!"));
           yield* logger.close();
 
           const globalPath = NodePath.join(tempDir, "_global.log");
@@ -184,6 +185,63 @@ describe("EventNdjsonLogger", () => {
           '{"id":"evt-concurrent-1"}',
           '{"id":"evt-concurrent-2"}',
         ]);
+      } finally {
+        NodeFS.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }),
+  );
+
+  it.effect("records canonical logger cost and bounded provider output volume", () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-provider-log-"));
+      const basePath = NodePath.join(tempDir, "provider-canonical.ndjson");
+
+      try {
+        const logger = yield* makeEventNdjsonLogger(basePath, {
+          stream: "canonical",
+          batchWindowMs: 0,
+        });
+        assert.exists(logger);
+        if (!logger) return;
+
+        yield* logger.write(
+          { type: "turn.output", turnId: "turn-metrics", delta: "hello" },
+          ThreadId.make("thread-metrics"),
+        );
+        yield* logger.close();
+
+        const snapshots = yield* Metric.snapshot;
+        const has = (id: string, attributes: Readonly<Record<string, string>>) =>
+          snapshots.some(
+            (snapshot) =>
+              snapshot.id === id &&
+              Object.entries(attributes).every(
+                ([key, value]) => snapshot.attributes?.[key] === value,
+              ),
+          );
+        assert.equal(
+          has("t3_provider_output_events_total", {
+            stream: "canonical",
+          }),
+          true,
+        );
+        assert.equal(
+          has("t3_provider_output_bytes_total", {
+            stream: "canonical",
+          }),
+          true,
+        );
+        const outputSamples = snapshots.filter(
+          (snapshot) =>
+            snapshot.id === "t3_provider_output_events_total" ||
+            snapshot.id === "t3_provider_output_bytes_total",
+        );
+        assert.equal(
+          outputSamples.every((snapshot) => snapshot.attributes?.turnId === undefined),
+          true,
+        );
+        assert.equal(has("t3_canonical_logger_duration", { stream: "canonical" }), true);
+        assert.equal(has("t3_canonical_logger_bytes_total", { stream: "canonical" }), true);
       } finally {
         NodeFS.rmSync(tempDir, { recursive: true, force: true });
       }

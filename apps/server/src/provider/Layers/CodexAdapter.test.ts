@@ -23,6 +23,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, vi } from "@effect/vitest";
 
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -38,6 +39,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
+import type { ProviderLivenessSample } from "../Services/ProviderAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
   type CodexSessionRuntimeOptions,
@@ -512,6 +514,79 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("holds a liveness marker behind a paused lifecycle enqueue", () =>
+    Effect.gen(function* () {
+      const mutationObserved = yield* Deferred.make<void>();
+      const allowEnqueue = yield* Deferred.make<void>();
+      const runtimeFactory = makeRuntimeFactory();
+      const raceLayer = Layer.effect(
+        CodexAdapter,
+        Effect.gen(function* () {
+          const codexConfig = decodeCodexSettings({});
+          return yield* makeCodexAdapter(codexConfig, {
+            makeRuntime: runtimeFactory.factory,
+            beforeRuntimeEventEnqueue: (event) =>
+              event.type === "item.completed"
+                ? Deferred.succeed(mutationObserved, undefined).pipe(
+                    Effect.andThen(Deferred.await(allowEnqueue)),
+                  )
+                : Effect.void,
+          });
+        }),
+      ).pipe(
+        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+        Layer.provideMerge(ServerSettingsService.layerTest()),
+        Layer.provideMerge(providerSessionDirectoryTestLayer),
+        Layer.provideMerge(NodeServices.layer),
+      );
+
+      yield* Effect.gen(function* () {
+        const adapter = yield* CodexAdapter;
+        const threadId = asThreadId("codex-marker-race");
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const runtime = runtimeFactory.lastRuntime;
+        NodeAssert.ok(runtime);
+        yield* runtime.emit({
+          id: asEventId("evt-marker-race"),
+          kind: "notification",
+          provider: ProviderDriverKind.make("codex"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          method: "item/completed",
+          threadId,
+          turnId: asTurnId("turn-marker-race"),
+          itemId: asItemId("item-marker-race"),
+          payload: {
+            completedAtMs: 1_778_000_000_000,
+            threadId,
+            turnId: "turn-marker-race",
+            item: {
+              type: "agentMessage",
+              id: "item-marker-race",
+              text: "done",
+            },
+          },
+        });
+        yield* Deferred.await(mutationObserved);
+
+        const acknowledged = yield* Deferred.make<ProviderLivenessSample>();
+        NodeAssert.ok(adapter.requestLivenessSample);
+        const markerFiber = yield* adapter
+          .requestLivenessSample(threadId, "codex-race-marker", acknowledged)
+          .pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        NodeAssert.equal(markerFiber.pollUnsafe(), undefined);
+
+        yield* Deferred.succeed(allowEnqueue, undefined);
+        yield* Fiber.join(markerFiber);
+        yield* adapter.stopAll();
+      }).pipe(Effect.provide(raceLayer));
+    }),
+  );
+
   it.effect("maps completed agent message items to canonical item.completed events", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();

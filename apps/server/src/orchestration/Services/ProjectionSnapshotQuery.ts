@@ -18,6 +18,7 @@ import type {
   OrchestrationThreadShell,
   ProjectId,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Option from "effect/Option";
@@ -28,6 +29,10 @@ import type { ProjectionRepositoryError } from "../../persistence/Errors.ts";
 export interface ProjectionSnapshotCounts {
   readonly projectCount: number;
   readonly threadCount: number;
+}
+
+export interface ProjectionActiveTurnCount {
+  readonly activeTurnCount: number;
 }
 
 export interface ProjectionSnapshotSequence {
@@ -49,6 +54,26 @@ export interface ProjectionFullThreadDiffContext {
   readonly worktreePath: string | null;
   readonly latestCheckpointTurnCount: number;
   readonly toCheckpointRef: CheckpointRef | null;
+}
+
+export interface ProjectionTurnRecoveryEvidence {
+  readonly observedAt: ReadonlyArray<string>;
+}
+
+export interface LegacyPendingTurnReadinessIssue {
+  readonly rowId: number;
+  readonly threadId: ThreadId;
+  readonly messageId: string;
+  readonly requestedAt: string;
+  readonly pendingDeliveryId: string | null;
+  readonly pendingEventId: string | null;
+  readonly sessionStatus: string | null;
+}
+
+export interface LegacyPendingTurnReadiness {
+  readonly count: number;
+  readonly issues: ReadonlyArray<LegacyPendingTurnReadinessIssue>;
+  readonly truncated: boolean;
 }
 
 /**
@@ -107,6 +132,15 @@ export interface ProjectionSnapshotQueryShape {
    * Read aggregate projection counts without hydrating the full read model.
    */
   readonly getCounts: () => Effect.Effect<ProjectionSnapshotCounts, ProjectionRepositoryError>;
+
+  /**
+   * Read the authoritative count of projected sessions with an active turn,
+   * including hidden and deleted threads.
+   */
+  readonly getActiveTurnCount?: () => Effect.Effect<
+    ProjectionActiveTurnCount,
+    ProjectionRepositoryError
+  >;
 
   /**
    * Read the active project for an exact workspace root match.
@@ -168,6 +202,21 @@ export interface ProjectionSnapshotQueryShape {
   readonly getThreadDetailSnapshot: (
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>, ProjectionRepositoryError>;
+
+  /** Persisted activity timestamps for one recovery target, including hidden threads. */
+  readonly getTurnRecoveryEvidence?: (
+    threadId: ThreadId,
+    turnId: TurnId,
+  ) => Effect.Effect<ProjectionTurnRecoveryEvidence, ProjectionRepositoryError>;
+
+  /**
+   * Lists a bounded diagnostic sample of legacy pending-start placeholders
+   * that migration 039 could not attach to an exact source event/delivery.
+   */
+  readonly getLegacyPendingTurnReadiness?: () => Effect.Effect<
+    LegacyPendingTurnReadiness,
+    ProjectionRepositoryError
+  >;
 }
 
 /**

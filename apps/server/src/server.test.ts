@@ -21,6 +21,7 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   ORCHESTRATION_WS_METHODS,
+  OrchestrationNotReadyError,
   type PreviewEvent,
   ProjectId,
   ProviderDriverKind,
@@ -685,6 +686,18 @@ const buildAppUnderTest = (options?: {
         Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
           readEvents: () => Stream.empty,
           dispatch: () => Effect.succeed({ sequence: 0 }),
+          dispatchExternal: (command) =>
+            options?.layers?.orchestrationEngine?.dispatchExternal?.(command) ??
+            options?.layers?.orchestrationEngine?.dispatch?.(command) ??
+            Effect.succeed({ sequence: 0 }),
+          reserveExternalHotAdmission: () =>
+            Effect.succeed({
+              dispatch: (command) =>
+                options?.layers?.orchestrationEngine?.dispatchExternal?.(command) ??
+                options?.layers?.orchestrationEngine?.dispatch?.(command) ??
+                Effect.succeed({ sequence: 0 }),
+              cancel: Effect.void,
+            }),
           streamDomainEvents: Stream.empty,
           latestSequence: Effect.succeed(0),
           ...options?.layers?.orchestrationEngine,
@@ -6322,7 +6335,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("stops the provider session and closes thread terminals after archive", () =>
+  it.effect("uses one transport dispatch for archive and leaves cleanup to durable delivery", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-archive");
       const effects: string[] = [];
@@ -6380,20 +6393,15 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
-      const sessionStopCommand = dispatchedCommands[1];
-      assert.equal(sessionStopCommand?.type, "thread.session.stop");
-      if (sessionStopCommand?.type === "thread.session.stop") {
-        assert.equal(sessionStopCommand.threadId, threadId);
-      }
+      assert.deepEqual(effects, ["dispatch:thread.archive"]);
+      assert.deepEqual(
+        dispatchedCommands.map((command) => command.type),
+        ["thread.archive"],
+      );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("checks session status before archiving removes the thread from active lookups", () =>
+  it.effect("does not perform a transport-side archive precheck", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-archive-precheck");
       const effects: string[] = [];
@@ -6458,15 +6466,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "query:thread-shell:active",
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
+      assert.deepEqual(effects, ["dispatch:thread.archive"]);
       assert.deepEqual(
         dispatchedCommands.map((command) => command.type),
-        ["thread.archive", "thread.session.stop"],
+        ["thread.archive"],
       );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
@@ -6514,7 +6517,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, ["dispatch:thread.archive", `terminal.close:${threadId}`]);
+      assert.deepEqual(effects, ["dispatch:thread.archive"]);
       assert.deepEqual(
         dispatchedCommands.map((command) => command.type),
         ["thread.archive"],
@@ -6582,7 +6585,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         );
 
         assert.equal(dispatchResult.sequence, 1);
-        assert.deepEqual(effects, ["dispatch:thread.archive", `terminal.close:${threadId}`]);
+        assert.deepEqual(effects, ["dispatch:thread.archive"]);
         assert.deepEqual(
           dispatchedCommands.map((command) => command.type),
           ["thread.archive"],
@@ -6590,7 +6593,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("archives and still closes terminals when session stop fails", () =>
+  it.effect("archive commit is independent of obsolete transport cleanup failures", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-archive-stop-failure");
       const effects: string[] = [];
@@ -6655,19 +6658,15 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
+      assert.deepEqual(effects, ["dispatch:thread.archive"]);
       assert.deepEqual(
         dispatchedCommands.map((command) => command.type),
-        ["thread.archive", "thread.session.stop"],
+        ["thread.archive"],
       );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("archives and still closes terminals when session stop defects", () =>
+  it.effect("archive transport does not run a second defect-prone dispatch", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-archive-stop-defect");
       const effects: string[] = [];
@@ -6727,15 +6726,80 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       assert.equal(dispatchResult.sequence, 1);
-      assert.deepEqual(effects, [
-        "dispatch:thread.archive",
-        "dispatch:thread.session.stop",
-        `terminal.close:${threadId}`,
-      ]);
+      assert.deepEqual(effects, ["dispatch:thread.archive"]);
       assert.deepEqual(
         dispatchedCommands.map((command) => command.type),
-        ["thread.archive", "thread.session.stop"],
+        ["thread.archive"],
       );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects bootstrap before worktree side effects when maintenance owns admission", () =>
+    Effect.gen(function* () {
+      const createWorktree = vi.fn(() => Effect.die("worktree side effect must not run"));
+      yield* buildAppUnderTest({
+        layers: {
+          gitVcsDriver: { createWorktree },
+          orchestrationEngine: {
+            reserveExternalHotAdmission: () =>
+              Effect.fail(
+                new OrchestrationNotReadyError({
+                  message: "Server update is in progress.",
+                  retryable: true,
+                  retryAfterMs: 1_000,
+                  phase: "quiescing",
+                }),
+              ),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const error = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+              type: "thread.turn.start",
+              commandId: CommandId.make("cmd-bootstrap-maintenance-rejected"),
+              threadId: ThreadId.make("thread-bootstrap-maintenance-rejected"),
+              message: {
+                messageId: MessageId.make("msg-bootstrap-maintenance-rejected"),
+                role: "user",
+                text: "hello",
+                attachments: [],
+              },
+              modelSelection: defaultModelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              bootstrap: {
+                createThread: {
+                  projectId: defaultProjectId,
+                  title: "Rejected bootstrap",
+                  modelSelection: defaultModelSelection,
+                  runtimeMode: "full-access",
+                  interactionMode: "default",
+                  branch: "main",
+                  worktreePath: null,
+                  createdAt,
+                },
+                prepareWorktree: {
+                  projectCwd: "/tmp/project",
+                  baseBranch: "main",
+                  branch: "t3code/rejected-bootstrap",
+                  startFromOrigin: false,
+                },
+                runSetupScript: true,
+              },
+              createdAt,
+            }),
+          ),
+        ),
+      );
+
+      assert.equal(error._tag, "OrchestrationDispatchCommandError");
+      assert.equal(createWorktree.mock.calls.length, 0);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -6806,6 +6870,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               cwd: "/tmp/bootstrap-worktree",
             }),
         );
+        const dispatchCommand = (command: OrchestrationCommand) =>
+          Effect.sync(() => {
+            dispatchedCommands.push(command);
+            return { sequence: dispatchedCommands.length };
+          });
 
         yield* buildAppUnderTest({
           layers: {
@@ -6818,10 +6887,16 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               refreshStatus,
             },
             orchestrationEngine: {
-              dispatch: (command) =>
+              dispatch: dispatchCommand,
+              reserveExternalHotAdmission: () =>
                 Effect.sync(() => {
-                  dispatchedCommands.push(command);
-                  return { sequence: dispatchedCommands.length };
+                  bootstrapGitOperations.push("reserve-admission");
+                  return {
+                    dispatch: dispatchCommand,
+                    cancel: Effect.sync(() => {
+                      bootstrapGitOperations.push("release-admission");
+                    }),
+                  };
                 }),
               readEvents: () => Stream.empty,
             },
@@ -6900,9 +6975,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           fallbackRemoteName: "origin",
         });
         assert.deepEqual(bootstrapGitOperations, [
+          "reserve-admission",
           "fetch",
           "resolve-remote-commit",
           "create-worktree",
+          "release-admission",
         ]);
         assert.deepEqual(runForThread.mock.calls[0]?.[0], {
           threadId: ThreadId.make("thread-bootstrap"),

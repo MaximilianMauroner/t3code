@@ -9,6 +9,7 @@ import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -28,6 +29,7 @@ import {
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { CursorAdapterShape } from "../Services/CursorAdapter.ts";
+import type { ProviderLivenessSample } from "../Services/ProviderAdapter.ts";
 import { makeCursorAdapter } from "./CursorAdapter.ts";
 const decodeCursorSettings = Schema.decodeSync(CursorSettings);
 
@@ -168,6 +170,49 @@ const cursorAdapterTestLayer = it.layer(
 );
 
 cursorAdapterTestLayer("CursorAdapterLive", (it) => {
+  it.effect("holds a liveness marker behind a paused lifecycle enqueue", () =>
+    Effect.gen(function* () {
+      const settings = yield* ServerSettingsService;
+      const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+      const resolveSettings = yield* makeResolveCursorSettings;
+      const mutationObserved = yield* Deferred.make<void>();
+      const allowEnqueue = yield* Deferred.make<void>();
+      const adapter = yield* makeCursorAdapter(decodeCursorSettings({}), {
+        resolveSettings,
+        beforeRuntimeEventEnqueue: (event) =>
+          event.type === "session.started"
+            ? Deferred.succeed(mutationObserved, undefined).pipe(
+                Effect.andThen(Deferred.await(allowEnqueue)),
+              )
+            : Effect.void,
+      });
+      const threadId = ThreadId.make("cursor-marker-race");
+      const startFiber = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("cursor"),
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(mutationObserved);
+
+      const acknowledged = yield* Deferred.make<ProviderLivenessSample>();
+      assert.exists(adapter.requestLivenessSample);
+      const markerFiber = yield* adapter
+        .requestLivenessSample(threadId, "cursor-race-marker", acknowledged)
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.equal(markerFiber.pollUnsafe(), undefined);
+
+      yield* Deferred.succeed(allowEnqueue, undefined);
+      yield* Fiber.join(startFiber);
+      yield* Fiber.join(markerFiber);
+      yield* adapter.stopAll();
+    }),
+  );
+
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;
@@ -380,28 +425,32 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
         );
         yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
 
-        const [firstSession, secondSession] = yield* Effect.all(
+        const results = yield* Effect.all(
           [
-            adapter.startSession({
-              threadId,
-              provider: ProviderDriverKind.make("cursor"),
-              cwd: process.cwd(),
-              runtimeMode: "full-access",
-              modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
-            }),
-            adapter.startSession({
-              threadId,
-              provider: ProviderDriverKind.make("cursor"),
-              cwd: process.cwd(),
-              runtimeMode: "full-access",
-              modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
-            }),
+            Effect.exit(
+              adapter.startSession({
+                threadId,
+                provider: ProviderDriverKind.make("cursor"),
+                cwd: process.cwd(),
+                runtimeMode: "full-access",
+                modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+              }),
+            ),
+            Effect.exit(
+              adapter.startSession({
+                threadId,
+                provider: ProviderDriverKind.make("cursor"),
+                cwd: process.cwd(),
+                runtimeMode: "full-access",
+                modelSelection: { instanceId: ProviderInstanceId.make("cursor"), model: "default" },
+              }),
+            ),
           ],
           { concurrency: "unbounded" },
         );
 
-        assert.equal(firstSession.threadId, threadId);
-        assert.equal(secondSession.threadId, threadId);
+        assert.equal(results.filter(Exit.isSuccess).length, 1);
+        assert.equal(results.filter(Exit.isFailure).length, 1);
 
         yield* adapter.stopSession(threadId);
 

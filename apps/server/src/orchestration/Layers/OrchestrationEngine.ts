@@ -1,10 +1,15 @@
 import type {
+  DispatchableClientOrchestrationCommand,
   OrchestrationEvent,
   OrchestrationReadModel,
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
-import { OrchestrationCommand } from "@t3tools/contracts";
+import {
+  OrchestrationCommand,
+  OrchestrationEvent as OrchestrationEventSchema,
+  OrchestrationNotReadyError,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
@@ -12,13 +17,17 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Fiber from "effect/Fiber";
+import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -31,6 +40,10 @@ import {
 import { toPersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
+import { OrchestrationReactorDeliveries } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import { OrchestrationReactorDeliveriesLive } from "../../persistence/Layers/OrchestrationReactorDeliveries.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import {
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
@@ -43,20 +56,42 @@ import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
   OrchestrationEngineService,
+  type OrchestrationHotAdmissionReservation,
   type OrchestrationEngineShape,
 } from "../Services/OrchestrationEngine.ts";
-import { UpdateMaintenanceGate, type UpdateDispatchAcceptance } from "../UpdateMaintenanceGate.ts";
+import {
+  UpdateMaintenanceGate,
+  type UpdateDispatchAcceptance,
+  type UpdateDispatchReservation,
+} from "../UpdateMaintenanceGate.ts";
+import { planReactorDelivery } from "../reactorDeliveries.ts";
+import { classifyExternalCommand } from "../externalCommandClassification.ts";
+import { ServerBootIdentity } from "../../serverBootId.ts";
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
+const isOrchestrationEvent = Schema.is(OrchestrationEventSchema);
 
 interface CommandEnvelope {
+  readonly _tag: "command";
   command: OrchestrationCommand;
   maintenanceAcceptance: UpdateDispatchAcceptance;
+  maintenanceReservation: UpdateDispatchReservation | null;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   startedAtMs: number;
 }
+
+interface BarrierEnvelope {
+  readonly _tag: "barrier";
+  readonly result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
+}
+interface StopEnvelope {
+  readonly _tag: "stop";
+  readonly completed: Deferred.Deferred<void>;
+}
+
+type EngineEnvelope = CommandEnvelope | BarrierEnvelope | StopEnvelope;
 
 function commandToAggregateRef(command: OrchestrationCommand): {
   readonly aggregateKind: "project" | "thread";
@@ -86,12 +121,39 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const crypto = yield* Crypto.Crypto;
   const maintenanceGate = yield* UpdateMaintenanceGate;
+  const reactorDeliveries = yield* OrchestrationReactorDeliveries;
+  const projectionTurns = yield* ProjectionTurnRepository;
+  const serverBootId = (yield* ServerBootIdentity).id;
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
 
-  const commandQueue = yield* Queue.unbounded<CommandEnvelope>();
+  const commandQueue = yield* Queue.unbounded<EngineEnvelope>();
   const eventPubSub = yield* PubSub.unbounded<OrchestrationEvent>();
+  const admissionLock = yield* Semaphore.make(1);
+  let sealed = false;
+  let externalAdmissionClosed = true;
+  const externalHotAdmissionBlockers = new Set<string>();
+  let nextReservationId = 0;
+  const activeReservationIds = new Set<number>();
+  let reservationsDrained = yield* Deferred.make<void>();
+  yield* Deferred.succeed(reservationsDrained, undefined);
+  const activeBootstrapMaintenanceReservations = new Set<UpdateDispatchReservation>();
+  const pendingCommands = new Set<CommandEnvelope>();
+  const pendingBarriers = new Set<BarrierEnvelope>();
+  const pendingStops = new Set<StopEnvelope>();
+
+  const withMaintenanceAdmission = <A, E, R>(
+    envelope: CommandEnvelope,
+    effect: Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, E | OrchestrationCommandInvariantError, R> =>
+    envelope.maintenanceReservation === null
+      ? maintenanceGate.withDispatchAllowed(
+          envelope.command,
+          envelope.maintenanceAcceptance,
+          effect,
+        )
+      : envelope.maintenanceReservation.withDispatchAllowed(envelope.command, effect);
 
   const projectEventsOntoReadModel = (
     baseReadModel: OrchestrationReadModel,
@@ -124,7 +186,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       commandReadModel = yield* projectEventsOntoReadModel(commandReadModel, persistedEvents);
 
       for (const persistedEvent of persistedEvents) {
-        yield* PubSub.publish(eventPubSub, persistedEvent);
+        if (!sealed) yield* PubSub.publish(eventPubSub, persistedEvent);
       }
     });
 
@@ -153,36 +215,103 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
-        const committedCommand = yield* maintenanceGate.withDispatchAllowed(
-          envelope.command,
-          envelope.maintenanceAcceptance,
+        const committedCommand = yield* withMaintenanceAdmission(
+          envelope,
           Effect.gen(function* () {
-            const eventBase = yield* decideOrchestrationCommand({
-              command: envelope.command,
-              readModel: commandReadModel,
-            }).pipe(
-              Effect.provideService(Crypto.Crypto, crypto),
-              Effect.mapError((cause) =>
-                isOrchestrationCommandInvariantError(cause)
-                  ? cause
-                  : new OrchestrationCommandInvariantError({
-                      commandType: envelope.command.type,
-                      detail: "Failed to generate an event identifier.",
-                      cause,
-                    }),
-              ),
-            );
-            const eventBases = Array.isArray(eventBase) ? eventBase : [eventBase];
             const committed = yield* sql
               .withTransaction(
                 Effect.gen(function* () {
+                  const pendingTurnStart =
+                    envelope.command.type === "thread.session.interrupt-if-active" &&
+                    envelope.command.target.kind === "pendingStart"
+                      ? yield* projectionTurns
+                          .getPendingTurnStartByThreadId({
+                            threadId: envelope.command.threadId,
+                          })
+                          .pipe(
+                            Effect.map(
+                              Option.match({
+                                onNone: () => null,
+                                onSome: (pending) => {
+                                  const deliveryId = pending.pendingDeliveryId;
+                                  const sourceEventId = pending.pendingEventId;
+                                  return {
+                                    messageId: pending.messageId,
+                                    ...(deliveryId !== undefined && deliveryId !== null
+                                      ? { deliveryId }
+                                      : {}),
+                                    ...(sourceEventId !== undefined && sourceEventId !== null
+                                      ? { sourceEventId }
+                                      : {}),
+                                  };
+                                },
+                              }),
+                            ),
+                          )
+                      : undefined;
+                  const eventBase = yield* decideOrchestrationCommand({
+                    command: envelope.command,
+                    readModel: commandReadModel,
+                    ...(pendingTurnStart !== undefined ? { pendingTurnStart } : {}),
+                  }).pipe(
+                    Effect.provideService(Crypto.Crypto, crypto),
+                    Effect.mapError((cause) =>
+                      isOrchestrationCommandInvariantError(cause)
+                        ? cause
+                        : new OrchestrationCommandInvariantError({
+                            commandType: envelope.command.type,
+                            detail: "Failed to generate an event identifier.",
+                            cause,
+                          }),
+                    ),
+                  );
+                  const eventBases = Array.isArray(eventBase) ? eventBase : [eventBase];
                   const committedEvents: OrchestrationEvent[] = [];
                   let nextCommandReadModel = commandReadModel;
 
                   for (const nextEvent of eventBases) {
+                    if (
+                      envelope.command.type === "thread.session.interrupt-if-active" &&
+                      envelope.command.target.kind === "pendingStart"
+                    ) {
+                      const delivery = yield* reactorDeliveries.getById(
+                        envelope.command.target.deliveryId,
+                      );
+                      const deliveryEvent = Option.isSome(delivery)
+                        ? delivery.value.payload
+                        : undefined;
+                      if (
+                        Option.isNone(delivery) ||
+                        delivery.value.deliveryKind !== "turn-start" ||
+                        delivery.value.reactor !== "provider-command" ||
+                        delivery.value.sourceEventId !== envelope.command.target.sourceEventId ||
+                        delivery.value.threadId !== envelope.command.threadId ||
+                        !isOrchestrationEvent(deliveryEvent) ||
+                        deliveryEvent.type !== "thread.turn-start-requested" ||
+                        deliveryEvent.eventId !== envelope.command.target.sourceEventId ||
+                        deliveryEvent.payload.threadId !== envelope.command.threadId ||
+                        deliveryEvent.payload.messageId !==
+                          envelope.command.target.pendingMessageId ||
+                        (envelope.command.target.expectedDeliveryOwnership.status === "pending"
+                          ? delivery.value.status !== "pending"
+                          : delivery.value.status !== "delivering" ||
+                            delivery.value.claimToken !==
+                              envelope.command.target.expectedDeliveryOwnership.claimToken)
+                      ) {
+                        return yield* new OrchestrationCommandInvariantError({
+                          commandType: envelope.command.type,
+                          detail:
+                            "Recovery start delivery no longer matches pending durable state.",
+                        });
+                      }
+                    }
                     const savedEvent = yield* eventStore.append(nextEvent);
                     nextCommandReadModel = yield* projectEvent(nextCommandReadModel, savedEvent);
                     yield* projectionPipeline.projectEvent(savedEvent);
+                    const plannedDelivery = planReactorDelivery(savedEvent, serverBootId);
+                    if (plannedDelivery !== null) {
+                      yield* reactorDeliveries.insert(plannedDelivery);
+                    }
                     committedEvents.push(savedEvent);
                   }
 
@@ -226,7 +355,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         );
 
         for (const [index, event] of committedCommand.committedEvents.entries()) {
-          yield* PubSub.publish(eventPubSub, event);
+          if (!sealed) yield* PubSub.publish(eventPubSub, event);
           if (index === 0) {
             yield* Metric.update(
               Metric.withAttributes(
@@ -288,7 +417,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               ),
             );
 
-            if (isOrchestrationCommandInvariantError(error)) {
+            if (
+              isOrchestrationCommandInvariantError(error) &&
+              envelope.command.type !== "thread.session.interrupt-if-active"
+            ) {
               yield* commandReceiptRepository
                 .upsert({
                   commandId: envelope.command.commandId,
@@ -306,14 +438,44 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           yield* Deferred.fail(envelope.result, error);
         }),
       ),
+      Effect.ensuring(
+        Effect.sync(() => {
+          pendingCommands.delete(envelope);
+        }),
+      ),
     );
   };
 
   yield* projectionPipeline.bootstrap;
   commandReadModel = yield* projectionSnapshotQuery.getCommandReadModel();
 
-  const worker = Effect.forever(Queue.take(commandQueue).pipe(Effect.flatMap(processEnvelope)));
-  yield* Effect.forkScoped(worker);
+  const worker = Effect.forever(
+    Queue.take(commandQueue).pipe(
+      Effect.flatMap((envelope) =>
+        envelope._tag === "command"
+          ? processEnvelope(envelope)
+          : envelope._tag === "barrier"
+            ? Deferred.succeed(envelope.result, {
+                sequence: commandReadModel.snapshotSequence,
+              }).pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    pendingBarriers.delete(envelope);
+                  }),
+                ),
+              )
+            : Deferred.succeed(envelope.completed, undefined).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    pendingStops.delete(envelope);
+                  }),
+                ),
+                Effect.andThen(Effect.interrupt),
+              ),
+      ),
+    ),
+  );
+  const workerFiber = yield* Effect.forkScoped(worker);
   yield* Effect.logDebug("orchestration engine started").pipe(
     Effect.annotateLogs({ sequence: commandReadModel.snapshotSequence }),
   );
@@ -321,22 +483,392 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive, limit) =>
     eventStore.readFromSequence(fromSequenceExclusive, limit);
 
-  const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
+  const enqueueCommand = (command: OrchestrationCommand, externalEffect: "hot" | "pure" | null) =>
     Effect.gen(function* () {
       const maintenanceAcceptance = yield* maintenanceGate.ensureDispatchAllowed(command);
-      const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
-      yield* Queue.offer(commandQueue, {
-        command,
-        maintenanceAcceptance,
-        result,
-        startedAtMs: yield* Clock.currentTimeMillis,
-      });
+      const result = yield* admissionLock.withPermits(1)(
+        Effect.gen(function* () {
+          if (sealed) {
+            return yield* new OrchestrationNotReadyError({
+              message: "Orchestration engine is sealed.",
+              retryable: false,
+              retryAfterMs: 0,
+              phase: "sealed",
+            });
+          }
+          if (
+            externalEffect !== null &&
+            externalEffect === "hot" &&
+            (externalAdmissionClosed || externalHotAdmissionBlockers.size > 0)
+          ) {
+            return yield* new OrchestrationNotReadyError({
+              message:
+                externalHotAdmissionBlockers.size > 0
+                  ? "Orchestration is reconciling an uncertain external execution."
+                  : "Orchestration is quiescing.",
+              retryable: true,
+              retryAfterMs: 1_000,
+              phase: externalHotAdmissionBlockers.size > 0 ? "reconciling" : "quiescing",
+            });
+          }
+          const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
+          const envelope = {
+            _tag: "command",
+            command,
+            maintenanceAcceptance,
+            maintenanceReservation: null,
+            result,
+            startedAtMs: yield* Clock.currentTimeMillis,
+          } satisfies CommandEnvelope;
+          pendingCommands.add(envelope);
+          const offered = yield* Queue.offer(commandQueue, envelope);
+          if (!offered) {
+            pendingCommands.delete(envelope);
+            return yield* new OrchestrationNotReadyError({
+              message: "Orchestration engine queue is unavailable.",
+              retryable: false,
+              retryAfterMs: 0,
+              phase: "sealed",
+            });
+          }
+          return result;
+        }).pipe(Effect.uninterruptible),
+      );
       return yield* Deferred.await(result);
     });
+
+  const dispatch: OrchestrationEngineShape["dispatch"] = (command) => enqueueCommand(command, null);
+  const dispatchExternal: OrchestrationEngineShape["dispatchExternal"] = (
+    command: DispatchableClientOrchestrationCommand,
+  ) => enqueueCommand(command, classifyExternalCommand(command));
+  const dispatchInternal: OrchestrationEngineShape["dispatchInternal"] = (command) =>
+    enqueueCommand(command, null);
+
+  const releaseReservation = (reservationId: number) =>
+    Effect.gen(function* () {
+      if (!activeReservationIds.delete(reservationId)) return;
+      if (activeReservationIds.size === 0) {
+        yield* Deferred.succeed(reservationsDrained, undefined);
+      }
+    });
+
+  const reserveExternalHotAdmission: OrchestrationEngineShape["reserveExternalHotAdmission"] = (
+    reservedCommand,
+  ) =>
+    Effect.gen(function* () {
+      if (classifyExternalCommand(reservedCommand) !== "hot") {
+        return yield* new OrchestrationNotReadyError({
+          message: "Bootstrap reservation only accepts hot commands.",
+          retryable: false,
+          retryAfterMs: 0,
+          phase: "quiescing",
+        });
+      }
+      const reservationScope = yield* Scope.make("parallel");
+      let detachCleanupOnFailure = false;
+      return yield* Effect.gen(function* () {
+        const reservationId = yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            yield* restore(admissionLock.take(1));
+            return yield* Effect.gen(function* () {
+              if (sealed || externalAdmissionClosed || externalHotAdmissionBlockers.size > 0) {
+                return yield* new OrchestrationNotReadyError({
+                  message: sealed
+                    ? "Orchestration engine is sealed."
+                    : externalHotAdmissionBlockers.size > 0
+                      ? "Orchestration is reconciling an uncertain external execution."
+                      : "Orchestration is quiescing.",
+                  retryable: !sealed,
+                  retryAfterMs: sealed ? 0 : 1_000,
+                  phase: sealed
+                    ? "sealed"
+                    : externalHotAdmissionBlockers.size > 0
+                      ? "reconciling"
+                      : "quiescing",
+                });
+              }
+              if (activeReservationIds.size === 0) {
+                reservationsDrained = yield* Deferred.make<void>();
+              }
+              const reservationId = nextReservationId++;
+              activeReservationIds.add(reservationId);
+              yield* Scope.addFinalizer(
+                reservationScope,
+                admissionLock.withPermits(1)(releaseReservation(reservationId)).pipe(Effect.ignore),
+              );
+              return reservationId;
+            }).pipe(Effect.ensuring(admissionLock.release(1)));
+          }),
+        );
+        const maintenanceReservation = yield* maintenanceGate.reserveDispatchAllowed(
+          reservedCommand,
+          reservationScope,
+        );
+        yield* Effect.acquireRelease(
+          admissionLock
+            .withPermits(1)(
+              Effect.gen(function* () {
+                if (sealed || !activeReservationIds.has(reservationId)) {
+                  detachCleanupOnFailure = sealed;
+                  return yield* new OrchestrationNotReadyError({
+                    message: sealed
+                      ? "Orchestration engine is sealed."
+                      : "Bootstrap admission reservation is no longer active.",
+                    retryable: false,
+                    retryAfterMs: 0,
+                    phase: sealed ? "sealed" : "quiescing",
+                  });
+                }
+                activeBootstrapMaintenanceReservations.add(maintenanceReservation);
+              }),
+            )
+            .pipe(Effect.uninterruptible),
+          () =>
+            Effect.sync(() => {
+              activeBootstrapMaintenanceReservations.delete(maintenanceReservation);
+            }),
+        );
+
+        let enqueued = false;
+        const releaseOwnedReservation = Scope.close(reservationScope, Exit.void);
+        const cancel = Effect.suspend(() => (enqueued ? Effect.void : releaseOwnedReservation));
+        const ownedMaintenanceReservation: UpdateDispatchReservation = {
+          withDispatchAllowed: (command, effect) =>
+            maintenanceReservation
+              .withDispatchAllowed(command, effect)
+              .pipe(Effect.ensuring(releaseOwnedReservation)),
+          cancel: releaseOwnedReservation,
+        };
+        const dispatch: OrchestrationHotAdmissionReservation["dispatch"] = (command) =>
+          Effect.gen(function* () {
+            const result = yield* admissionLock.withPermits(1)(
+              Effect.gen(function* () {
+                if (!activeReservationIds.has(reservationId)) {
+                  return yield* new OrchestrationNotReadyError({
+                    message: "Bootstrap admission reservation is no longer active.",
+                    retryable: false,
+                    retryAfterMs: 0,
+                    phase: sealed ? "sealed" : "quiescing",
+                  });
+                }
+                if (sealed) {
+                  return yield* new OrchestrationNotReadyError({
+                    message: "Orchestration engine is sealed.",
+                    retryable: false,
+                    retryAfterMs: 0,
+                    phase: "sealed",
+                  });
+                }
+                if (externalHotAdmissionBlockers.size > 0) {
+                  return yield* new OrchestrationNotReadyError({
+                    message: "Orchestration is reconciling an uncertain external execution.",
+                    retryable: true,
+                    retryAfterMs: 1_000,
+                    phase: "reconciling",
+                  });
+                }
+                if (!Equal.equals(command, reservedCommand)) {
+                  return yield* new OrchestrationNotReadyError({
+                    message: "Bootstrap reservation only accepts its exact command.",
+                    retryable: false,
+                    retryAfterMs: 0,
+                    phase: "quiescing",
+                  });
+                }
+                const deferred = yield* Deferred.make<
+                  { sequence: number },
+                  OrchestrationDispatchError
+                >();
+                const envelope = {
+                  _tag: "command",
+                  command,
+                  maintenanceAcceptance: { generation: 0 },
+                  maintenanceReservation: ownedMaintenanceReservation,
+                  result: deferred,
+                  startedAtMs: yield* Clock.currentTimeMillis,
+                } satisfies CommandEnvelope;
+                yield* Effect.gen(function* () {
+                  pendingCommands.add(envelope);
+                  const offered = yield* Queue.offer(commandQueue, envelope);
+                  if (!offered) {
+                    pendingCommands.delete(envelope);
+                    yield* releaseOwnedReservation.pipe(
+                      Effect.forkDetach({ startImmediately: true }),
+                    );
+                    return yield* new OrchestrationNotReadyError({
+                      message: "Orchestration engine queue is unavailable.",
+                      retryable: false,
+                      retryAfterMs: 0,
+                      phase: "sealed",
+                    });
+                  }
+                  enqueued = true;
+                }).pipe(Effect.uninterruptible);
+                return deferred;
+              }),
+            );
+            return yield* Deferred.await(result);
+          });
+        return { dispatch, cancel } satisfies OrchestrationHotAdmissionReservation;
+      }).pipe(
+        Scope.provide(reservationScope),
+        Effect.onExit((exit) =>
+          Exit.isFailure(exit)
+            ? detachCleanupOnFailure
+              ? Scope.close(reservationScope, exit).pipe(
+                  Effect.forkDetach({ startImmediately: true }),
+                  Effect.asVoid,
+                )
+              : Scope.close(reservationScope, exit)
+            : Effect.void,
+        ),
+      );
+    });
+  const closeExternalAdmission: OrchestrationEngineShape["closeExternalAdmission"] =
+    admissionLock.withPermits(1)(
+      Effect.sync(() => {
+        externalAdmissionClosed = true;
+      }),
+    );
+  const openExternalAdmission: OrchestrationEngineShape["openExternalAdmission"] =
+    admissionLock.withPermits(1)(
+      Effect.sync(() => {
+        if (!sealed) externalAdmissionClosed = false;
+      }),
+    );
+  const blockExternalHotAdmission: OrchestrationEngineShape["blockExternalHotAdmission"] = (
+    blockerId,
+  ) =>
+    admissionLock.withPermits(1)(
+      Effect.sync(() => {
+        externalHotAdmissionBlockers.add(blockerId);
+      }),
+    );
+  const releaseExternalHotAdmissionBlocker: OrchestrationEngineShape["releaseExternalHotAdmissionBlocker"] =
+    (blockerId) =>
+      admissionLock.withPermits(1)(
+        Effect.sync(() => {
+          externalHotAdmissionBlockers.delete(blockerId);
+        }),
+      );
+  const barrier: OrchestrationEngineShape["barrier"] = Effect.gen(function* () {
+    const pendingReservations = yield* admissionLock.withPermits(1)(
+      Effect.succeed(reservationsDrained),
+    );
+    yield* Deferred.await(pendingReservations);
+    const result = yield* admissionLock.withPermits(1)(
+      Effect.gen(function* () {
+        if (sealed) {
+          return yield* new OrchestrationNotReadyError({
+            message: "Orchestration engine is sealed.",
+            retryable: false,
+            retryAfterMs: 0,
+            phase: "sealed",
+          });
+        }
+        const deferred = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
+        const envelope = { _tag: "barrier", result: deferred } satisfies BarrierEnvelope;
+        pendingBarriers.add(envelope);
+        const offered = yield* Queue.offer(commandQueue, envelope);
+        if (!offered) {
+          pendingBarriers.delete(envelope);
+          return yield* new OrchestrationNotReadyError({
+            message: "Orchestration engine queue is unavailable.",
+            retryable: false,
+            retryAfterMs: 0,
+            phase: "sealed",
+          });
+        }
+        return deferred;
+      }).pipe(Effect.uninterruptible),
+    );
+    return yield* Deferred.await(result);
+  });
+  const sealAndStop: OrchestrationEngineShape["sealAndStop"] = Effect.gen(function* () {
+    const completed = yield* admissionLock.withPermits(1)(
+      Effect.gen(function* () {
+        if (sealed) return null;
+        sealed = true;
+        externalAdmissionClosed = true;
+        const deferred = yield* Deferred.make<void>();
+        const envelope = { _tag: "stop", completed: deferred } satisfies StopEnvelope;
+        pendingStops.add(envelope);
+        const offered = yield* Queue.offer(commandQueue, envelope);
+        if (!offered) {
+          pendingStops.delete(envelope);
+          return null;
+        }
+        return deferred;
+      }).pipe(Effect.uninterruptible),
+    );
+    if (completed === null) return;
+    yield* Deferred.await(completed);
+    yield* Fiber.interrupt(workerFiber).pipe(Effect.ignore);
+    yield* Queue.shutdown(commandQueue);
+    yield* PubSub.shutdown(eventPubSub);
+  });
+  const forceStop: OrchestrationEngineShape["forceStop"] = Effect.gen(function* () {
+    const snapshot = yield* admissionLock.withPermits(1)(
+      Effect.sync(() => {
+        sealed = true;
+        externalAdmissionClosed = true;
+        activeReservationIds.clear();
+        const pending = {
+          commands: [...pendingCommands],
+          barriers: [...pendingBarriers],
+          stops: [...pendingStops],
+          maintenanceReservations: new Set([
+            ...activeBootstrapMaintenanceReservations,
+            ...[...pendingCommands].flatMap((envelope) =>
+              envelope.maintenanceReservation === null ? [] : [envelope.maintenanceReservation],
+            ),
+          ]),
+        };
+        workerFiber.interruptUnsafe();
+        return pending;
+      }),
+    );
+    yield* Deferred.succeed(reservationsDrained, undefined);
+    const forceError = new OrchestrationNotReadyError({
+      message: "Orchestration engine was force-stopped.",
+      retryable: false,
+      retryAfterMs: 0,
+      phase: "sealed",
+    });
+    yield* Effect.forEach(snapshot.commands, (envelope) =>
+      Deferred.fail(envelope.result, forceError),
+    );
+    yield* Effect.forEach(snapshot.barriers, (envelope) =>
+      Deferred.fail(envelope.result, forceError),
+    );
+    yield* Effect.forEach(snapshot.stops, (envelope) =>
+      Deferred.succeed(envelope.completed, undefined),
+    );
+    yield* Queue.shutdown(commandQueue);
+    yield* PubSub.shutdown(eventPubSub);
+    yield* Effect.forEach(snapshot.maintenanceReservations, (reservation) =>
+      reservation.cancel.pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+  }).pipe(Effect.uninterruptible);
+  const awaitStopped: OrchestrationEngineShape["awaitStopped"] = Fiber.await(workerFiber).pipe(
+    Effect.asVoid,
+  );
 
   return {
     readEvents,
     dispatch,
+    dispatchExternal,
+    dispatchInternal,
+    reserveExternalHotAdmission,
+    closeExternalAdmission,
+    openExternalAdmission,
+    blockExternalHotAdmission,
+    releaseExternalHotAdmissionBlocker,
+    barrier,
+    sealAndStop,
+    forceStop,
+    awaitStopped,
+    isSealed: Effect.sync(() => sealed),
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (wsServer, ProviderRuntimeIngestion, CheckpointReactor, etc.)
     // each independently receive all domain events.
@@ -351,7 +883,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   } satisfies OrchestrationEngineShape;
 });
 
-export const OrchestrationEngineLive = Layer.effect(
+export const OrchestrationEngineCoreLive = Layer.effect(
   OrchestrationEngineService,
   makeOrchestrationEngine,
+).pipe(
+  Layer.provide(OrchestrationReactorDeliveriesLive),
+  Layer.provide(ProjectionTurnRepositoryLive),
+);
+
+export const OrchestrationEngineLive = OrchestrationEngineCoreLive.pipe(
+  Layer.provide(ServerBootIdentity.layer),
 );

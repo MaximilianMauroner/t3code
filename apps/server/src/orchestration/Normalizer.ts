@@ -4,8 +4,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import {
   type ClientOrchestrationCommand,
+  type DispatchableClientOrchestrationCommand,
   type IsoDateTime,
-  type OrchestrationCommand,
   OrchestrationDispatchCommandError,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
 } from "@t3tools/contracts";
@@ -87,7 +87,7 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
           canonicalCommand.createWorkspaceRootIfMissing,
         ),
         createWorkspaceRootIfMissing: canonicalCommand.createWorkspaceRootIfMissing === true,
-      } satisfies OrchestrationCommand;
+      } satisfies DispatchableClientOrchestrationCommand;
     }
 
     if (
@@ -97,11 +97,11 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
       return {
         ...canonicalCommand,
         workspaceRoot: yield* normalizeProjectWorkspaceRoot(canonicalCommand.workspaceRoot),
-      } satisfies OrchestrationCommand;
+      } satisfies DispatchableClientOrchestrationCommand;
     }
 
     if (canonicalCommand.type !== "thread.turn.start") {
-      return canonicalCommand as OrchestrationCommand;
+      return canonicalCommand;
     }
 
     const normalizedAttachments = yield* Effect.forEach(
@@ -175,5 +175,5 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
         ...canonicalCommand.message,
         attachments: normalizedAttachments,
       },
-    } satisfies OrchestrationCommand;
+    } satisfies DispatchableClientOrchestrationCommand;
   });

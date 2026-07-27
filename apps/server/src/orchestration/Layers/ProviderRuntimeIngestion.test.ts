@@ -25,10 +25,14 @@ import {
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Deferred from "effect/Deferred";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
+import * as Metric from "effect/Metric";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
+import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it } from "vite-plus/test";
@@ -40,17 +44,29 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import type {
+  ProviderIngestionBarrier,
+  ProviderIngestionOutput,
+  ProviderLivenessSample,
+} from "../../provider/Services/ProviderAdapter.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
-import { ProviderRuntimeIngestionLive } from "./ProviderRuntimeIngestion.ts";
+import {
+  ProviderRuntimeIngestionLive,
+  latestEligibleProviderExitObservation,
+  makeProviderRuntimeIngestionLive,
+  type ProviderRuntimeIngestionLiveOptions,
+} from "./ProviderRuntimeIngestion.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeIngestion.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as OutputPressureMonitor from "../../diagnostics/OutputPressureMonitor.ts";
+import { ServerBootIdentity } from "../../serverBootId.ts";
 
 function makeTestServerSettingsLayer(overrides: Partial<ServerSettings> = {}) {
   return ServerSettingsService.layerTest(overrides);
@@ -95,6 +111,7 @@ function isLegacyTurnCompletedEvent(
 
 function createProviderServiceHarness() {
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+  const ingestionPubSub = Effect.runSync(PubSub.unbounded<ProviderIngestionOutput>());
   const runtimeSessions: ProviderSession[] = [];
 
   const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
@@ -124,6 +141,9 @@ function createProviderServiceHarness() {
     get streamEvents() {
       return Stream.fromPubSub(runtimeEventPubSub);
     },
+    get streamIngestion() {
+      return Stream.fromPubSub(ingestionPubSub);
+    },
   };
 
   const setSession = (session: ProviderSession): void => {
@@ -151,12 +171,28 @@ function createProviderServiceHarness() {
   };
 
   const emit = (event: LegacyProviderRuntimeEvent): void => {
-    Effect.runSync(PubSub.publish(runtimeEventPubSub, normalizeLegacyEvent(event)));
+    const normalized = normalizeLegacyEvent(event);
+    Effect.runSync(
+      Effect.all([
+        PubSub.publish(runtimeEventPubSub, normalized),
+        PubSub.publish(ingestionPubSub, normalized),
+      ]),
+    );
+  };
+
+  const emitBarrier = (barrier: ProviderIngestionBarrier): void => {
+    Effect.runSync(PubSub.publish(ingestionPubSub, barrier));
+  };
+
+  const emitIngestion = (output: ProviderIngestionOutput): void => {
+    Effect.runSync(PubSub.publish(ingestionPubSub, output));
   };
 
   return {
     service,
     emit,
+    emitBarrier,
+    emitIngestion,
     setSession,
   };
 }
@@ -191,6 +227,27 @@ async function waitForThread(
 }
 
 describe("ProviderRuntimeIngestion", () => {
+  it("selects only the latest persisted provider-exit observation within the turn window", () => {
+    expect(
+      latestEligibleProviderExitObservation(
+        [
+          "2026-01-01T00:00:00.000Z",
+          "2026-01-01T00:00:01.500Z",
+          "2026-01-01T00:00:03.000Z",
+          "not-a-date",
+        ],
+        "2026-01-01T00:00:01.000Z",
+        "2026-01-01T00:00:02.000Z",
+      ),
+    ).toBe("2026-01-01T00:00:01.500Z");
+    expect(
+      latestEligibleProviderExitObservation(
+        ["2026-01-01T00:00:00.000Z", "2026-01-01T00:00:03.000Z"],
+        "2026-01-01T00:00:01.000Z",
+        "2026-01-01T00:00:02.000Z",
+      ),
+    ).toBeUndefined();
+  });
   let runtime: ManagedRuntime.ManagedRuntime<
     OrchestrationEngineService | ProviderRuntimeIngestionService | ProjectionSnapshotQuery,
     unknown
@@ -218,7 +275,10 @@ describe("ProviderRuntimeIngestion", () => {
     }
   });
 
-  async function createHarness(options?: { serverSettings?: Partial<ServerSettings> }) {
+  async function createHarness(options?: {
+    serverSettings?: Partial<ServerSettings>;
+    ingestion?: ProviderRuntimeIngestionLiveOptions;
+  }) {
     const workspaceRoot = makeTempDir("t3-provider-project-");
     NodeFS.mkdirSync(NodePath.join(workspaceRoot, ".git"));
     const provider = createProviderServiceHarness();
@@ -234,13 +294,18 @@ describe("ProviderRuntimeIngestion", () => {
       Layer.provide(RepositoryIdentityResolver.layer),
       Layer.provide(SqlitePersistenceMemory),
     );
-    const layer = ProviderRuntimeIngestionLive.pipe(
+    const ingestionLayer = options?.ingestion
+      ? makeProviderRuntimeIngestionLive(options.ingestion)
+      : ProviderRuntimeIngestionLive;
+    const layer = ingestionLayer.pipe(
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
       Layer.provideMerge(makeTestServerSettingsLayer(options?.serverSettings)),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+      Layer.provideMerge(OutputPressureMonitor.layerWithOptions({ enabled: false })),
+      Layer.provideMerge(ServerBootIdentity.layer),
       Layer.provideMerge(NodeServices.layer),
     );
     runtime = ManagedRuntime.make(layer);
@@ -314,6 +379,8 @@ describe("ProviderRuntimeIngestion", () => {
       engine,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       emit: provider.emit,
+      emitBarrier: provider.emitBarrier,
+      emitIngestion: provider.emitIngestion,
       setProviderSession: provider.setSession,
       drain,
     };
@@ -359,6 +426,189 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(thread.session?.status).toBe("error");
     expect(thread.session?.lastError).toBe("turn failed");
+  });
+
+  it("publishes bounded provider-runtime-ingestion worker pressure", async () => {
+    const harness = await createHarness();
+    harness.emit({
+      type: "session.state.changed",
+      eventId: asEventId("evt-worker-pressure"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      payload: { state: "ready" },
+    });
+    await harness.drain();
+
+    const snapshots = await Effect.runPromise(Metric.snapshot);
+    const depth = snapshots.find(
+      (sample) =>
+        sample.id === "t3_ingestion_worker_depth" &&
+        sample.attributes?.worker === "provider-runtime-ingestion",
+    );
+    const oldestAge = snapshots.find(
+      (sample) =>
+        sample.id === "t3_ingestion_worker_oldest_age_ms" &&
+        sample.attributes?.worker === "provider-runtime-ingestion",
+    );
+    expect(depth?.state).toEqual({ value: 0 });
+    expect(oldestAge?.state).toEqual({ value: 0 });
+  });
+
+  it("does not acknowledge a barrier until a failed lifecycle prefix retries successfully", async () => {
+    const allowProjection = Effect.runSync(Ref.make(false));
+    const attempts = Effect.runSync(Ref.make(0));
+    const failedEventId = asEventId("evt-sticky-prefix");
+    const harness = await createHarness({
+      ingestion: {
+        beforeProcessRuntimeEvent: (event) =>
+          event.eventId !== failedEventId
+            ? Effect.void
+            : Ref.get(allowProjection).pipe(
+                Effect.flatMap((allowed) =>
+                  allowed
+                    ? Effect.void
+                    : Ref.update(attempts, (count) => count + 1).pipe(
+                        Effect.andThen(Effect.fail("planned projection failure")),
+                      ),
+                ),
+              ),
+      },
+    });
+
+    harness.emit({
+      type: "session.state.changed",
+      eventId: failedEventId,
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      payload: { state: "error", reason: "persist me" },
+    });
+    const markerAcknowledged = Effect.runSync(Deferred.make<ProviderLivenessSample>());
+    harness.emitIngestion({
+      _tag: "ProviderLivenessMarker",
+      markerId: "liveness-after-failure",
+      threadId: asThreadId("thread-1"),
+      sample: { state: "absent", threadId: asThreadId("thread-1") },
+      acknowledged: markerAcknowledged,
+    });
+    const acknowledged = Effect.runSync(Deferred.make<void>());
+    harness.emitBarrier({
+      _tag: "ProviderIngestionBarrier",
+      barrierId: "barrier-after-failure",
+      acknowledged,
+    });
+
+    const attemptDeadline = Date.now() + 2_000;
+    while (Effect.runSync(Ref.get(attempts)) === 0 && Date.now() < attemptDeadline) {
+      await Effect.runPromise(Effect.sleep("10 millis"));
+    }
+    expect(Effect.runSync(Ref.get(attempts))).toBeGreaterThan(0);
+    expect(Option.isNone(Effect.runSync(Deferred.poll(markerAcknowledged)))).toBe(true);
+    expect(Option.isNone(Effect.runSync(Deferred.poll(acknowledged)))).toBe(true);
+
+    Effect.runSync(Ref.set(allowProjection, true));
+    await harness.drain();
+    expect((await Effect.runPromise(Deferred.await(markerAcknowledged))).state).toBe("absent");
+    await Effect.runPromise(Deferred.await(acknowledged));
+    const thread = (await harness.readModel()).threads.find(
+      (entry) => entry.id === asThreadId("thread-1"),
+    );
+    expect(thread?.session?.status).toBe("error");
+    expect(thread?.session?.lastError).toBe("persist me");
+  });
+
+  it("records provider-exit evidence and fences late lifecycle events for the interrupted turn", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-provider-exit");
+    const messageId = asMessageId("message-provider-exit");
+    const startedAt = "2026-01-01T00:00:01.000Z";
+    const detectedAt = "2026-01-01T00:00:02.000Z";
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-provider-exit-turn-request"),
+        threadId,
+        message: {
+          messageId,
+          role: "user",
+          text: "survive a provider exit",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: startedAt,
+      }),
+    );
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-provider-exit-turn-started"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      turnId,
+      createdAt: startedAt,
+    });
+    const running = await waitForThread(
+      harness.readModel,
+      (thread) => thread.latestTurn?.turnId === turnId && thread.latestTurn.state === "running",
+    );
+    expect(running.latestTurn?.retrySourceMessageId).toBe(messageId);
+    const ordinaryUpdatedAt = running.updatedAt;
+
+    harness.emit({
+      type: "session.exited",
+      eventId: asEventId("evt-provider-exit"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      createdAt: detectedAt,
+      payload: { reason: "provider process exited", exitKind: "crash", recoverable: true },
+    });
+    const interrupted = await waitForThread(
+      harness.readModel,
+      (thread) => thread.latestTurn?.state === "interrupted",
+    );
+    expect(interrupted.latestTurn).toMatchObject({
+      turnId,
+      interruptionCode: "provider_exit",
+      interruptionDetectedAt: detectedAt,
+      executionLastObservedAt: startedAt,
+      interruptionTimestampFallback: false,
+      retrySourceMessageId: messageId,
+    });
+    expect(interrupted.session?.status).toBe("interrupted");
+    expect(interrupted.updatedAt).toBe(ordinaryUpdatedAt);
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-provider-exit-late-start"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      turnId,
+      createdAt: "2026-01-01T00:00:03.000Z",
+    });
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-provider-exit-late-complete"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      turnId,
+      createdAt: "2026-01-01T00:00:04.000Z",
+      status: "completed",
+    });
+    harness.emit({
+      type: "session.started",
+      eventId: asEventId("evt-provider-exit-late-session"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      createdAt: "2026-01-01T00:00:05.000Z",
+    });
+    await harness.drain();
+    const reloaded = (await harness.readModel()).threads.find((thread) => thread.id === threadId);
+    expect(reloaded?.latestTurn?.state).toBe("interrupted");
+    expect(reloaded?.latestTurn?.retrySourceMessageId).toBe(messageId);
+    expect(reloaded?.session?.status).toBe("interrupted");
   });
 
   it("applies provider session.state.changed transitions directly", async () => {

@@ -11,6 +11,7 @@ import {
   type CanonicalItemType,
   type CanonicalRequestType,
   type CodexSettings,
+  EventId,
   ProviderDriverKind,
   type ProviderEvent,
   ProviderInstanceId,
@@ -23,9 +24,12 @@ import {
   ProviderApprovalDecision,
   ThreadId,
   ProviderSendTurnInput,
+  type ProviderSession,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -50,6 +54,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
+import { isProviderRuntimeEvent, type ProviderAdapterOutput } from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
@@ -62,6 +67,7 @@ import {
 } from "./CodexSessionRuntime.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import { resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
+import { makeTargetTransitionLock } from "./TargetTransitionLock.ts";
 const isCodexAppServerProcessExitedError = Schema.is(CodexErrors.CodexAppServerProcessExitedError);
 const isCodexAppServerTransportError = Schema.is(CodexErrors.CodexAppServerTransportError);
 const isCodexSessionRuntimeThreadIdMissingError = Schema.is(
@@ -83,6 +89,7 @@ export interface CodexAdapterLiveOptions {
   >;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly beforeRuntimeEventEnqueue?: (event: ProviderRuntimeEvent) => Effect.Effect<void>;
 }
 
 interface CodexAdapterSessionContext {
@@ -90,7 +97,22 @@ interface CodexAdapterSessionContext {
   readonly scope: Scope.Closeable;
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
+  observedSession: ProviderSession;
   stopped: boolean;
+}
+
+function isProviderAdapterError(error: unknown): error is ProviderAdapterError {
+  if (typeof error !== "object" || error === null || !("_tag" in error)) return false;
+  switch (error._tag) {
+    case "ProviderAdapterValidationError":
+    case "ProviderAdapterSessionNotFoundError":
+    case "ProviderAdapterSessionClosedError":
+    case "ProviderAdapterRequestError":
+    case "ProviderAdapterProcessError":
+      return true;
+    default:
+      return false;
+  }
 }
 
 function mapCodexRuntimeError(
@@ -1371,8 +1393,15 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       : undefined);
   const managedNativeEventLogger =
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
-  const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
+  const runtimeEventQueue = yield* Queue.unbounded<ProviderAdapterOutput>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
+  const startEpochs = new Map<ThreadId, number>();
+  const transitions = yield* makeTargetTransitionLock();
+  const invalidateStart = (threadId: ThreadId) =>
+    transitions.withTarget(
+      threadId,
+      Effect.sync(() => startEpochs.set(threadId, (startEpochs.get(threadId) ?? 0) + 1)),
+    );
 
   const startSession: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
@@ -1385,9 +1414,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           });
         }
 
-        const existing = sessions.get(input.threadId);
+        const reservation = yield* transitions.withTarget(
+          input.threadId,
+          Effect.sync(() => {
+            const epoch = (startEpochs.get(input.threadId) ?? 0) + 1;
+            startEpochs.set(input.threadId, epoch);
+            return { epoch, existing: sessions.get(input.threadId) } as const;
+          }),
+        );
+        const existing = reservation.existing;
         if (existing && !existing.stopped) {
-          yield* Effect.suspend(() => stopSessionInternal(existing));
+          yield* Effect.suspend(() => stopSessionTransition(existing, { emitExitEvent: false }));
         }
 
         const serviceTier =
@@ -1447,22 +1484,40 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         );
 
-        const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
-          Effect.gen(function* () {
-            yield* writeNativeEvent(event);
-            const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
-            if (runtimeEvents.length === 0) {
-              yield* Effect.logDebug("ignoring unhandled Codex provider event", {
-                method: event.method,
-                threadId: event.threadId,
-                turnId: event.turnId,
-                itemId: event.itemId,
-              });
-              return;
-            }
-            yield* Queue.offerAll(runtimeEventQueue, runtimeEvents);
-          }),
-        ).pipe(Effect.forkChild);
+        const eventPumpCommitted = yield* Deferred.make<void>();
+        const eventFiber = yield* Deferred.await(eventPumpCommitted).pipe(
+          Effect.andThen(
+            Stream.runForEach(runtime.events, (event) =>
+              transitions.withTarget(
+                event.threadId,
+                Effect.gen(function* () {
+                  yield* writeNativeEvent(event);
+                  const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
+                  if (runtimeEvents.length === 0) {
+                    yield* Effect.logDebug("ignoring unhandled Codex provider event", {
+                      method: event.method,
+                      threadId: event.threadId,
+                      turnId: event.turnId,
+                      itemId: event.itemId,
+                    });
+                    return;
+                  }
+                  if (options?.beforeRuntimeEventEnqueue !== undefined) {
+                    yield* Effect.forEach(runtimeEvents, options.beforeRuntimeEventEnqueue, {
+                      discard: true,
+                    });
+                  }
+                  yield* Queue.offerAll(runtimeEventQueue, runtimeEvents);
+                  const context = sessions.get(event.threadId);
+                  if (context && !context.stopped) {
+                    context.observedSession = yield* context.runtime.getSession;
+                  }
+                }),
+              ),
+            ),
+          ),
+          Effect.forkChild,
+        );
 
         const started = yield* runtime.start().pipe(
           Effect.mapError(
@@ -1483,17 +1538,43 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         );
 
-        sessions.set(input.threadId, {
-          threadId: input.threadId,
-          scope: sessionScope,
-          runtime,
-          eventFiber,
-          stopped: false,
-        });
+        const committed = yield* transitions.withTarget(
+          input.threadId,
+          Effect.sync(() => {
+            if (startEpochs.get(input.threadId) !== reservation.epoch) return false;
+            sessions.set(input.threadId, {
+              threadId: input.threadId,
+              scope: sessionScope,
+              runtime,
+              eventFiber,
+              observedSession: started,
+              stopped: false,
+            });
+            return true;
+          }),
+        );
+        if (!committed) {
+          return yield* new ProviderAdapterSessionClosedError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+          });
+        }
         sessionScopeTransferred = true;
+        yield* Deferred.succeed(eventPumpCommitted, undefined);
 
         return started;
       }),
+    ).pipe(
+      Effect.mapError((cause) =>
+        isProviderAdapterError(cause)
+          ? cause
+          : new ProviderAdapterProcessError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+              detail: "Failed to manage the Codex session lifecycle.",
+              cause,
+            }),
+      ),
     );
 
   const resolveAttachment = Effect.fn("resolveAttachment")(function* (
@@ -1528,7 +1609,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     };
   });
 
-  const sendTurn: CodexAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
+  const sendTurnUnlocked = Effect.fn("sendTurnUnlocked")(function* (input: ProviderSendTurnInput) {
     const codexAttachments = yield* Effect.forEach(
       input.attachments ?? [],
       (attachment) => resolveAttachment(input, attachment),
@@ -1561,6 +1642,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       })
       .pipe(Effect.mapError((cause) => mapCodexRuntimeError(input.threadId, "turn/start", cause)));
   });
+  const sendTurn: CodexAdapterShape["sendTurn"] = sendTurnUnlocked;
 
   const requireSession = Effect.fn("requireSession")(function* (threadId: ThreadId) {
     const session = sessions.get(threadId);
@@ -1653,27 +1735,69 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     yield* nativeEventLogger.write(event, event.threadId);
   });
 
-  const stopSessionInternal = Effect.fn("stopSessionInternal")(function* (
+  const prepareStopSession = Effect.fn("prepareStopSession")(function* (
     session: CodexAdapterSessionContext,
+    stopOptions?: { readonly emitExitEvent?: boolean },
   ) {
     if (session.stopped) {
-      return;
+      return false;
     }
     session.stopped = true;
-    sessions.delete(session.threadId);
+    if (sessions.get(session.threadId) === session) sessions.delete(session.threadId);
+    if (stopOptions?.emitExitEvent !== false) {
+      const event: ProviderRuntimeEvent = {
+        type: "session.exited",
+        eventId: EventId.make(yield* crypto.randomUUIDv4),
+        provider: PROVIDER,
+        createdAt: DateTime.formatIso(yield* DateTime.now),
+        threadId: session.threadId,
+        payload: { reason: "Session stopped", exitKind: "graceful", recoverable: false },
+      };
+      if (options?.beforeRuntimeEventEnqueue !== undefined) {
+        yield* options.beforeRuntimeEventEnqueue(event);
+      }
+      yield* Queue.offer(runtimeEventQueue, event);
+    }
+    return true;
+  });
+  const cleanupStoppedSession = Effect.fn("cleanupStoppedSession")(function* (
+    session: CodexAdapterSessionContext,
+  ) {
+    yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
     yield* session.runtime.close.pipe(Effect.ignore);
     yield* Effect.ignore(Scope.close(session.scope, Exit.void));
-    yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
   });
+  const stopSessionTransition = (
+    session: CodexAdapterSessionContext,
+    stopOptions?: { readonly emitExitEvent?: boolean },
+  ) =>
+    Effect.gen(function* () {
+      const stopped = yield* transitions.withTarget(
+        session.threadId,
+        prepareStopSession(session, stopOptions),
+      );
+      if (stopped) yield* cleanupStoppedSession(session);
+    });
 
   const stopSession: CodexAdapterShape["stopSession"] = (threadId) =>
     Effect.gen(function* () {
+      yield* invalidateStart(threadId);
       const session = sessions.get(threadId);
       if (!session) {
         return;
       }
-      yield* stopSessionInternal(session);
-    });
+      yield* stopSessionTransition(session);
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId,
+            detail: "Failed to stop the Codex session.",
+            cause,
+          }),
+      ),
+    );
 
   const listSessions: CodexAdapterShape["listSessions"] = () =>
     Effect.forEach(
@@ -1685,11 +1809,68 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const hasSession: CodexAdapterShape["hasSession"] = (threadId) =>
     Effect.succeed(Boolean(sessions.get(threadId) && !sessions.get(threadId)?.stopped));
 
+  const requestLivenessSample: CodexAdapterShape["requestLivenessSample"] = (
+    threadId,
+    markerId,
+    acknowledged,
+  ) =>
+    transitions
+      .withTarget(
+        threadId,
+        Effect.gen(function* () {
+          const context = sessions.get(threadId);
+          const session = context && !context.stopped ? context.observedSession : undefined;
+          yield* Queue.offer(runtimeEventQueue, {
+            _tag: "ProviderLivenessMarker",
+            markerId,
+            threadId,
+            sample: session
+              ? { state: "present", threadId, session }
+              : { state: "absent", threadId },
+            acknowledged,
+          });
+        }),
+      )
+      .pipe(Effect.orDie);
+
   const stopAll: CodexAdapterShape["stopAll"] = () =>
-    Effect.forEach(Array.from(sessions.values()), stopSessionInternal, {
-      concurrency: 1,
-      discard: true,
-    }).pipe(Effect.asVoid);
+    Effect.gen(function* () {
+      yield* Effect.forEach(
+        Array.from(startEpochs.keys()),
+        (threadId) =>
+          invalidateStart(threadId).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId,
+                  detail: "Failed to invalidate the Codex session start.",
+                  cause,
+                }),
+            ),
+          ),
+        { discard: true },
+      );
+      yield* Effect.forEach(
+        Array.from(sessions.values()),
+        (session) =>
+          stopSessionTransition(session).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId: session.threadId,
+                  detail: "Failed to stop the Codex session.",
+                  cause,
+                }),
+            ),
+          ),
+        {
+          concurrency: 1,
+          discard: true,
+        },
+      );
+    });
 
   yield* Effect.acquireRelease(Effect.void, () =>
     stopAll().pipe(
@@ -1714,8 +1895,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     stopSession,
     listSessions,
     hasSession,
+    requestLivenessSample,
     stopAll,
     get streamEvents() {
+      return Stream.fromQueue(runtimeEventQueue).pipe(Stream.filter(isProviderRuntimeEvent));
+    },
+    get streamOutput() {
       return Stream.fromQueue(runtimeEventQueue);
     },
   } satisfies CodexAdapterShape;

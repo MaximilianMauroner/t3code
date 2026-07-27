@@ -10,7 +10,11 @@
  *
  * @module OrchestrationEngineService
  */
-import type { OrchestrationCommand, OrchestrationEvent } from "@t3tools/contracts";
+import type {
+  DispatchableClientOrchestrationCommand,
+  OrchestrationCommand,
+  OrchestrationEvent,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
@@ -21,6 +25,15 @@ import type { OrchestrationEventStoreError } from "../../persistence/Errors.ts";
 /**
  * OrchestrationEngineShape - Service API for orchestration command and event flow.
  */
+export interface OrchestrationHotAdmissionReservation {
+  /** Consumes the reservation by enqueueing its one hot command. */
+  readonly dispatch: (
+    command: DispatchableClientOrchestrationCommand,
+  ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+  /** Releases an unused reservation after bootstrap cleanup has finished. */
+  readonly cancel: Effect.Effect<void, never, never>;
+}
+
 export interface OrchestrationEngineShape {
   /**
    * Replay persisted orchestration events from an exclusive sequence cursor.
@@ -49,6 +62,47 @@ export interface OrchestrationEngineShape {
   readonly dispatch: (
     command: OrchestrationCommand,
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  readonly dispatchExternal: (
+    command: DispatchableClientOrchestrationCommand,
+  ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  readonly dispatchInternal: (
+    command: OrchestrationCommand,
+  ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  /** Linearizably rejects new external commands while preserving internal recovery dispatch. */
+  readonly closeExternalAdmission: Effect.Effect<void, never, never>;
+
+  /** Opens hot external command admission after startup recovery is fully settled. */
+  readonly openExternalAdmission: Effect.Effect<void, never, never>;
+
+  /** Fail-closes hot admission while an execution-uncertain durable predecessor exists. */
+  readonly blockExternalHotAdmission: (blockerId: string) => Effect.Effect<void, never, never>;
+
+  /** Releases one execution-uncertain predecessor without affecting lifecycle admission. */
+  readonly releaseExternalHotAdmissionBlocker: (
+    blockerId: string,
+  ) => Effect.Effect<void, never, never>;
+
+  /** Reserves one hot enqueue before a bootstrap performs side effects. */
+  readonly reserveExternalHotAdmission: (
+    command: DispatchableClientOrchestrationCommand,
+  ) => Effect.Effect<OrchestrationHotAdmissionReservation, OrchestrationDispatchError, never>;
+
+  /** Resolves after all earlier envelopes have committed and planned deliveries are durable. */
+  readonly barrier: Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
+
+  /** Idempotently reject new work, stop the queue worker, and prohibit later publication. */
+  readonly sealAndStop: Effect.Effect<void, never, never>;
+
+  /** Immediately seals admission and tears down worker transports without an in-band queue stop. */
+  readonly forceStop: Effect.Effect<void, never, never>;
+
+  /** Resolves once the command worker has actually terminated. */
+  readonly awaitStopped: Effect.Effect<void, never, never>;
+
+  readonly isSealed: Effect.Effect<boolean, never, never>;
 
   /**
    * Stream persisted domain events in dispatch order.

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check normal T3 Code availability
+After=t3code.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/t3code-availability-healthcheck
+Environment=T3CODE_SERVICE_NAME=t3code.service
+Environment=T3CODE_WATCHDOG_RUNTIME_DIR=/run/t3code-watchdog
+Environment=T3CODE_AVAILABILITY_STATE_FILE=/var/lib/t3code-watchdog/availability.state
+TimeoutStartSec=25s

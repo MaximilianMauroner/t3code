@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
+import * as NodeChildProcess from "node:child_process";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -76,6 +77,7 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
     readonly commands: Array<string>;
     readonly deployedCommit?: string;
     readonly partialReleaseCommit?: string;
+    readonly authorityMode?: "regular" | "symlink";
     readonly interruptWhen?: (command: string, args: ReadonlyArray<string>) => boolean;
     readonly output?: (
       command: string,
@@ -92,7 +94,15 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
     const repo = path.join(root, "repo");
     const releasesDir = path.join(root, "releases");
     const currentLink = path.join(root, "current");
+    const authorityPath = path.join(root, "watchdog-authority.lock");
     yield* fs.makeDirectory(repo, { recursive: true });
+    if (input.authorityMode === "regular") {
+      yield* fs.writeFileString(authorityPath, "");
+    } else if (input.authorityMode === "symlink") {
+      const foreignPath = path.join(root, "foreign-authority");
+      yield* fs.writeFileString(foreignPath, "foreign-bytes");
+      yield* fs.symlink(foreignPath, authorityPath);
+    }
     if (input.deployedCommit !== undefined) {
       const deployed = path.join(releasesDir, input.deployedCommit);
       yield* fs.makeDirectory(deployed, { recursive: true });
@@ -163,7 +173,12 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
         Layer.mergeAll(
           ServerConfig.layerTest(root, path.join(root, "state")),
           Layer.succeed(ProcessRunner.ProcessRunner, runner),
-          Layer.succeed(HostProcessEnvironment, {}),
+          Layer.succeed(
+            HostProcessEnvironment,
+            input.authorityMode === undefined
+              ? {}
+              : { T3_FORK_UPDATE_AUTHORITY_LOCK: authorityPath },
+          ),
           Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, unusedSnapshotQuery),
         ),
       ),
@@ -176,6 +191,7 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       stateDir: path.join(root, "state", "userdata"),
       remake: () => makeOne,
       restartCount: () => restarts,
+      authorityPath,
     };
   });
 
@@ -334,6 +350,42 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       assert.equal(verificationInfo.mode & 0o777, 0o600);
       const status = yield* fs.readFileString(`${context.stateDir}/fork-update.json`);
       assert.notInclude(status, token);
+    }),
+  );
+
+  it.effect("holds and releases the shared watchdog authority for an update", () =>
+    Effect.gen(function* () {
+      const commands: Array<string> = [];
+      const context = yield* makeService({
+        active: false,
+        commands,
+        authorityMode: "regular",
+        output: updatingOutput(),
+      });
+      yield* context.service.start;
+      const result = yield* awaitStatus(context.service, new Set(["restarting", "failed"]));
+      assert.equal(result.stage, "restarting");
+
+      const probe = NodeChildProcess.spawnSync("/usr/bin/flock", [
+        "-n",
+        context.authorityPath,
+        "/bin/true",
+      ]);
+      assert.equal(probe.status, 0);
+    }),
+  );
+
+  it.effect("rejects a symlinked watchdog authority before update commands", () =>
+    Effect.gen(function* () {
+      const commands: Array<string> = [];
+      const context = yield* makeService({
+        active: false,
+        commands,
+        authorityMode: "symlink",
+      });
+      const result = yield* Effect.exit(context.service.start);
+      assert.equal(result._tag, "Failure");
+      assert.deepEqual(commands, []);
     }),
   );
 

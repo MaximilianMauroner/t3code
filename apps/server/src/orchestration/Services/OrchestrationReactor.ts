@@ -21,6 +21,9 @@ export interface OrchestrationReactorShape {
    * finalized on shutdown.
    */
   readonly start: () => Effect.Effect<void, never, Scope.Scope>;
+
+  /** Stops auxiliary event admission and waits for every reactor queue to become idle. */
+  readonly quiesceAndDrain: Effect.Effect<void>;
 }
 
 /**

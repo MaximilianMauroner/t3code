@@ -37,10 +37,21 @@ import {
 } from "./auth/http.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import { browserApiCorsAllowedHeaders, browserApiCorsAllowedMethods } from "./httpCors.ts";
+import { healthProbeDuration, withMetrics } from "./observability/Metrics.ts";
 
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
+
+export const withEnvironmentDescriptorHealthMetrics = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  effect.pipe(
+    withMetrics({
+      timer: healthProbeDuration,
+      attributes: { probe: "environment-descriptor" },
+    }),
+  );
 
 export const browserApiCorsLayer = Layer.unwrap(
   Effect.gen(function* () {
@@ -103,7 +114,7 @@ export const serverEnvironmentHttpApiLayer = HttpApiBuilder.group(
       "descriptor",
       Effect.fn("environment.metadata.descriptor")(function* (args) {
         yield* annotateEnvironmentRequest(args.endpoint.name);
-        return yield* serverEnvironment.getDescriptor;
+        return yield* serverEnvironment.getDescriptor.pipe(withEnvironmentDescriptorHealthMetrics);
       }, traceRelayRequest),
     );
   }),

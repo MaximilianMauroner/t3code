@@ -6,14 +6,17 @@ import {
   IsoDateTime,
   MessageId,
   ModelSelection,
+  OrchestrationProposedPlanId,
   ProjectId,
   ProviderInteractionMode,
   RuntimeMode,
   ThreadId,
   type ModelSelection as ModelSelectionType,
+  type OrchestrationProposedPlanId as OrchestrationProposedPlanIdType,
   type ProjectId as ProjectIdType,
   type ProviderInteractionMode as ProviderInteractionModeType,
   type RuntimeMode as RuntimeModeType,
+  type ThreadId as ThreadIdType,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -36,6 +39,16 @@ const QueuedThreadCreationSchema = Schema.Struct({
   startFromOrigin: Schema.optional(Schema.Boolean),
 });
 
+const QueuedSourceProposedPlanReferenceSchema = Schema.Struct({
+  threadId: ThreadId,
+  planId: OrchestrationProposedPlanId,
+});
+
+export interface QueuedSourceProposedPlanReference {
+  readonly threadId: ThreadIdType;
+  readonly planId: OrchestrationProposedPlanIdType;
+}
+
 export const QueuedThreadMessageSchema = Schema.Struct({
   schemaVersion: Schema.Literals([1, 2, THREAD_OUTBOX_SCHEMA_VERSION]),
   environmentId: EnvironmentId,
@@ -47,6 +60,7 @@ export const QueuedThreadMessageSchema = Schema.Struct({
   modelSelection: Schema.optional(ModelSelection),
   runtimeMode: Schema.optional(RuntimeMode),
   interactionMode: Schema.optional(ProviderInteractionMode),
+  sourceProposedPlan: Schema.optional(QueuedSourceProposedPlanReferenceSchema),
   // Present when the queued item creates a brand-new thread (pending task)
   // instead of appending a turn to an existing one.
   creation: Schema.optional(QueuedThreadCreationSchema),
@@ -76,6 +90,7 @@ export interface QueuedThreadMessage {
   readonly modelSelection?: ModelSelectionType;
   readonly runtimeMode?: RuntimeModeType;
   readonly interactionMode?: ProviderInteractionModeType;
+  readonly sourceProposedPlan?: QueuedSourceProposedPlanReference;
   readonly creation?: QueuedThreadCreation;
   readonly createdAt: string;
 }

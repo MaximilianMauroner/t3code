@@ -49,6 +49,7 @@ export const ProviderSessionRuntime = Schema.Struct({
   lastSeenAt: IsoDateTime,
   resumeCursor: Schema.NullOr(Schema.Unknown),
   runtimePayload: Schema.NullOr(Schema.Unknown),
+  serverBootId: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 export type ProviderSessionRuntime = typeof ProviderSessionRuntime.Type;
 
@@ -119,6 +120,7 @@ const ProviderSessionRuntimeRawDbRowSchema = Schema.Struct({
   lastSeenAt: Schema.Unknown,
   resumeCursor: Schema.Unknown,
   runtimePayload: Schema.Unknown,
+  serverBootId: Schema.Unknown,
 });
 
 const decodeRuntimeRow = Schema.decodeUnknownEffect(ProviderSessionRuntimeDbRowSchema);
@@ -161,6 +163,7 @@ export const make = Effect.gen(function* () {
           last_seen_at,
           resume_cursor_json,
           runtime_payload_json
+          , server_boot_id
         )
         VALUES (
           ${runtime.threadId},
@@ -172,6 +175,7 @@ export const make = Effect.gen(function* () {
           ${runtime.lastSeenAt},
           ${runtime.resumeCursor},
           ${runtime.runtimePayload}
+          , ${runtime.serverBootId ?? null}
         )
         ON CONFLICT (thread_id)
         DO UPDATE SET
@@ -183,6 +187,7 @@ export const make = Effect.gen(function* () {
           last_seen_at = excluded.last_seen_at,
           resume_cursor_json = excluded.resume_cursor_json,
           runtime_payload_json = excluded.runtime_payload_json
+          , server_boot_id = excluded.server_boot_id
       `,
   });
 
@@ -201,6 +206,7 @@ export const make = Effect.gen(function* () {
           last_seen_at AS "lastSeenAt",
           resume_cursor_json AS "resumeCursor",
           runtime_payload_json AS "runtimePayload"
+          , server_boot_id AS "serverBootId"
         FROM provider_session_runtime
         WHERE thread_id = ${threadId}
       `,
@@ -221,6 +227,7 @@ export const make = Effect.gen(function* () {
           last_seen_at AS "lastSeenAt",
           resume_cursor_json AS "resumeCursor",
           runtime_payload_json AS "runtimePayload"
+          , server_boot_id AS "serverBootId"
         FROM provider_session_runtime
         ORDER BY last_seen_at ASC, thread_id ASC
       `,

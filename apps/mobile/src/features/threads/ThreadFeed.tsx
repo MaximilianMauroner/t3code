@@ -95,6 +95,8 @@ import { ThreadWorkGroupToggle, ThreadWorkLog } from "./thread-work-log";
 import { useMarkdownCodeHighlight } from "./markdownCodeHighlightState";
 import { useAssetUrl } from "../../state/assets";
 import { resolveWorkspaceRelativeFilePath } from "../files/filePath";
+import { ThreadRecoveryNotice, type ThreadRecoveryRetryInput } from "./ThreadRecoveryNotice";
+import type { ThreadRecoveryPresentation } from "./threadRecoveryPresentation";
 
 const MESSAGE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
   hour: "numeric",
@@ -130,6 +132,7 @@ export interface ThreadFeedProps {
   readonly agentLabel: string;
   readonly latestTurn: ThreadFeedLatestTurn | null;
   readonly activeWorkStartedAt: string | null;
+  readonly recoveryPresentation: ThreadRecoveryPresentation | null;
   readonly listRef: RefObject<LegendListRef | null>;
   readonly freeze: SharedValue<boolean>;
   readonly anchorMessageId: MessageId | null;
@@ -141,6 +144,7 @@ export interface ThreadFeedProps {
   readonly usesAutomaticContentInsets?: boolean;
   readonly onHeaderMaterialVisibilityChange?: (visible: boolean) => void;
   readonly skills?: ReadonlyArray<SelectableMarkdownSkill>;
+  readonly onRetryInterruptedTurn: (input: ThreadRecoveryRetryInput) => Promise<boolean>;
 }
 
 function MessageAttachmentImage(props: {
@@ -550,9 +554,45 @@ function useMarkdownStyles(onLinkPress: (href: string) => void): MarkdownStyleSe
       blockBackgroundColor: string,
       blockTextColor: string,
       copyTintColor: ColorValue,
+      paragraphMarginBottom: number,
       preserveSoftBreaks: boolean,
       highlightCode: boolean,
     ): CustomRenderers => ({
+      paragraph: ({ children }) => (
+        <NativeText
+          selectable
+          style={{
+            color: inlineTextColor,
+            fontFamily: regularFontFamily,
+            fontSize: markdownFontSizes.m,
+            lineHeight: markdownFontSizes.bodyLineHeight,
+            marginBottom: paragraphMarginBottom,
+            ...(Platform.OS === "android" ? { includeFontPadding: false } : null),
+          }}
+        >
+          {children}
+        </NativeText>
+      ),
+      heading: ({ children, level = 1 }) => {
+        const fontSize = markdownFontSizes[`h${level}`];
+        return (
+          <NativeText
+            selectable
+            style={{
+              color: inlineTextColor,
+              fontFamily: boldFontFamily,
+              fontSize,
+              fontWeight: "700",
+              lineHeight: fontSize * 1.3,
+              marginTop: 18,
+              marginBottom: 8,
+              ...(Platform.OS === "android" ? { includeFontPadding: false } : null),
+            }}
+          >
+            {children}
+          </NativeText>
+        );
+      },
       link: ({ children, href = "" }) => {
         const presentation = resolveMarkdownLinkPresentation(href);
         if (presentation.kind === "file") {
@@ -722,6 +762,7 @@ function useMarkdownStyles(onLinkPress: (href: string) => void): MarkdownStyleSe
           markdownUserFenceBg,
           markdownUserFenceText,
           userBubbleForegroundMuted,
+          0,
           true,
           false,
         ),
@@ -755,6 +796,7 @@ function useMarkdownStyles(onLinkPress: (href: string) => void): MarkdownStyleSe
           markdownCodeBg,
           markdownCodeText,
           iconSubtleColor,
+          10,
           false,
           true,
         ),
@@ -1793,6 +1835,15 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
             scrollEventThrottle={16}
             ListHeaderComponent={
               usesNativeAutomaticInsets ? null : <View style={{ height: topContentInset }} />
+            }
+            ListFooterComponent={
+              props.recoveryPresentation === null ? null : (
+                <ThreadRecoveryNotice
+                  environmentId={props.environmentId}
+                  presentation={props.recoveryPresentation}
+                  onRetry={props.onRetryInterruptedTurn}
+                />
+              )
             }
             contentContainerStyle={{
               paddingTop: 12,

@@ -1,10 +1,14 @@
 import { assert, it } from "@effect/vitest";
 
-import { EnvironmentInternalError } from "@t3tools/contracts";
+import {
+  EnvironmentInternalError,
+  EnvironmentOrchestrationNotReadyError,
+} from "@t3tools/contracts";
 
 import {
   ProjectLiveServerDeclaredResponseError,
   ProjectLiveServerRequestError,
+  ProjectOrchestrationNotReadyError,
   projectCommandErrorFromLiveServerRequest,
 } from "./project.ts";
 
@@ -23,6 +27,24 @@ it("maps declared server failures into structural project command errors", () =>
   assert.strictEqual(error.traceId, "trace-123");
   assert.strictEqual(error.message, "Server request failed (internal_error, trace trace-123).");
   assert.strictEqual(error.cause, cause);
+});
+
+it("preserves orchestration readiness metadata for CLI retries", () => {
+  const cause = new EnvironmentOrchestrationNotReadyError({
+    code: "orchestration_not_ready",
+    retryable: true,
+    retryAfterMs: 1_000,
+    phase: "reconciling",
+    traceId: "trace-ready",
+  });
+
+  const error = projectCommandErrorFromLiveServerRequest(cause);
+
+  assert.instanceOf(error, ProjectOrchestrationNotReadyError);
+  assert.strictEqual(error.code, "orchestration_not_ready");
+  assert.strictEqual(error.retryable, true);
+  assert.strictEqual(error.retryAfterMs, 1_000);
+  assert.strictEqual(error.phase, "reconciling");
 });
 
 it("preserves unexpected server failures without deriving the message from them", () => {

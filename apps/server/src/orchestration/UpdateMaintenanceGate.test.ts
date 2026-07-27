@@ -15,6 +15,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Scope from "effect/Scope";
 import type * as PlatformError from "effect/PlatformError";
 import { describe, expect } from "vite-plus/test";
 
@@ -86,6 +87,62 @@ function writeOwner(
 }
 
 describe("UpdateMaintenanceGate", () => {
+  it.effect("holds a bootstrap reservation through its durable commit", () =>
+    withFixture((fixture) =>
+      Effect.gen(function* () {
+        const reservationScope = yield* Scope.make();
+        const reservation = yield* fixture.gate.reserveDispatchAllowed(
+          turnCommand,
+          reservationScope,
+        );
+        const mismatch = yield* reservation
+          .withDispatchAllowed(
+            {
+              ...turnCommand,
+              message: { ...turnCommand.message, text: "different command" },
+            },
+            Effect.succeed("incorrectly accepted"),
+          )
+          .pipe(Effect.flip);
+        expect(mismatch.message).toContain("server update is in progress");
+        const commitEntered = yield* Deferred.make<void>();
+        const allowCommit = yield* Deferred.make<void>();
+        const commitFiber = yield* reservation
+          .withDispatchAllowed(
+            turnCommand,
+            Deferred.succeed(commitEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(allowCommit)),
+              Effect.as("committed"),
+            ),
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(commitEntered);
+
+        const updateFiber = yield* fixture.gate.acquire.pipe(Effect.forkChild);
+        yield* Effect.yieldNow;
+        expect(updateFiber.pollUnsafe()).toBeUndefined();
+        yield* Deferred.succeed(allowCommit, undefined);
+        expect(yield* Fiber.join(commitFiber)).toBe("committed");
+        yield* Fiber.join(updateFiber);
+        yield* fixture.gate.release;
+      }),
+    ),
+  );
+
+  it.effect("rejects bootstrap reservation before side effects when maintenance already won", () =>
+    withFixture((fixture) =>
+      Effect.gen(function* () {
+        yield* fixture.gate.acquire;
+        const reservationScope = yield* Scope.make();
+        const error = yield* fixture.gate
+          .reserveDispatchAllowed(turnCommand, reservationScope)
+          .pipe(Effect.flip);
+        expect(error.message).toContain("server update is in progress");
+        yield* fixture.gate.release;
+      }),
+    ),
+  );
+
   it.effect("lets a turn finish its durable section before update acquisition completes", () =>
     withFixture((fixture) =>
       Effect.gen(function* () {
@@ -123,6 +180,38 @@ describe("UpdateMaintenanceGate", () => {
         yield* fixture.gate.acquire;
         const error = yield* fixture.gate.ensureDispatchAllowed(turnCommand).pipe(Effect.flip);
         expect(error.message).toContain("server update is in progress");
+        yield* fixture.gate.release;
+      }),
+    ),
+  );
+
+  it.effect("gates archive, checkpoint revert, and delete as hot external commands", () =>
+    withFixture((fixture) =>
+      Effect.gen(function* () {
+        yield* fixture.gate.acquire;
+        const hotCommands: ReadonlyArray<OrchestrationCommand> = [
+          {
+            type: "thread.archive",
+            commandId: CommandId.make("cmd-hot-archive"),
+            threadId: ThreadId.make("thread-hot"),
+          },
+          {
+            type: "thread.checkpoint.revert",
+            commandId: CommandId.make("cmd-hot-checkpoint"),
+            threadId: ThreadId.make("thread-hot"),
+            turnCount: 1,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+          {
+            type: "thread.delete",
+            commandId: CommandId.make("cmd-hot-delete"),
+            threadId: ThreadId.make("thread-hot"),
+          },
+        ];
+        for (const command of hotCommands) {
+          const error = yield* fixture.gate.ensureDispatchAllowed(command).pipe(Effect.flip);
+          expect(error.message).toContain("server update is in progress");
+        }
         yield* fixture.gate.release;
       }),
     ),

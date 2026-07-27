@@ -47,6 +47,12 @@ import Migration0031 from "./Migrations/031_AuthAuthorizationScopes.ts";
 import Migration0032 from "./Migrations/032_AuthPairingProofKeyThumbprint.ts";
 import Migration0033 from "./Migrations/033_ProjectionThreadsSettled.ts";
 import Migration0034 from "./Migrations/034_ProjectionThreadsSnoozed.ts";
+import Migration0035 from "./Migrations/035_OrchestrationRecovery.ts";
+import Migration0036 from "./Migrations/036_OrchestrationReactorDeliveryLeases.ts";
+import Migration0037 from "./Migrations/037_OrchestrationReactorDeliveryRetrySchedule.ts";
+import Migration0038 from "./Migrations/038_OrchestrationReactorDeliveryClaimOwnership.ts";
+import Migration0039 from "./Migrations/039_BackfillLegacyPendingTurnStarts.ts";
+import Migration0040 from "./Migrations/040_LegacyPendingTurnReadinessIndex.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -93,6 +99,12 @@ export const migrationEntries = [
   [32, "AuthPairingProofKeyThumbprint", Migration0032],
   [33, "ProjectionThreadsSettled", Migration0033],
   [34, "ProjectionThreadsSnoozed", Migration0034],
+  [35, "OrchestrationRecovery", Migration0035],
+  [36, "OrchestrationReactorDeliveryLeases", Migration0036],
+  [37, "OrchestrationReactorDeliveryRetrySchedule", Migration0037],
+  [38, "OrchestrationReactorDeliveryClaimOwnership", Migration0038],
+  [39, "BackfillLegacyPendingTurnStarts", Migration0039],
+  [40, "LegacyPendingTurnReadinessIndex", Migration0040],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>

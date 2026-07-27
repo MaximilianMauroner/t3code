@@ -1,0 +1,123 @@
+#!/bin/sh
+set -eu
+
+service_name="${T3CODE_SERVICE_NAME:-t3code.service}"
+health_url="${T3CODE_HEALTH_URL:-http://127.0.0.1:41731/.well-known/t3/environment}"
+state_file="${T3CODE_AVAILABILITY_STATE_FILE:-/var/lib/t3code-watchdog/availability.state}"
+runtime_dir="${T3CODE_WATCHDOG_RUNTIME_DIR:-/run/t3code-watchdog}"
+local_lock="${runtime_dir}/availability-checker.lock"
+authority_lock="${runtime_dir}/authority.lock"
+marker_file="${T3CODE_UPDATE_MARKER:-/home/codex/.t3code/userdata/fork-update-verification.json}"
+active_turn_count_file="${T3CODE_ACTIVE_TURN_COUNT_FILE:-${runtime_dir}/active-turn-count}"
+active_turn_count_max_age_seconds="${T3CODE_ACTIVE_TURN_COUNT_MAX_AGE_SECONDS:-15}"
+failure_limit="${T3CODE_FAILURE_LIMIT:-3}"
+cooldown_seconds="${T3CODE_RESTART_COOLDOWN_SECONDS:-120}"
+
+[ -d "$runtime_dir" ] && [ ! -L "$runtime_dir" ] || exit 1
+
+validate_lock() {
+  candidate="$1"
+  [ -f "$candidate" ] && [ ! -L "$candidate" ] || exit 1
+  [ "$(stat -c '%h' "$candidate")" -eq 1 ] || exit 1
+}
+
+validate_lock "$local_lock"
+validate_lock "$authority_lock"
+exec 8<>"$local_lock"
+flock -n 8 || exit 0
+
+generation() {
+  systemctl show "$service_name" -p InvocationID --value
+}
+
+active_since_monotonic() {
+  value="$(systemctl show "$service_name" -p ActiveEnterTimestampMonotonic --value)"
+  case "$value" in ''|*[!0-9]*) printf '0\n' ;; *) printf '%s\n' "$value" ;; esac
+}
+
+monotonic_microseconds() {
+  awk '{ printf "%.0f\n", $1 * 1000000 }' /proc/uptime
+}
+
+write_state() {
+  failures="$1"; observed_generation="$2"; observed_at="$3"
+  temporary="${state_file}.tmp.$$"
+  umask 077
+  printf 'failures=%s\ngeneration=%s\nobserved_at=%s\n' \
+    "$failures" "$observed_generation" "$observed_at" >"$temporary"
+  mv -f "$temporary" "$state_file"
+}
+
+read_state_value() {
+  key="$1"
+  [ -f "$state_file" ] && [ ! -L "$state_file" ] || return 0
+  sed -n "s/^${key}=//p" "$state_file" | head -n 1
+}
+
+read_active_turn_count() {
+  [ -f "$active_turn_count_file" ] && [ ! -L "$active_turn_count_file" ] || {
+    printf '0\n'
+    return
+  }
+  [ "$(stat -c '%h' "$active_turn_count_file" 2>/dev/null || printf '0')" -eq 1 ] || {
+    printf '0\n'
+    return
+  }
+  modified_at="$(stat -c '%Y' "$active_turn_count_file" 2>/dev/null || printf '0')"
+  telemetry_now="$(date +%s)"
+  case "$modified_at" in ''|*[!0-9]*) printf '0\n'; return ;; esac
+  case "$telemetry_now" in ''|*[!0-9]*) printf '0\n'; return ;; esac
+  case "$active_turn_count_max_age_seconds" in ''|*[!0-9]*) printf '0\n'; return ;; esac
+  [ "$telemetry_now" -ge "$modified_at" ] || { printf '0\n'; return; }
+  [ $((telemetry_now - modified_at)) -le "$active_turn_count_max_age_seconds" ] || {
+    printf '0\n'
+    return
+  }
+  count="$(cat "$active_turn_count_file" 2>/dev/null || printf '0')"
+  case "$count" in ''|*[!0-9]*) printf '0\n' ;; *) printf '%s\n' "$count" ;; esac
+}
+
+probe_started="$(date +%s)"
+if curl --fail --silent --show-error --max-time 5 "$health_url" >/dev/null; then
+  write_state 0 "$(generation)" "$probe_started"
+  logger -t t3code-availability-healthcheck \
+    "initiator=availability result=healthy health_latency_seconds=$(( $(date +%s) - probe_started ))"
+  exit 0
+fi
+
+observed_generation="$(generation)"
+failures="$(read_state_value failures)"
+previous_generation="$(read_state_value generation)"
+case "$failures" in ''|*[!0-9]*) failures=0 ;; esac
+[ "$previous_generation" = "$observed_generation" ] || failures=0
+failures=$((failures + 1))
+write_state "$failures" "$observed_generation" "$probe_started"
+[ "$failures" -ge "$failure_limit" ] || exit 1
+
+# The expensive probe is outside authority; every action premise is rechecked inside it.
+exec 9<>"$authority_lock"
+flock -x 9
+[ ! -e "$marker_file" ] && [ ! -L "$marker_file" ] || exit 1
+[ "$(read_state_value failures)" = "$failures" ] || exit 1
+[ "$(read_state_value generation)" = "$observed_generation" ] || exit 1
+observed_at="$(read_state_value observed_at)"
+case "$observed_at" in ''|*[!0-9]*) exit 1 ;; esac
+now="$(date +%s)"
+[ $((now - observed_at)) -le 90 ] || exit 1
+[ "$(generation)" = "$observed_generation" ] || exit 1
+if curl --fail --silent --show-error --max-time 5 "$health_url" >/dev/null; then
+  write_state 0 "$observed_generation" "$now"
+  exit 0
+fi
+
+active_since="$(active_since_monotonic)"
+monotonic_now="$(monotonic_microseconds)"
+if [ "$active_since" -gt 0 ] && [ $((monotonic_now - active_since)) -lt $((cooldown_seconds * 1000000)) ]; then
+  exit 1
+fi
+active_turn_count="$(read_active_turn_count)"
+logger -t t3code-availability-healthcheck \
+  "initiator=availability counter=$failures health_latency_seconds=$((now - probe_started)) active_turn_count=$active_turn_count generation=$observed_generation cooldown_seconds=$cooldown_seconds action=restart"
+systemctl restart "$service_name"
+write_state 0 "$(generation)" "$now"
+exit 1

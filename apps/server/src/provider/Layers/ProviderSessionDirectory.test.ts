@@ -87,6 +87,7 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
       yield* directory.upsert({
         provider: ProviderDriverKind.make("codex"),
         threadId,
+        serverBootId: "stale-caller-boot",
         status: "starting",
         resumeCursor: {
           threadId: "provider-thread-runtime",
@@ -119,6 +120,8 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
           model: "gpt-5-codex",
           activeTurnId: "turn-1",
         });
+        assert.equal(typeof runtime.value.serverBootId, "string");
+        assert.notEqual(runtime.value.serverBootId, "stale-caller-boot");
       }
     }));
 

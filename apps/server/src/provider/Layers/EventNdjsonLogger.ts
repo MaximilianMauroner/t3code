@@ -12,14 +12,24 @@ import * as NodePath from "node:path";
 import type { ThreadId } from "@t3tools/contracts";
 import { RotatingFileSink } from "@t3tools/shared/logging";
 import { errorTag } from "@t3tools/shared/observability";
+import * as Clock from "effect/Clock";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Logger from "effect/Logger";
+import * as Metric from "effect/Metric";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import { toSafeThreadAttachmentSegment } from "../../attachmentStore.ts";
+import {
+  canonicalLoggerBytesTotal,
+  canonicalLoggerDuration,
+  metricAttributes,
+  providerOutputBytesTotal,
+  providerOutputEventsTotal,
+} from "../../observability/Metrics.ts";
 
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MAX_FILES = 10;
@@ -246,6 +256,7 @@ export const makeEventNdjsonLogger = Effect.fn("makeEventNdjsonLogger")(function
   });
 
   const write = Effect.fn("write")(function* (event: unknown, threadId: ThreadId | null) {
+    const startedAt = yield* Clock.currentTimeNanos;
     const threadSegment = resolveThreadSegment(threadId);
     const message = yield* toLogMessage(event);
     if (!message) {
@@ -258,6 +269,30 @@ export const makeEventNdjsonLogger = Effect.fn("makeEventNdjsonLogger")(function
     }
 
     yield* writer.writeMessage(message);
+    const bytes = Buffer.byteLength(message, "utf8");
+    const attributes = metricAttributes({
+      stream: options.stream,
+    });
+    yield* Metric.update(Metric.withAttributes(providerOutputEventsTotal, attributes), 1);
+    yield* Metric.update(Metric.withAttributes(providerOutputBytesTotal, attributes), bytes);
+
+    if (options.stream !== "native") {
+      const endedAt = yield* Clock.currentTimeNanos;
+      yield* Metric.update(
+        Metric.withAttributes(
+          canonicalLoggerDuration,
+          metricAttributes({ stream: options.stream }),
+        ),
+        Duration.nanos(endedAt > startedAt ? endedAt - startedAt : 0n),
+      );
+      yield* Metric.update(
+        Metric.withAttributes(
+          canonicalLoggerBytesTotal,
+          metricAttributes({ stream: options.stream }),
+        ),
+        bytes,
+      );
+    }
   });
 
   const close = Effect.fn("close")(function* () {

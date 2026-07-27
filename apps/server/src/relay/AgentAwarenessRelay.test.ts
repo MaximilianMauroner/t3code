@@ -27,6 +27,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -473,6 +474,18 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
         const orchestrationEngine = {
           readEvents: () => Stream.empty,
           dispatch: () => Effect.succeed({ sequence: 1 }),
+          dispatchExternal: () => Effect.succeed({ sequence: 1 }),
+          dispatchInternal: () => Effect.succeed({ sequence: 1 }),
+          reserveExternalHotAdmission: () => Effect.die("unused"),
+          closeExternalAdmission: Effect.void,
+          openExternalAdmission: Effect.void,
+          blockExternalHotAdmission: () => Effect.void,
+          releaseExternalHotAdmissionBlocker: () => Effect.void,
+          barrier: Effect.succeed({ sequence: 1 }),
+          sealAndStop: Effect.void,
+          forceStop: Effect.void,
+          awaitStopped: Effect.void,
+          isSealed: Effect.succeed(false),
           streamDomainEvents: Stream.fromQueue(events),
           latestSequence: Effect.succeed(0),
         } satisfies OrchestrationEngineShape;
@@ -551,6 +564,144 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
       }),
     ),
   );
+
+  it.effect("owns deferred confirmations through quiesce and concurrent timer expiry", () => {
+    const runScenario = Effect.fn("runDeferredConfirmationScenario")(function* (
+      raceWithDeadline: boolean,
+    ) {
+      const originalFetch = globalThis.fetch;
+      let publishCount = 0;
+      const fetchMock = Object.assign(
+        async () => {
+          publishCount += 1;
+          return Response.json({ ok: true, deliveries: [] });
+        },
+        { preconnect: originalFetch.preconnect },
+      ) satisfies typeof fetch;
+      globalThis.fetch = fetchMock;
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          globalThis.fetch = originalFetch;
+        }),
+      );
+
+      const secrets = makeMemorySecretStore();
+      const now = "2026-05-25T00:00:00.000Z";
+      const projectId = "project-deferred" as ProjectId;
+      const threadId = "thread-deferred" as ThreadId;
+      const environmentId = "env-deferred" as EnvironmentId;
+      const project = {
+        id: projectId,
+        title: "T3 Code",
+        workspaceRoot: "/workspace",
+        repositoryIdentity: null,
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: now,
+        updatedAt: now,
+      } satisfies OrchestrationProjectShell;
+      const thread = {
+        id: threadId,
+        projectId,
+        title: "Deferred confirmation",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        latestTurn: {
+          turnId: "turn-deferred" as TurnId,
+          state: "completed",
+          requestedAt: now,
+          startedAt: now,
+          completedAt: now,
+          assistantMessageId: null,
+        },
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "Codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        latestUserMessageAt: now,
+        hasPendingApprovals: false,
+        hasPendingUserInput: false,
+        hasActionableProposedPlan: false,
+      } satisfies OrchestrationThreadShell;
+      const descriptor = {
+        environmentId,
+        label: "Test Desktop",
+        platform: { os: "darwin", arch: "arm64" },
+        serverVersion: "0.0.0-test",
+        capabilities: { repositoryIdentity: true },
+      } satisfies ExecutionEnvironmentDescriptor;
+
+      yield* secrets.setString(RELAY_URL_SECRET, "https://transport.example.test");
+      yield* secrets.setString(RELAY_ENVIRONMENT_CREDENTIAL_SECRET, "relay-credential");
+      yield* secrets.setString(PUBLISH_AGENT_ACTIVITY_SECRET, "true");
+
+      const dependencies = Layer.mergeAll(
+        Layer.succeed(ServerSecretStore.ServerSecretStore, secrets.store),
+        Layer.succeed(ServerEnvironment.ServerEnvironment, {
+          getEnvironmentId: Effect.succeed(environmentId),
+          getDescriptor: Effect.succeed(descriptor),
+        }),
+        Layer.mock(OrchestrationEngineService)({
+          streamDomainEvents: Stream.empty,
+        }),
+        Layer.mock(ProjectionSnapshotQuery)({
+          getShellSnapshot: () =>
+            Effect.succeed({
+              snapshotSequence: 1,
+              projects: [project],
+              threads: [thread],
+              updatedAt: now,
+            } satisfies OrchestrationShellSnapshot),
+          getThreadShellById: () => Effect.succeed(Option.some(thread)),
+          getProjectShellById: () => Effect.succeed(Option.some(project)),
+        }),
+      );
+
+      yield* Effect.gen(function* () {
+        const relay = yield* AgentAwarenessRelay.AgentAwarenessRelay;
+        yield* relay.publishThread(threadId);
+
+        if (raceWithDeadline) {
+          yield* Effect.all([TestClock.adjust("5 seconds"), relay.quiesceAndDrain], {
+            concurrency: "unbounded",
+          });
+          expect(publishCount).toBeLessThanOrEqual(1);
+        } else {
+          yield* relay.quiesceAndDrain;
+          yield* TestClock.adjust("5 seconds");
+          expect(publishCount).toBe(0);
+        }
+
+        const countAtDrain = publishCount;
+        yield* TestClock.adjust("10 seconds");
+        yield* Effect.yieldNow;
+        expect(publishCount).toBe(countAtDrain);
+        yield* relay.quiesceAndDrain;
+      }).pipe(
+        Effect.provide(
+          AgentAwarenessRelay.layer.pipe(
+            Layer.provide(dependencies),
+            Layer.provideMerge(NodeServices.layer),
+          ),
+        ),
+      );
+    });
+
+    return Effect.scoped(runScenario(false)).pipe(Effect.andThen(Effect.scoped(runScenario(true))));
+  });
 
   it.effect("publishes agent activity to the relay transport URL, not the relay issuer", () =>
     Effect.scoped(
@@ -665,6 +816,18 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
           Layer.succeed(OrchestrationEngineService, {
             readEvents: () => Stream.empty,
             dispatch: () => Effect.succeed({ sequence: 1 }),
+            dispatchExternal: () => Effect.succeed({ sequence: 1 }),
+            dispatchInternal: () => Effect.succeed({ sequence: 1 }),
+            reserveExternalHotAdmission: () => Effect.die("unused"),
+            closeExternalAdmission: Effect.void,
+            openExternalAdmission: Effect.void,
+            blockExternalHotAdmission: () => Effect.void,
+            releaseExternalHotAdmissionBlocker: () => Effect.void,
+            barrier: Effect.succeed({ sequence: 1 }),
+            sealAndStop: Effect.void,
+            forceStop: Effect.void,
+            awaitStopped: Effect.void,
+            isSealed: Effect.succeed(false),
             streamDomainEvents: Stream.fromQueue(events),
             latestSequence: Effect.succeed(0),
           } satisfies OrchestrationEngineShape),

@@ -54,6 +54,8 @@ const ICON_SOURCE_FILES = [
   "src/index.html",
 ] as const;
 
+const FAVICON_FILE_RE = /^favicon(?:[-_.][^/\\]*)?\.(?:svg|ico|png|webp|avif|jpe?g)$/i;
+
 // Matches <link ...> tags or object-like icon metadata where rel/href can appear in any order.
 const LINK_ICON_HTML_RE =
   /<link\b(?=[^>]*\brel=["'](?:icon|shortcut icon)["'])(?=[^>]*\bhref=["']([^"'?]+))[^>]*>/i;
@@ -67,6 +69,7 @@ export class ProjectFaviconResolutionError extends Schema.TaggedErrorClass<Proje
       "normalize-workspace",
       "resolve-path",
       "stat-candidate",
+      "read-directory",
       "read-source",
     ]),
     workspaceRoot: Schema.String,
@@ -103,6 +106,31 @@ function extractIconHref(source: string): string | null {
   return null;
 }
 
+function compareAppDirectoryNames(left: string, right: string): number {
+  if (left === "web") return right === "web" ? 0 : -1;
+  if (right === "web") return 1;
+  return left.localeCompare(right);
+}
+
+function compareDiscoveredFavicons(left: string, right: string): number {
+  const leftName = left.split(/[\\/]/).at(-1)?.toLowerCase() ?? "";
+  const rightName = right.split(/[\\/]/).at(-1)?.toLowerCase() ?? "";
+  const leftIsExact = /^favicon\.[^.]+$/.test(leftName);
+  const rightIsExact = /^favicon\.[^.]+$/.test(rightName);
+  if (leftIsExact !== rightIsExact) return leftIsExact ? -1 : 1;
+
+  const leftDepth = left.split(/[\\/]/).length;
+  const rightDepth = right.split(/[\\/]/).length;
+  if (leftDepth !== rightDepth) return leftDepth - rightDepth;
+
+  const extensionOrder = ["svg", "ico", "png", "webp", "avif", "jpg", "jpeg"];
+  const leftExtensionRank = extensionOrder.indexOf(leftName.split(".").at(-1) ?? "");
+  const rightExtensionRank = extensionOrder.indexOf(rightName.split(".").at(-1) ?? "");
+  if (leftExtensionRank !== rightExtensionRank) return leftExtensionRank - rightExtensionRank;
+
+  return left.localeCompare(right);
+}
+
 const optionOnNotFound = <A, R>(
   effect: Effect.Effect<A, PlatformError.PlatformError, R>,
 ): Effect.Effect<Option.Option<A>, PlatformError.PlatformError, R> =>
@@ -111,6 +139,19 @@ const optionOnNotFound = <A, R>(
     Effect.catchTags({
       PlatformError: (error) =>
         error.reason._tag === "NotFound" ? Effect.succeed(Option.none<A>()) : Effect.fail(error),
+    }),
+  );
+
+const optionOnMissingDirectory = <A, R>(
+  effect: Effect.Effect<A, PlatformError.PlatformError, R>,
+): Effect.Effect<Option.Option<A>, PlatformError.PlatformError, R> =>
+  effect.pipe(
+    Effect.map(Option.some),
+    Effect.catchTags({
+      PlatformError: (error) =>
+        error.reason._tag === "NotFound" || error.reason._tag === "BadResource"
+          ? Effect.succeed(Option.none<A>())
+          : Effect.fail(error),
     }),
   );
 
@@ -124,6 +165,70 @@ export const make = Effect.gen(function* () {
     const clean = href.replace(/^\//, "");
     return [path.join("public", clean), clean];
   };
+
+  const readDirectoryIfPresent = Effect.fn("ProjectFaviconResolver.readDirectoryIfPresent")(
+    function* (
+      projectCwd: string,
+      relativePath: string,
+      recursive: boolean,
+    ): Effect.fn.Return<ReadonlyArray<string>, ProjectFaviconResolutionError> {
+      const directory = yield* workspacePaths
+        .resolveRelativePathWithinRoot({
+          workspaceRoot: projectCwd,
+          relativePath,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProjectFaviconResolutionError({
+                operation: "read-directory",
+                workspaceRoot: projectCwd,
+                relativePath,
+                cause,
+              }),
+          ),
+        );
+      const entries = yield* optionOnMissingDirectory(
+        fileSystem.readDirectory(directory.absolutePath, { recursive }),
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProjectFaviconResolutionError({
+              operation: "read-directory",
+              workspaceRoot: projectCwd,
+              relativePath,
+              absolutePath: directory.absolutePath,
+              cause,
+            }),
+        ),
+      );
+      return Option.isSome(entries) ? entries.value : [];
+    },
+  );
+
+  const discoverMonorepoFaviconCandidates = Effect.fn(
+    "ProjectFaviconResolver.discoverMonorepoFaviconCandidates",
+  )(function* (
+    projectCwd: string,
+  ): Effect.fn.Return<ReadonlyArray<string>, ProjectFaviconResolutionError> {
+    const appDirectoryNames = [...(yield* readDirectoryIfPresent(projectCwd, "apps", false))].sort(
+      compareAppDirectoryNames,
+    );
+    const candidates: string[] = [];
+
+    for (const appDirectoryName of appDirectoryNames) {
+      const publicDirectory = path.join("apps", appDirectoryName, "public");
+      const entries = yield* readDirectoryIfPresent(projectCwd, publicDirectory, true);
+      const faviconEntries = entries
+        .filter((entry) => FAVICON_FILE_RE.test(path.basename(entry)))
+        .sort(compareDiscoveredFavicons);
+      for (const entry of faviconEntries) {
+        candidates.push(path.join(publicDirectory, entry));
+      }
+    }
+
+    return candidates;
+  });
 
   const findExistingFile = Effect.fn("ProjectFaviconResolver.findExistingFile")(function* (
     projectCwd: string,
@@ -237,6 +342,14 @@ export const make = Effect.gen(function* () {
       if (existing) {
         return existing;
       }
+    }
+
+    const monorepoFavicon = yield* findExistingFile(
+      projectCwd,
+      yield* discoverMonorepoFaviconCandidates(projectCwd),
+    );
+    if (monorepoFavicon) {
+      return monorepoFavicon;
     }
 
     return null;
