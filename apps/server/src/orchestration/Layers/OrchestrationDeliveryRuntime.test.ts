@@ -37,7 +37,10 @@ import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { planReactorDelivery } from "../reactorDeliveries.ts";
 import { CheckpointReactor } from "../Services/CheckpointReactor.ts";
 import { OrchestrationDeliveryRuntime } from "../Services/OrchestrationDeliveryRuntime.ts";
-import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
+import {
+  OrchestrationEngineService,
+  type OrchestrationEngineShape,
+} from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
@@ -207,34 +210,58 @@ describe("OrchestrationDeliveryRuntime", () => {
           Effect.map(OrchestrationReactorDeliveries, input.transformRepository),
         ).pipe(Layer.provide(baseRepositoryLayer))
       : baseRepositoryLayer;
-    const layer = OrchestrationDeliveryRuntimeLive.pipe(
-      Layer.provideMerge(repositoryLayer),
-      Layer.provideMerge(
-        Layer.mock(OrchestrationEngineService)({
-          dispatchInternal: (command) =>
-            (input.dispatchInternal ?? (() => Effect.succeed({ sequence: 1 })))(command).pipe(
-              Effect.tap(() =>
-                command.type === "thread.session.interrupt-if-active" &&
-                command.target.kind === "pendingStart"
-                  ? Effect.flatMap(OrchestrationReactorDeliveries, (repository) =>
-                      repository.markCancelled(
-                        command.target.deliveryId,
-                        command.detectedAt,
-                        command.target.expectedDeliveryOwnership.status === "delivering"
-                          ? command.target.expectedDeliveryOwnership.claimToken
-                          : undefined,
-                      ),
+    const engineLayer = Layer.effect(
+      OrchestrationEngineService,
+      Effect.map(OrchestrationReactorDeliveries, (repository) => {
+        const dispatchInternal: OrchestrationEngineShape["dispatchInternal"] = (command) => {
+          const pendingStartRecovery =
+            command.type === "thread.session.interrupt-if-active" &&
+            command.target.kind === "pendingStart"
+              ? {
+                  target: command.target,
+                  detectedAt: command.detectedAt,
+                }
+              : null;
+          return (input.dispatchInternal ?? (() => Effect.succeed({ sequence: 1 })))(command).pipe(
+            Effect.tap(() =>
+              pendingStartRecovery === null
+                ? Effect.void
+                : repository
+                    .markCancelled(
+                      pendingStartRecovery.target.deliveryId,
+                      pendingStartRecovery.detectedAt,
+                      pendingStartRecovery.target.expectedDeliveryOwnership.status === "delivering"
+                        ? pendingStartRecovery.target.expectedDeliveryOwnership.claimToken
+                        : undefined,
                     )
-                  : Effect.void,
-              ),
+                    .pipe(Effect.orDie),
             ),
+          );
+        };
+        return {
+          readEvents: () => Stream.empty,
+          dispatch: () => Effect.die("unused"),
+          dispatchExternal: () => Effect.die("unused"),
+          dispatchInternal,
           closeExternalAdmission: input.closeExternalAdmission ?? Effect.void,
+          openExternalAdmission: Effect.void,
           blockExternalHotAdmission: input.blockExternalHotAdmission ?? (() => Effect.void),
           releaseExternalHotAdmissionBlocker:
             input.releaseExternalHotAdmissionBlocker ?? (() => Effect.void),
+          reserveExternalHotAdmission: () => Effect.die("unused"),
+          barrier: Effect.die("unused"),
+          sealAndStop: Effect.void,
+          forceStop: Effect.void,
+          awaitStopped: Effect.void,
+          isSealed: Effect.succeed(false),
           streamDomainEvents: Stream.empty,
-        }),
-      ),
+          latestSequence: Effect.succeed(0),
+        } satisfies OrchestrationEngineShape;
+      }),
+    ).pipe(Layer.provide(repositoryLayer));
+    const layer = OrchestrationDeliveryRuntimeLive.pipe(
+      Layer.provideMerge(repositoryLayer),
+      Layer.provideMerge(engineLayer),
       Layer.provideMerge(
         Layer.mock(ProjectionSnapshotQuery)({
           getThreadDetailById: () =>
