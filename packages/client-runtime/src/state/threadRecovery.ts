@@ -65,7 +65,14 @@ export function threadRecoveryEvidence(thread: OrchestrationThread): ThreadRecov
       message.turnId === null &&
       message.createdAt > startInterruption.createdAt,
   );
-  if (supersededByTurn || supersededByPendingRetry) return null;
+  const supersededByIdleSession =
+    thread.session !== null &&
+    thread.session.activeTurnId === null &&
+    (thread.session.status === "idle" ||
+      thread.session.status === "ready" ||
+      thread.session.status === "stopped") &&
+    thread.session.updatedAt > startInterruption.createdAt;
+  if (supersededByTurn || supersededByPendingRetry || supersededByIdleSession) return null;
 
   return { kind: "start-interrupted", detectedAt: startInterruption.createdAt };
 }

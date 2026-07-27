@@ -847,6 +847,58 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("rejects a bootstrap reservation that completes after force-stop", async () => {
+    const reservationEntered = Deferred.makeUnsafe<void>();
+    const allowReservation = Deferred.makeUnsafe<void>();
+    const reservationCancelled = Deferred.makeUnsafe<void>();
+    const cancelReservation = Deferred.succeed(reservationCancelled, undefined);
+    const maintenanceReservation: UpdateDispatchReservation = {
+      withDispatchAllowed: (_command, effect) => effect.pipe(Effect.ensuring(cancelReservation)),
+      cancel: cancelReservation,
+    };
+    const gateService: UpdateMaintenanceGateService = {
+      acquire: Effect.succeed({ pid: process.pid, token: "test-maintenance-token" }),
+      release: Effect.void,
+      isHeld: Effect.succeed(false),
+      ensureDispatchAllowed: () => Effect.succeed({ generation: 0 }),
+      reserveDispatchAllowed: (_command, ownerScope) =>
+        Scope.addFinalizer(ownerScope, cancelReservation).pipe(
+          Effect.andThen(Deferred.succeed(reservationEntered, undefined)),
+          Effect.andThen(Deferred.await(allowReservation)),
+          Effect.as(maintenanceReservation),
+        ),
+      withDispatchAllowed: (_command, _acceptance, effect) => effect,
+    };
+    const system = await createOrchestrationSystem(gateService);
+    const command = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("cmd-bootstrap-force-stop-gap"),
+      threadId: ThreadId.make("thread-bootstrap-force-stop-gap"),
+      message: {
+        messageId: asMessageId("msg-bootstrap-force-stop-gap"),
+        role: "user",
+        text: "force stop",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: now(),
+    } as const;
+    const reservationFiber = await system.run(
+      system.engine
+        .reserveExternalHotAdmission(command)
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(reservationEntered));
+
+    await system.run(system.engine.forceStop.pipe(Effect.timeout("250 millis")));
+    await system.run(Deferred.succeed(allowReservation, undefined));
+    const exit = await system.run(Fiber.await(reservationFiber).pipe(Effect.timeout("250 millis")));
+    expect(Exit.isFailure(exit)).toBe(true);
+    await system.run(Deferred.await(reservationCancelled).pipe(Effect.timeout("250 millis")));
+    await system.dispose();
+  });
+
   it("keeps maintenance reserved after an enqueued bootstrap caller is interrupted", async () => {
     const projectionEntered = Deferred.makeUnsafe<void>();
     const allowProjection = Deferred.makeUnsafe<void>();

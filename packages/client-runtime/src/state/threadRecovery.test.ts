@@ -352,6 +352,25 @@ describe("thread recovery helpers", () => {
     ).toEqual({ kind: "start-interrupted", detectedAt: DETECTED_AT });
   });
 
+  it.each(["ready", "idle", "stopped"] as const)(
+    "suppresses historical start interruption after a newer %s session lifecycle",
+    (status) => {
+      expect(
+        threadRecoveryEvidence({
+          ...baseThread,
+          latestTurn: null,
+          session: {
+            ...baseThread.session!,
+            status,
+            activeTurnId: null,
+            updatedAt: "2026-07-26T02:01:00.000Z",
+          },
+          activities: [startInterruptionActivity],
+        }),
+      ).toBeNull();
+    },
+  );
+
   it("resolves the exact older retry source with attachments", () => {
     const newerMessage = {
       ...baseThread.messages[0]!,

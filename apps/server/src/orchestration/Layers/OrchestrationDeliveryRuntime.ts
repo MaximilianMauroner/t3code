@@ -339,11 +339,12 @@ const make = Effect.gen(function* () {
           const failedAtValue = yield* DateTime.now;
           const failedAt = DateTime.formatIso(failedAtValue);
           if (claimed.value.replayPolicy === "cancel-with-recovery" && executionMayHaveStarted) {
-            yield* appendNonReplayCancellationEvidence(
-              claimed.value,
-              `External execution may have succeeded before durable completion failed; replay was suppressed. ${Cause.pretty(cause)}`,
-              failedAt,
-            );
+            yield* cancelUncertainExecution(claimed.value, {
+              reason: "provider-state-mismatch",
+              interruptionCode: "provider_state_mismatch",
+              checkpointDetail: `Checkpoint rollback execution may have succeeded before durable completion failed; replay was suppressed. ${Cause.pretty(cause)}`,
+              genericDetail: `External execution may have succeeded before durable completion failed; replay was suppressed. ${Cause.pretty(cause)}`,
+            });
             const cancelled = yield* deliveries.markCancelled(
               claimed.value.deliveryId,
               failedAt,

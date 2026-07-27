@@ -577,6 +577,7 @@ describe("OrchestrationDeliveryRuntime", () => {
             createLayer({
               providerDeliver,
               dispatchInternal,
+              thread: absentSessionThread(),
               transformRepository: (repository) => ({
                 ...repository,
                 markDelivered: (...args) => {
@@ -594,8 +595,13 @@ describe("OrchestrationDeliveryRuntime", () => {
         expect(providerDeliver).toHaveBeenCalledTimes(1);
         expect(dispatchInternal).toHaveBeenCalledWith(
           expect.objectContaining({
-            type: "thread.activity.append",
-            commandId: CommandId.make(`delivery:${delivery.deliveryId}:recovery-evidence`),
+            type: "thread.session.interrupt-if-active",
+            reason: "provider-state-mismatch",
+            target: expect.objectContaining({
+              kind: "pendingStart",
+              deliveryId: delivery.deliveryId,
+              sourceEventId: delivery.sourceEventId,
+            }),
           }),
         );
         expect(result.row).toMatchObject({
@@ -603,6 +609,56 @@ describe("OrchestrationDeliveryRuntime", () => {
           executionStartedAt: expect.any(String),
         });
         expect(result.readiness.counts.total).toBe(0);
+      }),
+  );
+
+  effectIt.effect(
+    "recovers an exact pending start when provider delivery fails after marking",
+    () =>
+      Effect.gen(function* () {
+        const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+          Effect.fail("provider failed after execution marker"),
+        );
+        const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
+          () => Effect.succeed({ sequence: 2 }),
+        );
+        const delivery = deliveryFor(
+          turnStartEvent(1, "provider-failure-after-marker"),
+          "current-boot",
+        );
+        const status = yield* Effect.gen(function* () {
+          const repository = yield* OrchestrationReactorDeliveries;
+          const runtime = yield* OrchestrationDeliveryRuntime;
+          yield* repository.insert(delivery);
+          yield* runtime.drain;
+          yield* runtime.drain;
+          return Option.getOrThrow(yield* repository.getById(delivery.deliveryId)).status;
+        }).pipe(
+          Effect.provide(
+            createLayer({
+              providerDeliver,
+              dispatchInternal,
+              thread: absentSessionThread(),
+            }),
+          ),
+        );
+
+        expect(providerDeliver).toHaveBeenCalledTimes(1);
+        expect(dispatchInternal).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "thread.session.interrupt-if-active",
+            reason: "provider-state-mismatch",
+            interruptionCode: "provider_state_mismatch",
+            target: expect.objectContaining({
+              kind: "pendingStart",
+              pendingMessageId: MessageId.make("message-1"),
+              deliveryId: delivery.deliveryId,
+              sourceEventId: delivery.sourceEventId,
+              expectedSession: { kind: "absent" },
+            }),
+          }),
+        );
+        expect(status).toBe("cancelled");
       }),
   );
 

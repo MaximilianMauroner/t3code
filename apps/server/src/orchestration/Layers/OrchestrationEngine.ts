@@ -571,9 +571,23 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           reservationScope,
         );
         yield* Effect.acquireRelease(
-          Effect.sync(() => {
-            activeBootstrapMaintenanceReservations.add(maintenanceReservation);
-          }),
+          admissionLock
+            .withPermits(1)(
+              Effect.gen(function* () {
+                if (sealed || !activeReservationIds.has(reservationId)) {
+                  return yield* new OrchestrationNotReadyError({
+                    message: sealed
+                      ? "Orchestration engine is sealed."
+                      : "Bootstrap admission reservation is no longer active.",
+                    retryable: false,
+                    retryAfterMs: 0,
+                    phase: sealed ? "sealed" : "quiescing",
+                  });
+                }
+                activeBootstrapMaintenanceReservations.add(maintenanceReservation);
+              }),
+            )
+            .pipe(Effect.uninterruptible),
           () =>
             Effect.sync(() => {
               activeBootstrapMaintenanceReservations.delete(maintenanceReservation);
