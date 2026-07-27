@@ -25,8 +25,6 @@ import * as Stream from "effect/Stream";
 import * as CheckpointStore from "../src/checkpointing/CheckpointStore.ts";
 import * as OutputPressureMonitor from "../src/diagnostics/OutputPressureMonitor.ts";
 import { TextGeneration } from "../src/textGeneration/TextGeneration.ts";
-import { OrchestrationCommandReceiptRepositoryLive } from "../src/persistence/Layers/OrchestrationCommandReceipts.ts";
-import { OrchestrationEventStoreLive } from "../src/persistence/Layers/OrchestrationEventStore.ts";
 import { ProjectionCheckpointRepositoryLive } from "../src/persistence/Layers/ProjectionCheckpoints.ts";
 import { ProjectionPendingApprovalRepositoryLive } from "../src/persistence/Layers/ProjectionPendingApprovals.ts";
 import { ProviderSessionRuntimeRepositoryLive } from "../src/persistence/Layers/ProviderSessionRuntime.ts";
@@ -49,17 +47,22 @@ import { ServerBootIdentity } from "../src/serverBootId.ts";
 import { AnalyticsService } from "../src/telemetry/Services/AnalyticsService.ts";
 import { CheckpointReactorLive } from "../src/orchestration/Layers/CheckpointReactor.ts";
 import * as RepositoryIdentityResolver from "../src/project/RepositoryIdentityResolver.ts";
-import { OrchestrationEngineLive } from "../src/orchestration/Layers/OrchestrationEngine.ts";
-import { OrchestrationProjectionPipelineLive } from "../src/orchestration/Layers/ProjectionPipeline.ts";
-import { OrchestrationProjectionSnapshotQueryLive } from "../src/orchestration/Layers/ProjectionSnapshotQuery.ts";
 import { RuntimeReceiptBusTest } from "../src/orchestration/Layers/RuntimeReceiptBus.ts";
 import { OrchestrationReactorLive } from "../src/orchestration/Layers/OrchestrationReactor.ts";
 import { ProviderCommandReactorLive } from "../src/orchestration/Layers/ProviderCommandReactor.ts";
 import { ProviderRuntimeIngestionLive } from "../src/orchestration/Layers/ProviderRuntimeIngestion.ts";
+import { OrchestrationDeliveryRuntimeLive } from "../src/orchestration/Layers/OrchestrationDeliveryRuntime.ts";
+import { OrphanTurnReconcilerLive } from "../src/orchestration/Layers/OrphanTurnReconciler.ts";
+import { composeReactorLayer } from "../src/orchestration/reactorLayer.ts";
+import { OrchestrationLayerLive } from "../src/orchestration/runtimeLayer.ts";
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
 } from "../src/orchestration/Services/OrchestrationEngine.ts";
+import { OrchestrationDeliveryRuntime } from "../src/orchestration/Services/OrchestrationDeliveryRuntime.ts";
+import { OrphanTurnReconciler } from "../src/orchestration/Services/OrphanTurnReconciler.ts";
+import { ProviderRuntimeIngestionService } from "../src/orchestration/Services/ProviderRuntimeIngestion.ts";
+import { ShutdownCoordinator } from "../src/orchestration/Services/ShutdownCoordinator.ts";
 import { ThreadDeletionReactor } from "../src/orchestration/Services/ThreadDeletionReactor.ts";
 import { OrchestrationReactor } from "../src/orchestration/Services/OrchestrationReactor.ts";
 import { ProjectionSnapshotQuery } from "../src/orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -259,11 +262,6 @@ export const makeOrchestrationIntegrationHarness = (
     yield* initializeGitWorkspace(workspaceDir);
 
     const persistenceLayer = makeSqlitePersistenceLive(dbPath);
-    const orchestrationLayer = OrchestrationEngineLive.pipe(
-      Layer.provide(OrchestrationProjectionPipelineLive),
-      Layer.provide(OrchestrationEventStoreLive),
-      Layer.provide(OrchestrationCommandReceiptRepositoryLive),
-    );
     const providerSessionDirectoryLayer = ProviderSessionDirectoryLive.pipe(
       Layer.provide(ProviderSessionRuntimeRepositoryLive),
     );
@@ -298,14 +296,13 @@ export const makeOrchestrationIntegrationHarness = (
     const providerRegistryLayer = makeProviderRegistryLayer();
 
     const checkpointStoreLayer = CheckpointStore.layer.pipe(Layer.provide(VcsDriverRegistry.layer));
-    const projectionSnapshotQueryLayer = OrchestrationProjectionSnapshotQueryLive;
     const runtimeServicesLayer = Layer.mergeAll(
-      projectionSnapshotQueryLayer,
-      orchestrationLayer.pipe(Layer.provide(projectionSnapshotQueryLayer)),
+      OrchestrationLayerLive,
       ProjectionCheckpointRepositoryLive,
       ProjectionPendingApprovalRepositoryLive,
       checkpointStoreLayer,
       providerLayer,
+      providerSessionDirectoryLayer,
       RuntimeReceiptBusTest,
     );
     const serverSettingsLayer = ServerSettingsService.layerTest();
@@ -330,24 +327,23 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(textGenerationLayer),
       Layer.provideMerge(serverSettingsLayer),
     );
+    const vcsStatusBroadcasterLayer = Layer.succeed(VcsStatusBroadcaster, {
+      getStatus: () => Effect.die("getStatus should not be called in this test"),
+      refreshLocalStatus: () =>
+        Effect.succeed({
+          isRepo: true,
+          hasPrimaryRemote: false,
+          isDefaultRef: true,
+          refName: "main",
+          hasWorkingTreeChanges: false,
+          workingTree: { files: [], insertions: 0, deletions: 0 },
+        }),
+      refreshStatus: () => Effect.die("refreshStatus should not be called in this test"),
+      streamStatus: () => Stream.empty,
+    });
     const checkpointReactorLayer = CheckpointReactorLive.pipe(
       Layer.provideMerge(runtimeServicesLayer),
-      Layer.provideMerge(
-        Layer.succeed(VcsStatusBroadcaster, {
-          getStatus: () => Effect.die("getStatus should not be called in this test"),
-          refreshLocalStatus: () =>
-            Effect.succeed({
-              isRepo: true,
-              hasPrimaryRemote: false,
-              isDefaultRef: true,
-              refName: "main",
-              hasWorkingTreeChanges: false,
-              workingTree: { files: [], insertions: 0, deletions: 0 },
-            }),
-          refreshStatus: () => Effect.die("refreshStatus should not be called in this test"),
-          streamStatus: () => Stream.empty,
-        }),
-      ),
+      Layer.provideMerge(vcsStatusBroadcasterLayer),
       Layer.provideMerge(
         WorkspaceEntries.layer.pipe(
           Layer.provide(WorkspacePaths.layer),
@@ -357,6 +353,9 @@ export const makeOrchestrationIntegrationHarness = (
       ),
       Layer.provideMerge(WorkspacePaths.layer),
       Layer.provideMerge(VcsProcess.layer),
+    );
+    const providerCommandReactorWithVcsLayer = providerCommandReactorLayer.pipe(
+      Layer.provideMerge(vcsStatusBroadcasterLayer),
     );
     const threadDeletionReactorLayer = Layer.succeed(ThreadDeletionReactor, {
       start: () => Effect.void,
@@ -369,18 +368,27 @@ export const makeOrchestrationIntegrationHarness = (
       drain: Effect.void,
       quiesceAndDrain: Effect.void,
     });
-    const orchestrationReactorLayer = OrchestrationReactorLive.pipe(
-      Layer.provideMerge(runtimeIngestionLayer),
-      Layer.provideMerge(providerCommandReactorLayer),
-      Layer.provideMerge(checkpointReactorLayer),
-      Layer.provideMerge(threadDeletionReactorLayer),
-      Layer.provideMerge(agentAwarenessRelayLayer),
-    );
-    const layer = Layer.empty.pipe(
+    const orphanTurnReconcilerLayer = OrphanTurnReconcilerLive.pipe(
       Layer.provideMerge(runtimeServicesLayer),
-      Layer.provideMerge(orchestrationReactorLayer),
+    );
+    const reactorLeafServicesLayer = Layer.mergeAll(
+      runtimeIngestionLayer,
+      providerCommandReactorWithVcsLayer,
+      checkpointReactorLayer,
+      threadDeletionReactorLayer,
+      agentAwarenessRelayLayer,
+      orphanTurnReconcilerLayer,
+    );
+    const reactorLayer = composeReactorLayer(
+      reactorLeafServicesLayer,
+      OrchestrationReactorLive,
+      OrchestrationDeliveryRuntimeLive,
+    );
+    const layer = reactorLayer.pipe(
+      Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(providerRegistryLayer),
       Layer.provide(persistenceLayer),
+      Layer.provideMerge(VcsProcess.layer),
       Layer.provideMerge(RepositoryIdentityResolver.layer),
       Layer.provideMerge(ServerSettingsService.layerTest()),
       Layer.provideMerge(ServerConfig.layerTest(workspaceDir, rootDir)),
@@ -395,6 +403,20 @@ export const makeOrchestrationIntegrationHarness = (
     ).pipe(Effect.orDie);
     const reactor = yield* tryRuntimePromise("load OrchestrationReactor service", () =>
       runtime.runPromise(Effect.service(OrchestrationReactor)),
+    ).pipe(Effect.orDie);
+    const deliveryRuntime = yield* tryRuntimePromise(
+      "load OrchestrationDeliveryRuntime service",
+      () => runtime.runPromise(Effect.service(OrchestrationDeliveryRuntime)),
+    ).pipe(Effect.orDie);
+    const providerRuntimeIngestion = yield* tryRuntimePromise(
+      "load ProviderRuntimeIngestion service",
+      () => runtime.runPromise(Effect.service(ProviderRuntimeIngestionService)),
+    ).pipe(Effect.orDie);
+    const orphanTurnReconciler = yield* tryRuntimePromise("load OrphanTurnReconciler service", () =>
+      runtime.runPromise(Effect.service(OrphanTurnReconciler)),
+    ).pipe(Effect.orDie);
+    const shutdownCoordinator = yield* tryRuntimePromise("load ShutdownCoordinator service", () =>
+      runtime.runPromise(Effect.service(ShutdownCoordinator)),
     ).pipe(Effect.orDie);
     const snapshotQuery = yield* tryRuntimePromise("load ProjectionSnapshotQuery service", () =>
       runtime.runPromise(Effect.service(ProjectionSnapshotQuery)),
@@ -418,8 +440,23 @@ export const makeOrchestrationIntegrationHarness = (
     ).pipe(Effect.orDie);
 
     const scope = yield* Scope.make("sequential");
-    yield* tryRuntimePromise("start OrchestrationReactor", () =>
-      runtime.runPromise(reactor.start().pipe(Scope.provide(scope))),
+    yield* tryRuntimePromise("start orchestration runtime", () =>
+      runtime.runPromise(
+        Effect.gen(function* () {
+          yield* providerRuntimeIngestion.start().pipe(Scope.provide(scope));
+          const reconciliation = yield* orphanTurnReconciler.reconcileStartup;
+          if (reconciliation.status === "unresolved") {
+            return yield* Effect.die(
+              `integration startup reconciliation left ${reconciliation.candidateCount} unresolved candidate(s)`,
+            );
+          }
+          yield* deliveryRuntime.start().pipe(Scope.provide(scope));
+          yield* deliveryRuntime.recoverStartup;
+          yield* reactor.start().pipe(Scope.provide(scope));
+          yield* engine.barrier;
+          yield* engine.openExternalAdmission;
+        }),
+      ),
     ).pipe(Effect.orDie);
     const receiptHistory = yield* Ref.make<ReadonlyArray<OrchestrationRuntimeReceipt>>([]);
     yield* Stream.runForEach(runtimeReceiptBus.streamEventsForTest, (receipt) =>
@@ -528,7 +565,16 @@ export const makeOrchestrationIntegrationHarness = (
       disposed = true;
 
       const shutdown = Effect.gen(function* () {
-        const closeScopeExit = yield* Effect.exit(Scope.close(scope, Exit.void));
+        const closeScopeExit = yield* Effect.exit(
+          tryRuntimePromise("shut down orchestration runtime", () =>
+            runtime.runPromise(
+              shutdownCoordinator.shutdown({
+                reactorScope: scope,
+                closeExternalAdmission: Effect.void,
+              }),
+            ),
+          ).pipe(Effect.orDie),
+        );
         const disposeRuntimeExit = yield* Effect.exit(Effect.promise(() => runtime.dispose()));
 
         const failureCause = Exit.isFailure(closeScopeExit)
