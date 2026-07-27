@@ -352,6 +352,8 @@ if [ "$legacy_general_was_active" = true ] &&
 fi
 install_complete=false
 rollback_complete=false
+availability_service_runtime_mask_owned=false
+availability_timer_runtime_mask_owned=false
 verify_nightly_original_state() {
   validate_nightly_source_path "$nightly_timer_path" || return 1
   validate_nightly_source_path "$nightly_service_path" || return 1
@@ -442,6 +444,18 @@ restore_legacy_general_watchdog() {
   restore_unit_state "$legacy_health_timer_unit" \
     "$legacy_health_enabled" "$legacy_health_active" "$legacy_health_failed"
 }
+clear_installer_availability_runtime_masks() {
+  # Remove only masks created by this installer transaction. `--runtime`
+  # deliberately leaves a recorded persistent mask untouched.
+  if [ "$availability_service_runtime_mask_owned" = true ]; then
+    systemctl unmask --runtime t3code-availability-healthcheck.service || return 1
+    availability_service_runtime_mask_owned=false
+  fi
+  if [ "$availability_timer_runtime_mask_owned" = true ]; then
+    systemctl unmask --runtime t3code-availability-healthcheck.timer || return 1
+    availability_timer_runtime_mask_owned=false
+  fi
+}
 retire_staged_availability_after_legacy_restore() {
   # The installer still owns the shared authority lock. Prevent the staged
   # service from entering another probe while its timer remains active, then
@@ -457,6 +471,7 @@ retire_staged_availability_after_legacy_restore() {
     systemctl stop t3code-availability-healthcheck.service || return 1
     wait_for_unit_inactive t3code-availability-healthcheck.service || return 1
     systemctl mask --runtime t3code-availability-healthcheck.service || return 1
+    availability_service_runtime_mask_owned=true
   fi
   if ! restore_legacy_general_watchdog; then
     # Exact rollback failed. Keep the validated staged watchdog available when
@@ -467,10 +482,7 @@ retire_staged_availability_after_legacy_restore() {
       systemctl stop "$legacy_health_timer_unit" >/dev/null 2>&1 || true
       systemctl stop "$legacy_health_service_unit" >/dev/null 2>&1 || true
       wait_for_unit_inactive "$legacy_health_service_unit" || true
-      if [ "$staged_service_enabled" != not-found ] && [ -n "$staged_service_enabled" ]; then
-        systemctl unmask --runtime t3code-availability-healthcheck.service \
-          >/dev/null 2>&1 || true
-      fi
+      clear_installer_availability_runtime_masks || true
       systemctl enable --now t3code-availability-healthcheck.timer \
         >/dev/null 2>&1 || true
     fi
@@ -525,6 +537,11 @@ rollback() {
       general_owner_restored=false
       rollback_failed=true
     fi
+  fi
+  if [ "$general_owner_restored" = true ] &&
+    ! clear_installer_availability_runtime_masks; then
+    general_owner_restored=false
+    rollback_failed=true
   fi
   if [ "$general_owner_restored" = true ]; then
     restore_file availability_script "$availability_script"

@@ -380,6 +380,192 @@ describe("fork service bootstrap installer", () => {
     expect(bridge).toContain("Keep the validated staged watchdog available");
   });
 
+  it("removes only installer runtime masks when rolling absent availability units back", () => {
+    withStateDir((stateDir) => {
+      const mockBin = NodePath.join(stateDir, "bin");
+      const modelDir = NodePath.join(stateDir, "model");
+      const assetsDir = NodePath.join(stateDir, "assets");
+      const logPath = NodePath.join(stateDir, "systemctl.log");
+      const harnessPath = NodePath.join(stateDir, "rollback-model");
+      NodeFS.mkdirSync(mockBin);
+      NodeFS.mkdirSync(modelDir);
+      NodeFS.mkdirSync(assetsDir);
+
+      const writeState = (
+        unit: string,
+        enabled: string,
+        active: string,
+        failed = "inactive",
+      ): void => {
+        const key = unit.replaceAll(/[^a-zA-Z0-9]/g, "_");
+        NodeFS.writeFileSync(NodePath.join(modelDir, `${key}.enabled`), `${enabled}\n`);
+        NodeFS.writeFileSync(NodePath.join(modelDir, `${key}.active`), `${active}\n`);
+        NodeFS.writeFileSync(NodePath.join(modelDir, `${key}.failed`), `${failed}\n`);
+      };
+      writeState("t3code-healthcheck.timer", "disabled", "inactive");
+      writeState("t3code-healthcheck.service", "static", "inactive");
+      writeState("t3code-availability-healthcheck.timer", "enabled", "active");
+      writeState("t3code-availability-healthcheck.service", "static", "inactive");
+      writeState("t3code-fork-healthcheck.timer", "disabled", "inactive");
+      writeState("t3code-fork-healthcheck.service", "static", "inactive");
+      NodeFS.writeFileSync(NodePath.join(assetsDir, "availability.timer"), "staged\n");
+      NodeFS.writeFileSync(NodePath.join(assetsDir, "availability.service"), "staged\n");
+
+      NodeFS.writeFileSync(
+        NodePath.join(mockBin, "systemctl"),
+        [
+          "#!/bin/sh",
+          "set -eu",
+          'command="$1"',
+          "shift",
+          "runtime=false",
+          "now=false",
+          'while [ "${1-}" = --runtime ] || [ "${1-}" = --now ]; do',
+          '  [ "$1" != --runtime ] || runtime=true',
+          '  [ "$1" != --now ] || now=true',
+          "  shift",
+          "done",
+          'unit="${1-}"',
+          'key="$(printf "%s" "$unit" | tr -c "a-zA-Z0-9" "_")"',
+          'enabled="$MODEL_DIR/${key}.enabled"',
+          'active="$MODEL_DIR/${key}.active"',
+          'failed="$MODEL_DIR/${key}.failed"',
+          'runtime_mask="$MODEL_DIR/${key}.runtime-mask"',
+          'printf "%s %s runtime=%s now=%s\\n" "$command" "$unit" "$runtime" "$now" >>"$SYSTEMCTL_LOG"',
+          'read_value() { cat "$1"; }',
+          'write_value() { printf \'%s\\n\' "$2" >"$1"; }',
+          'case "$command" in',
+          "  is-enabled)",
+          '    if [ -f "$runtime_mask" ]; then printf "masked\\n"; else read_value "$enabled"; fi',
+          "    ;;",
+          '  is-active) read_value "$active" ;;',
+          '  is-failed) read_value "$failed" ;;',
+          "  stop)",
+          '    write_value "$active" inactive',
+          "    ;;",
+          "  start)",
+          '    [ ! -f "$runtime_mask" ] || exit 1',
+          '    [ "$(read_value "$enabled")" != not-found ] || exit 1',
+          '    if [ "$unit" = t3code-healthcheck.timer ]; then',
+          '      availability_key="$(printf "%s" t3code-availability-healthcheck.service | tr -c "a-zA-Z0-9" "_")"',
+          '      availability_active_key="$(printf "%s" t3code-availability-healthcheck.timer | tr -c "a-zA-Z0-9" "_")"',
+          '      [ "$(cat "$MODEL_DIR/${availability_active_key}.active")" != active ] ||',
+          '        [ -f "$MODEL_DIR/${availability_key}.runtime-mask" ] || exit 42',
+          "    fi",
+          '    case "$unit" in',
+          '      *.timer) write_value "$active" active ;;',
+          '      *) write_value "$active" inactive ;;',
+          "    esac",
+          '    [ "$unit" != t3code-availability-healthcheck.service ] ||',
+          '      printf "started\\n" >"$NEXT_STAGE_STARTED"',
+          "    ;;",
+          "  enable)",
+          '    write_value "$enabled" enabled',
+          '    [ "$now" != true ] || write_value "$active" active',
+          "    ;;",
+          "  disable)",
+          '    write_value "$enabled" disabled',
+          '    [ "$now" != true ] || write_value "$active" inactive',
+          "    ;;",
+          "  mask)",
+          '    if [ "$runtime" = true ]; then : >"$runtime_mask"; else write_value "$enabled" masked; fi',
+          "    ;;",
+          "  unmask)",
+          '    if [ "$runtime" = true ]; then',
+          '      rm -f "$runtime_mask"',
+          '    elif [ "$(read_value "$enabled")" = masked ]; then',
+          '      write_value "$enabled" disabled',
+          "    fi",
+          "    ;;",
+          '  reset-failed) write_value "$failed" inactive ;;',
+          "  daemon-reload)",
+          "    for kind in timer service; do",
+          '      model_unit="t3code-availability-healthcheck.${kind}"',
+          '      model_key="$(printf "%s" "$model_unit" | tr -c "a-zA-Z0-9" "_")"',
+          '      if [ -f "$ASSETS_DIR/availability.${kind}" ]; then',
+          '        if [ "$(cat "$MODEL_DIR/${model_key}.enabled")" = not-found ]; then',
+          '          if [ "$kind" = timer ]; then next_enabled=disabled; else next_enabled=static; fi',
+          '          write_value "$MODEL_DIR/${model_key}.enabled" "$next_enabled"',
+          "        fi",
+          "      else",
+          '        write_value "$MODEL_DIR/${model_key}.enabled" not-found',
+          '        write_value "$MODEL_DIR/${model_key}.active" inactive',
+          '        write_value "$MODEL_DIR/${model_key}.failed" inactive',
+          "      fi",
+          "    done",
+          "    ;;",
+          "  *) exit 64 ;;",
+          "esac",
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+
+      const rollbackHelpers = installer.slice(
+        installer.indexOf("restore_unit_state() {"),
+        installer.indexOf("\nrollback() {"),
+      );
+      NodeFS.writeFileSync(
+        harnessPath,
+        [
+          "#!/bin/sh",
+          "set -eu",
+          rollbackHelpers,
+          'legacy_health_timer_unit="t3code-healthcheck.timer"',
+          'legacy_health_service_unit="t3code-healthcheck.service"',
+          "legacy_health_enabled=enabled",
+          "legacy_health_active=active",
+          "legacy_health_failed=inactive",
+          "legacy_health_service_enabled=static",
+          "legacy_health_service_active=inactive",
+          "legacy_health_service_failed=inactive",
+          "availability_service_runtime_mask_owned=false",
+          "availability_timer_runtime_mask_owned=false",
+          "retire_staged_availability_after_legacy_restore",
+          "clear_installer_availability_runtime_masks",
+          'rm -f "$ASSETS_DIR/availability.timer" "$ASSETS_DIR/availability.service"',
+          "systemctl daemon-reload",
+          "restore_unit_state t3code-fork-healthcheck.timer disabled inactive inactive",
+          "restore_unit_state t3code-fork-healthcheck.service static inactive inactive",
+          "restore_unit_state t3code-availability-healthcheck.timer not-found inactive inactive",
+          "restore_unit_state t3code-availability-healthcheck.service not-found inactive inactive",
+          '[ "$(systemctl is-enabled t3code-healthcheck.timer)" = enabled ]',
+          '[ "$(systemctl is-active t3code-healthcheck.timer)" = active ]',
+          '[ "$(systemctl is-enabled t3code-availability-healthcheck.timer)" = not-found ]',
+          '[ "$(systemctl is-enabled t3code-availability-healthcheck.service)" = not-found ]',
+          'test ! -e "$MODEL_DIR/t3code_availability_healthcheck_service.runtime-mask"',
+          'printf "next\\n" >"$ASSETS_DIR/availability.timer"',
+          'printf "next\\n" >"$ASSETS_DIR/availability.service"',
+          "systemctl daemon-reload",
+          "systemctl start t3code-availability-healthcheck.service",
+          'test -f "$NEXT_STAGE_STARTED"',
+          "",
+        ].join("\n"),
+        { mode: 0o700 },
+      );
+
+      const result = NodeChildProcess.spawnSync("/bin/sh", [harnessPath], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ASSETS_DIR: assetsDir,
+          MODEL_DIR: modelDir,
+          NEXT_STAGE_STARTED: NodePath.join(stateDir, "next-stage-started"),
+          PATH: `${mockBin}:/usr/bin:/bin`,
+          SYSTEMCTL_LOG: logPath,
+        },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      const log = NodeFS.readFileSync(logPath, "utf8");
+      expect(log.indexOf("start t3code-healthcheck.timer")).toBeLessThan(
+        log.indexOf("stop t3code-availability-healthcheck.timer"),
+      );
+      expect(log).toContain(
+        "unmask t3code-availability-healthcheck.service runtime=true now=false",
+      );
+    });
+  });
+
   it("pins the package.json pnpm version through fixed offline Corepack", () => {
     const packageVersion = /"packageManager"\s*:\s*"pnpm@([^"]+)"/.exec(packageJson)?.[1];
     const installerVersion = /expected_pnpm_version="([^"]+)"/.exec(installer)?.[1];
@@ -824,6 +1010,8 @@ describe("fork service bootstrap installer", () => {
           "legacy_health_service_active=inactive",
           "legacy_health_service_failed=inactive",
           "legacy_general_was_active=false",
+          "availability_service_runtime_mask_owned=false",
+          "availability_timer_runtime_mask_owned=false",
           "service_active=inactive",
           'release_update_lock() { printf "%s\\n" released >"$LOCK_RELEASE"; }',
           'if rollback; then printf "%s\\n" 0 >"$ROLLBACK_STATUS";',
