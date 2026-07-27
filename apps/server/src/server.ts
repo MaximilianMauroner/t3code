@@ -51,7 +51,7 @@ import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
 import { OrchestrationDeliveryRuntimeLive } from "./orchestration/Layers/OrchestrationDeliveryRuntime.ts";
 import { OrphanTurnReconcilerLive } from "./orchestration/Layers/OrphanTurnReconciler.ts";
-import { withShutdownCoordinator } from "./orchestration/Layers/ShutdownCoordinator.ts";
+import { composeReactorLayer } from "./orchestration/reactorLayer.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
@@ -163,19 +163,20 @@ const PlatformServicesLive = Layer.unwrap(
   }),
 );
 
-const ReactorServicesLayerLive = Layer.empty.pipe(
-  Layer.provideMerge(OrchestrationReactorLive),
-  Layer.provideMerge(ProviderRuntimeIngestionLive),
-  Layer.provideMerge(ProviderCommandReactorLive),
-  Layer.provideMerge(CheckpointReactorLive),
-  Layer.provideMerge(ThreadDeletionReactorLive),
-  Layer.provideMerge(OrchestrationDeliveryRuntimeLive),
-  Layer.provideMerge(OrphanTurnReconcilerLive),
-  Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
-  Layer.provideMerge(RuntimeReceiptBusLive),
+const ReactorLeafServicesLayerLive = Layer.mergeAll(
+  ProviderRuntimeIngestionLive,
+  ProviderCommandReactorLive,
+  CheckpointReactorLive.pipe(Layer.provideMerge(RuntimeReceiptBusLive)),
+  ThreadDeletionReactorLive,
+  OrphanTurnReconcilerLive,
+  AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer)),
 );
 
-const ReactorLayerLive = withShutdownCoordinator(ReactorServicesLayerLive);
+const ReactorLayerLive = composeReactorLayer(
+  ReactorLeafServicesLayerLive,
+  OrchestrationReactorLive,
+  OrchestrationDeliveryRuntimeLive,
+);
 
 const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
   Layer.provide(ProviderSessionRuntime.layer),
