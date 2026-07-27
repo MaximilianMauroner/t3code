@@ -352,6 +352,21 @@ describe("thread recovery helpers", () => {
     ).toEqual({ kind: "start-interrupted", detectedAt: DETECTED_AT });
   });
 
+  it("keeps a newer pending-start interruption after older turn recovery evidence", () => {
+    expect(
+      threadRecoveryEvidence({
+        ...baseThread,
+        latestTurn: {
+          ...baseThread.latestTurn!,
+          interruptionDetectedAt: "2026-07-26T01:30:00.000Z",
+          completedAt: "2026-07-26T01:29:00.000Z",
+        },
+        session: { ...baseThread.session!, status: "interrupted", activeTurnId: null },
+        activities: [startInterruptionActivity],
+      }),
+    ).toEqual({ kind: "start-interrupted", detectedAt: DETECTED_AT });
+  });
+
   it.each(["ready", "idle", "stopped"] as const)(
     "suppresses historical start interruption after a newer %s session lifecycle",
     (status) => {
@@ -370,6 +385,63 @@ describe("thread recovery helpers", () => {
       ).toBeNull();
     },
   );
+
+  it("uses deterministic conservative ordering for equal-timestamp successor state", () => {
+    const interrupted = {
+      ...baseThread,
+      latestTurn: null,
+      session: { ...baseThread.session!, status: "interrupted" as const, activeTurnId: null },
+      messages: [
+        {
+          ...baseThread.messages[0]!,
+          id: MessageId.make("message-pending"),
+          turnId: null,
+          createdAt: DETECTED_AT,
+        },
+      ],
+      activities: [startInterruptionActivity],
+    };
+    expect(threadRecoveryEvidence(interrupted)).toEqual({
+      kind: "start-interrupted",
+      detectedAt: DETECTED_AT,
+    });
+
+    expect(
+      threadRecoveryEvidence({
+        ...interrupted,
+        messages: [
+          ...interrupted.messages,
+          {
+            ...interrupted.messages[0]!,
+            id: MessageId.make("same-time-retry"),
+            createdAt: DETECTED_AT,
+          },
+        ],
+      }),
+    ).toBeNull();
+    expect(
+      threadRecoveryEvidence({
+        ...interrupted,
+        latestTurn: {
+          ...baseThread.latestTurn!,
+          state: "completed",
+          requestedAt: DETECTED_AT,
+          startedAt: DETECTED_AT,
+          completedAt: DETECTED_AT,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      threadRecoveryEvidence({
+        ...interrupted,
+        session: {
+          ...interrupted.session!,
+          status: "ready",
+          updatedAt: DETECTED_AT,
+        },
+      }),
+    ).toBeNull();
+  });
 
   it("resolves the exact older retry source with attachments", () => {
     const newerMessage = {

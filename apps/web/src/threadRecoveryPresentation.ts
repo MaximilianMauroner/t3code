@@ -87,7 +87,13 @@ export function buildThreadRecoveryPresentation(
     return null;
   }
 
-  if (thread.latestTurn?.state === "interrupted" || thread.session?.status === "interrupted") {
+  const hasStartInterruptionActivity = thread.activities.some(
+    (activity) => activity.kind === "session.start.interrupted" && activity.turnId === null,
+  );
+  if (
+    thread.latestTurn?.state === "interrupted" ||
+    (thread.session?.status === "interrupted" && !hasStartInterruptionActivity)
+  ) {
     return {
       title: "Turn interrupted",
       message: "This turn was interrupted before it finished.",

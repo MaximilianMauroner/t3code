@@ -29,6 +29,33 @@ export type ThreadRecoveryRetrySource =
       readonly reason: "not-interrupted" | "missing-source-id" | "source-message-missing";
     };
 
+function latestTurnActivityAt(turn: OrchestrationLatestTurn): string {
+  return [
+    turn.requestedAt,
+    turn.startedAt,
+    turn.completedAt,
+    turn.interruptionDetectedAt,
+    turn.executionLastObservedAt,
+  ].reduce<string>(
+    (latest, timestamp) =>
+      timestamp !== null && timestamp !== undefined && timestamp > latest ? timestamp : latest,
+    turn.requestedAt,
+  );
+}
+
+function pendingMessageId(activity: OrchestrationThread["activities"][number]): string | null {
+  const payload = activity.payload;
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("pendingMessageId" in payload) ||
+    typeof payload.pendingMessageId !== "string"
+  ) {
+    return null;
+  }
+  return payload.pendingMessageId;
+}
+
 /**
  * Returns only server-projected recovery evidence. Runtime status alone is not
  * enough to classify a turn as interrupted (notably, Cursor can be ready while
@@ -44,35 +71,45 @@ export function threadRecoveryEvidence(thread: OrchestrationThread): ThreadRecov
   }
 
   const latestTurn = thread.latestTurn;
-  if (
+  const interruptedTurn =
     latestTurn?.state === "interrupted" &&
     latestTurn.interruptionCode !== undefined &&
     latestTurn.interruptionCode !== null
-  ) {
-    return { kind: "turn-interrupted", turn: latestTurn };
-  }
+      ? latestTurn
+      : null;
 
   const startInterruption = thread.activities.findLast(
     (activity) => activity.kind === "session.start.interrupted" && activity.turnId === null,
   );
-  if (startInterruption === undefined) return null;
+  if (startInterruption === undefined) {
+    return interruptedTurn === null ? null : { kind: "turn-interrupted", turn: interruptedTurn };
+  }
 
+  const sourceMessageId = pendingMessageId(startInterruption);
   const supersededByTurn =
-    latestTurn !== null && latestTurn.requestedAt > startInterruption.createdAt;
+    latestTurn !== null && latestTurnActivityAt(latestTurn) >= startInterruption.createdAt;
   const supersededByPendingRetry = thread.messages.some(
     (message) =>
       message.role === "user" &&
       message.turnId === null &&
-      message.createdAt > startInterruption.createdAt,
+      message.id !== sourceMessageId &&
+      message.createdAt >= startInterruption.createdAt,
   );
-  const supersededByIdleSession =
+  const supersededBySession =
     thread.session !== null &&
     thread.session.activeTurnId === null &&
-    (thread.session.status === "idle" ||
-      thread.session.status === "ready" ||
-      thread.session.status === "stopped") &&
-    thread.session.updatedAt > startInterruption.createdAt;
-  if (supersededByTurn || supersededByPendingRetry || supersededByIdleSession) return null;
+    (thread.session.updatedAt > startInterruption.createdAt ||
+      (thread.session.updatedAt === startInterruption.createdAt &&
+        thread.session.status !== "interrupted"));
+  const startIsCurrent = !supersededByTurn && !supersededByPendingRetry && !supersededBySession;
+
+  if (
+    interruptedTurn !== null &&
+    (!startIsCurrent || latestTurnActivityAt(interruptedTurn) >= startInterruption.createdAt)
+  ) {
+    return { kind: "turn-interrupted", turn: interruptedTurn };
+  }
+  if (!startIsCurrent) return null;
 
   return { kind: "start-interrupted", detectedAt: startInterruption.createdAt };
 }

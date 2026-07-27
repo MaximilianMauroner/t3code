@@ -157,6 +157,12 @@ describe("resolveThreadRecoveryPresentation", () => {
   it("presents a pending-start interruption without inventing a turn", () => {
     const pending = thread({
       latestTurn: null,
+      messages: [
+        {
+          ...thread().messages[0]!,
+          turnId: null,
+        },
+      ],
       session: { ...thread().session!, status: "interrupted", activeTurnId: null },
       activities: [
         {
@@ -177,6 +183,37 @@ describe("resolveThreadRecoveryPresentation", () => {
       retry: { kind: "unavailable" },
     });
     expect(pending.messages[0]?.text).toBe("Original prompt");
+    expect(pending.latestTurn).toBeNull();
+  });
+
+  it("suppresses stale pending-start recovery after a newer user message", () => {
+    const pending = thread({
+      latestTurn: null,
+      messages: [
+        {
+          ...thread().messages[0]!,
+          turnId: null,
+        },
+        {
+          ...thread().messages[1]!,
+          turnId: null,
+        },
+      ],
+      session: { ...thread().session!, status: "interrupted", activeTurnId: null },
+      activities: [
+        {
+          id: EventId.make("event-stale-start-interrupted"),
+          tone: "error",
+          kind: "session.start.interrupted",
+          summary: "Turn start was interrupted.",
+          payload: { pendingMessageId: SOURCE_ID },
+          turnId: null,
+          createdAt: DETECTED_AT,
+        },
+      ],
+    });
+
+    expect(resolveThreadRecoveryPresentation(pending)).toBeNull();
     expect(pending.latestTurn).toBeNull();
   });
 

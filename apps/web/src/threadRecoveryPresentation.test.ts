@@ -1,4 +1,5 @@
 import {
+  EventId,
   MessageId,
   ProjectId,
   ProviderInstanceId,
@@ -155,6 +156,49 @@ describe("thread recovery presentation", () => {
       buildThreadRecoveryPresentation({
         ...baseThread,
         session: { ...baseThread.session!, status: "ready", activeTurnId: TURN_ID },
+      }),
+    ).toBeNull();
+  });
+
+  it("matches mobile pending-start visibility and stale-evidence suppression", () => {
+    const activity = {
+      id: EventId.make("event-web-start-interrupted"),
+      tone: "error" as const,
+      kind: "session.start.interrupted",
+      summary: "Turn start was interrupted.",
+      payload: { pendingMessageId: SOURCE_MESSAGE_ID },
+      turnId: null,
+      createdAt: DETECTED_AT,
+    };
+    const current = {
+      ...baseThread,
+      latestTurn: null,
+      messages: [
+        {
+          ...baseThread.messages[0]!,
+          turnId: null,
+        },
+      ],
+      activities: [activity],
+      session: { ...baseThread.session!, status: "interrupted" as const, activeTurnId: null },
+    };
+
+    expect(buildThreadRecoveryPresentation(current)).toMatchObject({
+      title: "Turn start interrupted",
+      detectedAt: DETECTED_AT,
+      executionLastObservedAt: null,
+    });
+    expect(
+      buildThreadRecoveryPresentation({
+        ...current,
+        messages: [
+          ...current.messages,
+          {
+            ...current.messages[0]!,
+            id: MessageId.make("message-web-newer"),
+            createdAt: "2026-07-26T02:01:00.000Z",
+          },
+        ],
       }),
     ).toBeNull();
   });
