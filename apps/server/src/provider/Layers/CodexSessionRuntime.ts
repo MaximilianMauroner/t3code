@@ -27,6 +27,7 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
@@ -141,6 +142,10 @@ export interface CodexSessionRuntimeShape {
   readonly rollbackThread: (
     numTurns: number,
   ) => Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
+  readonly readAccountRateLimits: Effect.Effect<
+    EffectCodexSchema.V2GetAccountRateLimitsResponse,
+    CodexSessionRuntimeError
+  >;
   readonly respondToRequest: (
     requestId: ApprovalRequestId,
     decision: ProviderApprovalDecision,
@@ -724,6 +729,8 @@ export const makeCodexSessionRuntime = (
     const pendingUserInputsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingUserInput>());
     const collabReceiverTurnsRef = yield* Ref.make(new Map<string, TurnId>());
     const closedRef = yield* Ref.make(false);
+    const initializedRef = yield* Ref.make(false);
+    const initializeSemaphore = yield* Semaphore.make(1);
 
     // `~` is not shell-expanded when env vars are set via
     // `child_process.spawn`; `expandHomePath` lets a configured
@@ -766,6 +773,14 @@ export const makeCodexSessionRuntime = (
     );
     const client = yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
       Effect.provide(clientContext),
+    );
+    const ensureInitialized = initializeSemaphore.withPermits(1)(
+      Effect.gen(function* () {
+        if (yield* Ref.get(initializedRef)) return;
+        yield* client.request("initialize", buildCodexInitializeParams());
+        yield* client.notify("initialized", undefined);
+        yield* Ref.set(initializedRef, true);
+      }),
     );
     const serverNotifications = yield* Queue.unbounded<CodexServerNotification>();
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -1214,8 +1229,7 @@ export const makeCodexSessionRuntime = (
 
     const start = Effect.fn("CodexSessionRuntime.start")(function* () {
       yield* emitSessionEvent("session/connecting", "Starting Codex App Server session.");
-      yield* client.request("initialize", buildCodexInitializeParams());
-      yield* client.notify("initialized", undefined);
+      yield* ensureInitialized;
 
       const requestedModel = normalizeCodexModelSlug(options.model);
 
@@ -1277,6 +1291,9 @@ export const makeCodexSessionRuntime = (
     return {
       start,
       getSession: Ref.get(sessionRef),
+      readAccountRateLimits: ensureInitialized.pipe(
+        Effect.andThen(client.request("account/rateLimits/read", undefined)),
+      ),
       sendTurn: (input) =>
         Effect.gen(function* () {
           const providerThreadId = yield* readProviderThreadId;

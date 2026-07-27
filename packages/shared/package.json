@@ -11,6 +11,10 @@
       "types": "./src/model.ts",
       "import": "./src/model.ts"
     },
+    "./codexUsage": {
+      "types": "./src/codexUsage.ts",
+      "import": "./src/codexUsage.ts"
+    },
     "./advertisedEndpoint": {
       "types": "./src/advertisedEndpoint.ts",
       "import": "./src/advertisedEndpoint.ts"

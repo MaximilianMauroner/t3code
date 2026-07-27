@@ -34,6 +34,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as CodexErrors from "effect-codex-app-server/errors";
+import type * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -116,6 +117,21 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
   );
 
   public readonly closeImpl = vi.fn(() => Promise.resolve(undefined));
+  public readonly readAccountRateLimitsImpl = vi.fn(
+    (): Promise<EffectCodexSchema.V2GetAccountRateLimitsResponse> =>
+      Promise.resolve({
+        rateLimits: {
+          limitId: "codex",
+          primary: { usedPercent: 25, windowDurationMins: 300 },
+        },
+        rateLimitsByLimitId: {
+          "gpt-5.3-codex": {
+            limitId: "gpt-5.3-codex",
+            primary: { usedPercent: 40, windowDurationMins: 300 },
+          },
+        },
+      }),
+  );
 
   readonly options: CodexSessionRuntimeOptions;
 
@@ -128,6 +144,7 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
   }
 
   getSession = Effect.promise(() => this.startImpl());
+  readAccountRateLimits = Effect.promise(() => this.readAccountRateLimitsImpl());
 
   sendTurn(input: CodexSessionRuntimeSendTurnInput) {
     return Effect.promise(() => this.sendTurnImpl(input));
@@ -241,6 +258,22 @@ const validationLayer = it.layer(
 );
 
 validationLayer("CodexAdapterLive validation", (it) => {
+  it.effect("reads model-specific usage without starting a thread", () =>
+    Effect.gen(function* () {
+      validationRuntimeFactory.factory.mockClear();
+      const adapter = yield* CodexAdapter;
+      const usage = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+
+      NodeAssert.equal(validationRuntimeFactory.factory.mock.calls.length, 1);
+      NodeAssert.equal(validationRuntimeFactory.lastRuntime?.startImpl.mock.calls.length, 0);
+      NodeAssert.deepStrictEqual(
+        usage?.windows.map((window) => window.remainingPercent),
+        [60],
+      );
+      NodeAssert.equal(usage?.model, "gpt-5.3-codex");
+      validationRuntimeFactory.factory.mockClear();
+    }),
+  );
   it.effect("returns validation error for non-codex provider on startSession", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;

@@ -11,6 +11,7 @@ import {
   type CanonicalItemType,
   type CanonicalRequestType,
   type CodexSettings,
+  type CodexUsageSnapshot,
   EventId,
   ProviderDriverKind,
   type ProviderEvent,
@@ -42,6 +43,7 @@ import * as CodexErrors from "effect-codex-app-server/errors";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
+import { resolveCodexUsageSnapshot, type CodexUsageRawPayload } from "@t3tools/shared/codexUsage";
 import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 
@@ -162,6 +164,17 @@ function readPayload<A>(
 ): A | undefined {
   const isPayload = Schema.is(schema);
   return isPayload(payload) ? payload : undefined;
+}
+
+function readRateLimitsUpdate(payload: ProviderEvent["payload"]) {
+  const wrapped = readPayload(EffectCodexSchema.V2AccountRateLimitsUpdatedNotification, payload);
+  return (
+    wrapped?.rateLimits ??
+    readPayload(
+      EffectCodexSchema.V2AccountRateLimitsUpdatedNotification__RateLimitSnapshot,
+      payload,
+    )
+  );
 }
 
 function trimText(value: string | undefined | null): string | undefined {
@@ -1395,6 +1408,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
   const runtimeEventQueue = yield* Queue.unbounded<ProviderAdapterOutput>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
+  let cachedCodexUsagePayload: CodexUsageRawPayload | null = null;
+  let cachedCodexUsageSource: "read" | "notification" = "read";
   const startEpochs = new Map<ThreadId, number>();
   const transitions = yield* makeTargetTransitionLock();
   const invalidateStart = (threadId: ThreadId) =>
@@ -1492,6 +1507,27 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 event.threadId,
                 Effect.gen(function* () {
                   yield* writeNativeEvent(event);
+                  if (event.method === "account/rateLimits/updated") {
+                    const update = readRateLimitsUpdate(event.payload);
+                    const limitId = update?.limitId?.trim();
+                    if (cachedCodexUsagePayload && update && limitId) {
+                      cachedCodexUsagePayload = {
+                        ...cachedCodexUsagePayload,
+                        rateLimits:
+                          cachedCodexUsagePayload.rateLimits?.limitId === limitId
+                            ? { ...cachedCodexUsagePayload.rateLimits, ...update }
+                            : cachedCodexUsagePayload.rateLimits,
+                        rateLimitsByLimitId: {
+                          ...cachedCodexUsagePayload.rateLimitsByLimitId,
+                          [limitId]: {
+                            ...cachedCodexUsagePayload.rateLimitsByLimitId?.[limitId],
+                            ...update,
+                          },
+                        },
+                      };
+                      cachedCodexUsageSource = "notification";
+                    }
+                  }
                   const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
                   if (runtimeEvents.length === 0) {
                     yield* Effect.logDebug("ignoring unhandled Codex provider event", {
@@ -1809,6 +1845,81 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const hasSession: CodexAdapterShape["hasSession"] = (threadId) =>
     Effect.succeed(Boolean(sessions.get(threadId) && !sessions.get(threadId)?.stopped));
 
+  const readCodexUsageWithoutSession = Effect.fn("readCodexUsageWithoutSession")(function* () {
+    const usageThreadId = ThreadId.make("codex-usage");
+    const createRuntime = options?.makeRuntime ?? makeCodexSessionRuntime;
+    return yield* Effect.acquireUseRelease(
+      Scope.make("sequential"),
+      (usageScope) =>
+        Effect.gen(function* () {
+          const runtime = yield* createRuntime({
+            threadId: usageThreadId,
+            providerInstanceId: boundInstanceId,
+            cwd: process.cwd(),
+            binaryPath: codexConfig.binaryPath,
+            launchArgs: resolveCodexLaunchArgs(codexConfig.launchArgs, options?.environment),
+            ...(options?.environment ? { environment: options.environment } : {}),
+            ...(codexConfig.homePath ? { homePath: codexConfig.homePath } : {}),
+            runtimeMode: "full-access",
+          }).pipe(
+            Effect.provideService(Scope.Scope, usageScope),
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId: usageThreadId,
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+          );
+          return yield* runtime.readAccountRateLimits.pipe(
+            Effect.mapError((cause) =>
+              mapCodexRuntimeError(usageThreadId, "account/rateLimits/read", cause),
+            ),
+            Effect.ensuring(runtime.close),
+          );
+        }),
+      (usageScope) => Scope.close(usageScope, Exit.void),
+    );
+  });
+
+  const readCodexUsage: NonNullable<CodexAdapterShape["readCodexUsage"]> = Effect.fn(
+    "CodexAdapter.readCodexUsage",
+  )(
+    function* (model): Effect.fn.Return<CodexUsageSnapshot | null, ProviderAdapterError> {
+      const session = Array.from(sessions.values()).findLast((candidate) => !candidate.stopped);
+      const payload = yield* session
+        ? session.runtime.readAccountRateLimits.pipe(
+            Effect.mapError((cause) =>
+              mapCodexRuntimeError(session.threadId, "account/rateLimits/read", cause),
+            ),
+          )
+        : readCodexUsageWithoutSession();
+      cachedCodexUsagePayload = payload;
+      cachedCodexUsageSource = "read";
+      return resolveCodexUsageSnapshot({
+        providerInstanceId: boundInstanceId,
+        model,
+        payload,
+        source: "read",
+      });
+    },
+    Effect.catch((error) =>
+      cachedCodexUsagePayload
+        ? Effect.succeed(
+            resolveCodexUsageSnapshot({
+              providerInstanceId: boundInstanceId,
+              model,
+              payload: cachedCodexUsagePayload,
+              source: cachedCodexUsageSource === "notification" ? "notification" : "cache",
+            }),
+          )
+        : Effect.fail(error),
+    ),
+  );
+
   const requestLivenessSample: CodexAdapterShape["requestLivenessSample"] = (
     threadId,
     markerId,
@@ -1896,6 +2007,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     listSessions,
     hasSession,
     requestLivenessSample,
+    readCodexUsage,
     stopAll,
     get streamEvents() {
       return Stream.fromQueue(runtimeEventQueue).pipe(Stream.filter(isProviderRuntimeEvent));
