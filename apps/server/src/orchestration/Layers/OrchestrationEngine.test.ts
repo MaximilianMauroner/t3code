@@ -21,6 +21,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { describe, expect, it } from "vite-plus/test";
 
 import { PersistenceSqlError } from "../../persistence/Errors.ts";
@@ -88,7 +89,7 @@ async function createOrchestrationSystem(
     Layer.provide(OrchestrationEventStoreLive),
     Layer.provide(OrchestrationCommandReceiptRepositoryLive),
     Layer.provide(RepositoryIdentityResolver.layer),
-    Layer.provide(SqlitePersistenceMemory),
+    Layer.provideMerge(SqlitePersistenceMemory),
     Layer.provideMerge(ServerConfigLayer),
     Layer.provideMerge(NodeServices.layer),
   );
@@ -101,11 +102,13 @@ async function createOrchestrationSystem(
   );
   const deliveries = await runtime.runPromise(Effect.service(OrchestrationReactorDeliveries));
   const turns = await runtime.runPromise(Effect.service(ProjectionTurnRepository));
+  const sql = await runtime.runPromise(Effect.service(SqlClient.SqlClient));
   return {
     engine,
     maintenanceGate,
     deliveries,
     turns,
+    sql,
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
     dispose: () => runtime.dispose(),
@@ -205,6 +208,81 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("reference-counts uncertain predecessors while preserving pure external commands", async () => {
+    const system = await createOrchestrationSystem();
+    const projectId = asProjectId("project-uncertain-admission");
+    const threadId = ThreadId.make("thread-uncertain-admission");
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "project.create",
+        commandId: CommandId.make("cmd-uncertain-project"),
+        projectId,
+        title: "Uncertain admission",
+        workspaceRoot: "/tmp/project-uncertain-admission",
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.create",
+        commandId: CommandId.make("cmd-uncertain-thread"),
+        threadId,
+        projectId,
+        title: "Uncertain admission",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    const hotCommand = {
+      type: "thread.turn.start" as const,
+      commandId: CommandId.make("cmd-uncertain-start"),
+      threadId,
+      message: {
+        messageId: asMessageId("message-uncertain"),
+        role: "user" as const,
+        text: "must wait",
+        attachments: [],
+      },
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      createdAt: now(),
+    };
+
+    await system.run(system.engine.blockExternalHotAdmission("delivery-a"));
+    await system.run(system.engine.blockExternalHotAdmission("delivery-b"));
+    await system.run(system.engine.blockExternalHotAdmission("delivery-a"));
+    await expect(system.run(system.engine.dispatchExternal(hotCommand))).rejects.toMatchObject({
+      _tag: "orchestration_not_ready",
+      phase: "reconciling",
+      retryable: true,
+    });
+    await expect(
+      system.run(
+        system.engine.dispatchExternal({
+          type: "thread.meta.update",
+          commandId: CommandId.make("cmd-uncertain-safe-meta"),
+          threadId,
+          title: "Safe update",
+        }),
+      ),
+    ).resolves.toEqual({ sequence: expect.any(Number) });
+
+    await system.run(system.engine.openExternalAdmission);
+    await system.run(system.engine.releaseExternalHotAdmissionBlocker("delivery-a"));
+    await expect(system.run(system.engine.dispatchExternal(hotCommand))).rejects.toMatchObject({
+      phase: "reconciling",
+    });
+    await system.run(system.engine.releaseExternalHotAdmissionBlocker("delivery-b"));
+    await expect(system.run(system.engine.dispatchExternal(hotCommand))).resolves.toEqual({
+      sequence: expect.any(Number),
+    });
+    await system.dispose();
+  });
+
   it("atomically cancels an absent-session pending start and preserves its message", async () => {
     const system = await createOrchestrationSystem();
     const projectId = asProjectId("project-pending-recovery");
@@ -261,6 +339,7 @@ describe("OrchestrationEngine", () => {
         deliveryId: pending.deliveryId,
         sourceEventId: pending.sourceEventId,
         expectedSession: { kind: "absent" as const },
+        expectedDeliveryOwnership: { status: "pending" as const },
       },
       reason: "server-restarted" as const,
       interruptionCode: "server_restart" as const,
@@ -282,6 +361,117 @@ describe("OrchestrationEngine", () => {
     expect(
       thread.activities.filter((activity) => activity.kind === "session.start.interrupted"),
     ).toHaveLength(1);
+
+    await system.run(
+      system.engine.dispatchExternal({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-claimed-pending-start"),
+        threadId,
+        message: {
+          messageId: asMessageId("message-claimed-pending"),
+          role: "user",
+          text: "preserve exact ownership",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: "2026-01-01T00:00:04.000Z",
+      }),
+    );
+    const claimedPending = (await system.run(system.deliveries.listPendingOrdered()))[0]!;
+    const claimToken = "current-recovery-claim";
+    expect(
+      Option.getOrThrow(
+        await system.run(
+          system.deliveries.claimNext({
+            claimToken,
+            currentBootId: "boot-current",
+            claimedAt: "2026-01-01T00:00:05.000Z",
+            leaseExpiresAt: "2026-01-01T00:05:05.000Z",
+          }),
+        ),
+      ).deliveryId,
+    ).toBe(claimedPending.deliveryId);
+    const claimedRecoveryBase = {
+      ...recovery,
+      commandId: CommandId.make("recovery-claimed-base"),
+      target: {
+        ...recovery.target,
+        pendingMessageId: asMessageId("message-claimed-pending"),
+        deliveryId: claimedPending.deliveryId,
+        sourceEventId: claimedPending.sourceEventId,
+      },
+      detectedAt: "2026-01-01T00:00:06.000Z",
+      createdAt: "2026-01-01T00:00:06.000Z",
+    };
+    const sequenceBeforeOwnershipChecks = await system.run(system.engine.latestSequence);
+    await expect(
+      system.run(
+        system.engine.dispatchInternal({
+          ...claimedRecoveryBase,
+          commandId: CommandId.make("recovery-stale-pending-owner"),
+          target: {
+            ...claimedRecoveryBase.target,
+            expectedDeliveryOwnership: { status: "pending" },
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({
+      _tag: "OrchestrationCommandInvariantError",
+      detail: "Recovery start delivery no longer matches pending durable state.",
+    });
+    await expect(
+      system.run(
+        system.engine.dispatchInternal({
+          ...claimedRecoveryBase,
+          commandId: CommandId.make("recovery-wrong-claim-owner"),
+          target: {
+            ...claimedRecoveryBase.target,
+            expectedDeliveryOwnership: {
+              status: "delivering",
+              claimToken: "stale-recovery-claim",
+            },
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({
+      _tag: "OrchestrationCommandInvariantError",
+      detail: "Recovery start delivery no longer matches pending durable state.",
+    });
+    expect(await system.run(system.engine.latestSequence)).toBe(sequenceBeforeOwnershipChecks);
+
+    const exactClaimRecovery = {
+      ...claimedRecoveryBase,
+      commandId: CommandId.make("recovery-exact-claim-owner"),
+      target: {
+        ...claimedRecoveryBase.target,
+        expectedDeliveryOwnership: { status: "delivering" as const, claimToken },
+      },
+    };
+    await system.run(
+      system.sql.unsafe(`
+        CREATE TRIGGER fail_atomic_pending_recovery
+        BEFORE UPDATE OF status ON orchestration_reactor_deliveries
+        WHEN NEW.status = 'cancelled'
+        BEGIN
+          SELECT RAISE(ABORT, 'injected recovery terminal fault');
+        END
+      `),
+    );
+    await expect(
+      system.run(system.engine.dispatchInternal(exactClaimRecovery)),
+    ).rejects.toBeDefined();
+    expect(await system.run(system.engine.latestSequence)).toBe(sequenceBeforeOwnershipChecks);
+    expect(
+      Option.getOrThrow(await system.run(system.deliveries.getById(claimedPending.deliveryId)))
+        .status,
+    ).toBe("delivering");
+    await system.run(system.sql.unsafe("DROP TRIGGER fail_atomic_pending_recovery"));
+    await system.run(system.engine.dispatchInternal(exactClaimRecovery));
+    expect(
+      Option.getOrThrow(await system.run(system.deliveries.getById(claimedPending.deliveryId)))
+        .status,
+    ).toBe("cancelled");
     await system.dispose();
   });
 
@@ -356,6 +546,7 @@ describe("OrchestrationEngine", () => {
             deliveryId: originalDelivery.deliveryId,
             sourceEventId: originalDelivery.sourceEventId,
             expectedSession: { kind: "absent" },
+            expectedDeliveryOwnership: { status: "pending" },
           },
           reason: "server-restarted",
           interruptionCode: "server_restart",

@@ -12,6 +12,7 @@ it("derives recovery ids from target equality, boot, and reason rather than obse
       deliveryId: "delivery-1",
       sourceEventId: EventId.make("event-1"),
       expectedSession: { kind: "absent" as const },
+      expectedDeliveryOwnership: { status: "pending" as const },
     },
     serverBootId: "boot-2",
     reason: "server-restarted" as const,

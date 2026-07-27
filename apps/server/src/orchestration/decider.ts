@@ -1100,6 +1100,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             ? { executionLastObservedAt: command.executionLastObservedAt }
             : {}),
           expectedSession: command.target.expectedSession,
+          expectedDeliveryOwnership: command.target.expectedDeliveryOwnership,
           serverBootId: command.serverBootId,
         },
       };

@@ -1206,10 +1206,20 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
             threadId: event.payload.threadId,
           });
-          yield* reactorDeliveries.markCancelled(
+          const expectedOwnership = event.payload.expectedDeliveryOwnership;
+          const cancelled = yield* reactorDeliveries.markCancelled(
             event.payload.deliveryId,
             event.payload.detectedAt,
+            expectedOwnership?.status === "delivering" ? expectedOwnership.claimToken : undefined,
           );
+          if (!cancelled && expectedOwnership !== undefined) {
+            const current = yield* reactorDeliveries.getById(event.payload.deliveryId);
+            if (Option.isNone(current) || current.value.status !== "cancelled") {
+              return yield* Effect.die(
+                `pending-start recovery lost exact delivery ownership for ${event.payload.deliveryId}`,
+              );
+            }
+          }
           return;
         }
 

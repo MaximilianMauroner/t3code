@@ -43,6 +43,8 @@ import {
 import { OutputPressureMonitor } from "../../diagnostics/OutputPressureMonitor.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { OrchestrationReactorDeliveries } from "../../persistence/Services/OrchestrationReactorDeliveries.ts";
+import { OrchestrationReactorDeliveriesLive } from "../../persistence/Layers/OrchestrationReactorDeliveries.ts";
 import { isGitRepository } from "../../git/Utils.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -766,6 +768,7 @@ const makeProviderRuntimeIngestion = Effect.fn("makeProviderRuntimeIngestion")(f
   const outputPressureMonitor = yield* OutputPressureMonitor;
   const serverBootId = (yield* ServerBootIdentity).id;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
+  const reactorDeliveries = yield* OrchestrationReactorDeliveries;
   const serverSettingsService = yield* ServerSettingsService;
   const providerCommandId = (event: ProviderRuntimeEvent, tag: string) =>
     crypto.randomUUIDv4.pipe(
@@ -1421,6 +1424,12 @@ const makeProviderRuntimeIngestion = Effect.fn("makeProviderRuntimeIngestion")(f
       let providerExitRecovered = false;
       if (event.type === "session.exited") {
         const expectedSession = expectedSessionForRecovery(thread);
+        const pendingDelivery =
+          Option.isSome(pendingTurnStart) &&
+          pendingTurnStart.value.pendingDeliveryId !== undefined &&
+          pendingTurnStart.value.pendingDeliveryId !== null
+            ? yield* reactorDeliveries.getById(pendingTurnStart.value.pendingDeliveryId)
+            : Option.none();
         const target =
           thread.latestTurn?.state === "running" &&
           thread.session?.activeTurnId === thread.latestTurn.turnId
@@ -1434,13 +1443,16 @@ const makeProviderRuntimeIngestion = Effect.fn("makeProviderRuntimeIngestion")(f
                 pendingTurnStart.value.pendingDeliveryId !== undefined &&
                 pendingTurnStart.value.pendingDeliveryId !== null &&
                 pendingTurnStart.value.pendingEventId !== undefined &&
-                pendingTurnStart.value.pendingEventId !== null
+                pendingTurnStart.value.pendingEventId !== null &&
+                Option.isSome(pendingDelivery) &&
+                pendingDelivery.value.status === "pending"
               ? {
                   kind: "pendingStart" as const,
                   pendingMessageId: pendingTurnStart.value.messageId,
                   deliveryId: pendingTurnStart.value.pendingDeliveryId,
                   sourceEventId: EventId.make(pendingTurnStart.value.pendingEventId),
                   expectedSession,
+                  expectedDeliveryOwnership: { status: "pending" as const },
                 }
               : undefined;
         if (target !== undefined) {
@@ -2073,10 +2085,14 @@ const makeProviderRuntimeIngestion = Effect.fn("makeProviderRuntimeIngestion")(f
 export const ProviderRuntimeIngestionLive = Layer.effect(
   ProviderRuntimeIngestionService,
   makeProviderRuntimeIngestion(),
-).pipe(Layer.provide(ProjectionTurnRepositoryLive));
+).pipe(
+  Layer.provide(ProjectionTurnRepositoryLive),
+  Layer.provide(OrchestrationReactorDeliveriesLive),
+);
 
 export function makeProviderRuntimeIngestionLive(options: ProviderRuntimeIngestionLiveOptions) {
   return Layer.effect(ProviderRuntimeIngestionService, makeProviderRuntimeIngestion(options)).pipe(
     Layer.provide(ProjectionTurnRepositoryLive),
+    Layer.provide(OrchestrationReactorDeliveriesLive),
   );
 }

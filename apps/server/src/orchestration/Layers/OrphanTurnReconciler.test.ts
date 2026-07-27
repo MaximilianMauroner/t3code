@@ -332,6 +332,7 @@ describe("OrphanTurnReconciler liveness matching", () => {
         deliveryId: "delivery-pending",
         sourceEventId: EventId.make("event-pending"),
         expectedSession: { kind: "absent" },
+        expectedDeliveryOwnership: { status: "pending" },
       },
     };
     expect(

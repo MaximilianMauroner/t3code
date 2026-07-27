@@ -5,7 +5,11 @@ import type {
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
-import { OrchestrationCommand, OrchestrationNotReadyError } from "@t3tools/contracts";
+import {
+  OrchestrationCommand,
+  OrchestrationEvent as OrchestrationEventSchema,
+  OrchestrationNotReadyError,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
@@ -67,6 +71,7 @@ const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
+const isOrchestrationEvent = Schema.is(OrchestrationEventSchema);
 
 interface CommandEnvelope {
   readonly _tag: "command";
@@ -128,6 +133,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const admissionLock = yield* Semaphore.make(1);
   let sealed = false;
   let externalAdmissionClosed = true;
+  const externalHotAdmissionBlockers = new Set<string>();
   let nextReservationId = 0;
   const activeReservationIds = new Set<number>();
   let reservationsDrained = yield* Deferred.make<void>();
@@ -271,12 +277,26 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                       const delivery = yield* reactorDeliveries.getById(
                         envelope.command.target.deliveryId,
                       );
+                      const deliveryEvent = Option.isSome(delivery)
+                        ? delivery.value.payload
+                        : undefined;
                       if (
                         Option.isNone(delivery) ||
+                        delivery.value.deliveryKind !== "turn-start" ||
+                        delivery.value.reactor !== "provider-command" ||
                         delivery.value.sourceEventId !== envelope.command.target.sourceEventId ||
                         delivery.value.threadId !== envelope.command.threadId ||
-                        (delivery.value.status !== "pending" &&
-                          delivery.value.status !== "delivering")
+                        !isOrchestrationEvent(deliveryEvent) ||
+                        deliveryEvent.type !== "thread.turn-start-requested" ||
+                        deliveryEvent.eventId !== envelope.command.target.sourceEventId ||
+                        deliveryEvent.payload.threadId !== envelope.command.threadId ||
+                        deliveryEvent.payload.messageId !==
+                          envelope.command.target.pendingMessageId ||
+                        (envelope.command.target.expectedDeliveryOwnership.status === "pending"
+                          ? delivery.value.status !== "pending"
+                          : delivery.value.status !== "delivering" ||
+                            delivery.value.claimToken !==
+                              envelope.command.target.expectedDeliveryOwnership.claimToken)
                       ) {
                         return yield* new OrchestrationCommandInvariantError({
                           commandType: envelope.command.type,
@@ -476,12 +496,19 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               phase: "sealed",
             });
           }
-          if (externalEffect !== null && externalAdmissionClosed && externalEffect === "hot") {
+          if (
+            externalEffect !== null &&
+            externalEffect === "hot" &&
+            (externalAdmissionClosed || externalHotAdmissionBlockers.size > 0)
+          ) {
             return yield* new OrchestrationNotReadyError({
-              message: "Orchestration is quiescing.",
+              message:
+                externalHotAdmissionBlockers.size > 0
+                  ? "Orchestration is reconciling an uncertain external execution."
+                  : "Orchestration is quiescing.",
               retryable: true,
               retryAfterMs: 1_000,
-              phase: "quiescing",
+              phase: externalHotAdmissionBlockers.size > 0 ? "reconciling" : "quiescing",
             });
           }
           const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
@@ -544,14 +571,20 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           Effect.gen(function* () {
             yield* restore(admissionLock.take(1));
             return yield* Effect.gen(function* () {
-              if (sealed || externalAdmissionClosed) {
+              if (sealed || externalAdmissionClosed || externalHotAdmissionBlockers.size > 0) {
                 return yield* new OrchestrationNotReadyError({
                   message: sealed
                     ? "Orchestration engine is sealed."
-                    : "Orchestration is quiescing.",
+                    : externalHotAdmissionBlockers.size > 0
+                      ? "Orchestration is reconciling an uncertain external execution."
+                      : "Orchestration is quiescing.",
                   retryable: !sealed,
                   retryAfterMs: sealed ? 0 : 1_000,
-                  phase: sealed ? "sealed" : "quiescing",
+                  phase: sealed
+                    ? "sealed"
+                    : externalHotAdmissionBlockers.size > 0
+                      ? "reconciling"
+                      : "quiescing",
                 });
               }
               if (activeReservationIds.size === 0) {
@@ -626,6 +659,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                     phase: "sealed",
                   });
                 }
+                if (externalHotAdmissionBlockers.size > 0) {
+                  return yield* new OrchestrationNotReadyError({
+                    message: "Orchestration is reconciling an uncertain external execution.",
+                    retryable: true,
+                    retryAfterMs: 1_000,
+                    phase: "reconciling",
+                  });
+                }
                 if (!Equal.equals(command, reservedCommand)) {
                   return yield* new OrchestrationNotReadyError({
                     message: "Bootstrap reservation only accepts its exact command.",
@@ -695,6 +736,21 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         if (!sealed) externalAdmissionClosed = false;
       }),
     );
+  const blockExternalHotAdmission: OrchestrationEngineShape["blockExternalHotAdmission"] = (
+    blockerId,
+  ) =>
+    admissionLock.withPermits(1)(
+      Effect.sync(() => {
+        externalHotAdmissionBlockers.add(blockerId);
+      }),
+    );
+  const releaseExternalHotAdmissionBlocker: OrchestrationEngineShape["releaseExternalHotAdmissionBlocker"] =
+    (blockerId) =>
+      admissionLock.withPermits(1)(
+        Effect.sync(() => {
+          externalHotAdmissionBlockers.delete(blockerId);
+        }),
+      );
   const barrier: OrchestrationEngineShape["barrier"] = Effect.gen(function* () {
     const pendingReservations = yield* admissionLock.withPermits(1)(
       Effect.succeed(reservationsDrained),
@@ -806,6 +862,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     reserveExternalHotAdmission,
     closeExternalAdmission,
     openExternalAdmission,
+    blockExternalHotAdmission,
+    releaseExternalHotAdmissionBlocker,
     barrier,
     sealAndStop,
     forceStop,

@@ -189,6 +189,8 @@ describe("OrchestrationDeliveryRuntime", () => {
     readonly checkpointDeliver?: CheckpointReactor["Service"]["deliver"];
     readonly dispatchInternal?: OrchestrationEngineService["Service"]["dispatchInternal"];
     readonly closeExternalAdmission?: OrchestrationEngineService["Service"]["closeExternalAdmission"];
+    readonly blockExternalHotAdmission?: OrchestrationEngineService["Service"]["blockExternalHotAdmission"];
+    readonly releaseExternalHotAdmissionBlocker?: OrchestrationEngineService["Service"]["releaseExternalHotAdmissionBlocker"];
     readonly thread?: ReturnType<typeof absentSessionThread>;
     readonly getThread?: () => OrchestrationThread | undefined;
     readonly inspectTarget?: NonNullable<ProviderService["Service"]["inspectTarget"]>;
@@ -209,8 +211,27 @@ describe("OrchestrationDeliveryRuntime", () => {
       Layer.provideMerge(repositoryLayer),
       Layer.provideMerge(
         Layer.mock(OrchestrationEngineService)({
-          dispatchInternal: input.dispatchInternal ?? (() => Effect.succeed({ sequence: 1 })),
+          dispatchInternal: (command) =>
+            (input.dispatchInternal ?? (() => Effect.succeed({ sequence: 1 })))(command).pipe(
+              Effect.tap(() =>
+                command.type === "thread.session.interrupt-if-active" &&
+                command.target.kind === "pendingStart"
+                  ? Effect.flatMap(OrchestrationReactorDeliveries, (repository) =>
+                      repository.markCancelled(
+                        command.target.deliveryId,
+                        command.detectedAt,
+                        command.target.expectedDeliveryOwnership.status === "delivering"
+                          ? command.target.expectedDeliveryOwnership.claimToken
+                          : undefined,
+                      ),
+                    )
+                  : Effect.void,
+              ),
+            ),
           closeExternalAdmission: input.closeExternalAdmission ?? Effect.void,
+          blockExternalHotAdmission: input.blockExternalHotAdmission ?? (() => Effect.void),
+          releaseExternalHotAdmissionBlocker:
+            input.releaseExternalHotAdmissionBlocker ?? (() => Effect.void),
           streamDomainEvents: Stream.empty,
         }),
       ),
@@ -465,6 +486,10 @@ describe("OrchestrationDeliveryRuntime", () => {
             deliveryId: delivery.deliveryId,
             sourceEventId: delivery.sourceEventId,
             expectedSession: { kind: "absent" },
+            expectedDeliveryOwnership: {
+              status: "delivering",
+              claimToken: expect.any(String),
+            },
           }),
         }),
       );
@@ -580,6 +605,10 @@ describe("OrchestrationDeliveryRuntime", () => {
               deliveryId: delivery.deliveryId,
               sourceEventId: delivery.sourceEventId,
               expectedSession: { kind: "absent" },
+              expectedDeliveryOwnership: {
+                status: "delivering",
+                claimToken: expect.any(String),
+              },
             }),
           }),
         );
@@ -823,6 +852,86 @@ describe("OrchestrationDeliveryRuntime", () => {
   );
 
   effectIt.effect(
+    "keeps repeated unknown execution blocking until barrier-confirmed atomic settlement",
+    () =>
+      Effect.gen(function* () {
+        const blockExternalHotAdmission = vi.fn((_: string) => Effect.void);
+        const releaseExternalHotAdmissionBlocker = vi.fn((_: string) => Effect.void);
+        const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+          Effect.fail("provider completion became uncertain"),
+        );
+        let sampleCount = 0;
+        const delivery = deliveryFor(turnStartEvent(1, "repeated-unknown"), "current-boot");
+        const row = yield* Effect.gen(function* () {
+          const repository = yield* OrchestrationReactorDeliveries;
+          const runtime = yield* OrchestrationDeliveryRuntime;
+          yield* repository.insert(delivery);
+          yield* runtime.drain;
+          yield* TestClock.adjust("1 second");
+          yield* runtime.drain;
+          yield* TestClock.adjust("1 second");
+          yield* runtime.drain;
+          return Option.getOrThrow(yield* repository.getById(delivery.deliveryId));
+        }).pipe(
+          Effect.provide(
+            createLayer({
+              providerDeliver,
+              thread: absentSessionThread(),
+              blockExternalHotAdmission,
+              releaseExternalHotAdmissionBlocker,
+              inspectTarget: () =>
+                Effect.sync(() => {
+                  sampleCount += 1;
+                  return sampleCount < 3
+                    ? ({ state: "unknown", reason: "unavailable" } as const)
+                    : ({ state: "absent", threadId } as const);
+                }),
+            }),
+          ),
+        );
+
+        expect(row.status).toBe("cancelled");
+        expect(blockExternalHotAdmission).toHaveBeenCalledTimes(2);
+        expect(blockExternalHotAdmission).toHaveBeenNthCalledWith(1, delivery.deliveryId);
+        expect(blockExternalHotAdmission).toHaveBeenNthCalledWith(2, delivery.deliveryId);
+        expect(releaseExternalHotAdmissionBlocker).toHaveBeenCalledOnce();
+        expect(releaseExternalHotAdmissionBlocker).toHaveBeenCalledWith(delivery.deliveryId);
+      }),
+  );
+
+  effectIt.effect("reopens admission when another atomic path terminalizes a blocker", () =>
+    Effect.gen(function* () {
+      const releaseExternalHotAdmissionBlocker = vi.fn((_: string) => Effect.void);
+      const delivery = deliveryFor(turnStartEvent(1, "external-settlement"), "current-boot");
+      const result = yield* Effect.gen(function* () {
+        const repository = yield* OrchestrationReactorDeliveries;
+        const runtime = yield* OrchestrationDeliveryRuntime;
+        yield* repository.insert(delivery);
+        yield* runtime.drain;
+        const deferred = Option.getOrThrow(yield* repository.getById(delivery.deliveryId));
+        yield* repository.markCancelled(delivery.deliveryId, "2026-01-01T00:00:02.000Z");
+        yield* runtime.drain;
+        return deferred;
+      }).pipe(
+        Effect.provide(
+          createLayer({
+            providerDeliver: () => Effect.fail("provider completion became uncertain"),
+            thread: absentSessionThread(),
+            inspectTarget: () =>
+              Effect.succeed({ state: "unknown", reason: "unavailable" } as const),
+            releaseExternalHotAdmissionBlocker,
+          }),
+        ),
+      );
+
+      expect(result.status).toBe("pending");
+      expect(result.executionStartedAt).toEqual(expect.any(String));
+      expect(releaseExternalHotAdmissionBlocker).toHaveBeenCalledOnce();
+      expect(releaseExternalHotAdmissionBlocker).toHaveBeenCalledWith(delivery.deliveryId);
+    }),
+  );
+
+  effectIt.effect(
     "does not terminalize an exact pending start until its conditional recovery commits",
     () =>
       Effect.gen(function* () {
@@ -860,6 +969,47 @@ describe("OrchestrationDeliveryRuntime", () => {
 
         expect(result.beforeCommit).toBe("delivering");
         expect(result.afterCommit).toBe("cancelled");
+      }),
+  );
+
+  effectIt.effect(
+    "does not depend on a second terminal update after atomic pending recovery commits",
+    () =>
+      Effect.gen(function* () {
+        let terminalUpdates = 0;
+        const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+          Effect.fail("provider completion became uncertain"),
+        );
+        const delivery = deliveryFor(turnStartEvent(1, "atomic-recovery"), "current-boot");
+        const row = yield* Effect.gen(function* () {
+          const repository = yield* OrchestrationReactorDeliveries;
+          const runtime = yield* OrchestrationDeliveryRuntime;
+          yield* repository.insert(delivery);
+          yield* runtime.drain;
+          return Option.getOrThrow(yield* repository.getById(delivery.deliveryId));
+        }).pipe(
+          Effect.provide(
+            createLayer({
+              providerDeliver,
+              thread: absentSessionThread(),
+              inspectTarget: () => Effect.succeed({ state: "absent", threadId }),
+              transformRepository: (repository) => ({
+                ...repository,
+                markCancelled: (...args) => {
+                  terminalUpdates += 1;
+                  return terminalUpdates === 1
+                    ? repository.markCancelled(...args)
+                    : Effect.die(
+                        "injected failure after recovery commit before obsolete outer update",
+                      );
+                },
+              }),
+            }),
+          ),
+        );
+
+        expect(row.status).toBe("cancelled");
+        expect(terminalUpdates).toBe(1);
       }),
   );
 
@@ -967,6 +1117,10 @@ describe("OrchestrationDeliveryRuntime", () => {
               deliveryId: delivery.deliveryId,
               sourceEventId: delivery.sourceEventId,
               expectedSession: { kind: "absent" },
+              expectedDeliveryOwnership: {
+                status: "delivering",
+                claimToken: expect.any(String),
+              },
             }),
           }),
         );

@@ -113,6 +113,7 @@ it.effect("decodes recovery contracts while preserving legacy optionality", () =
         deliveryId: "delivery-1",
         sourceEventId: "event-1",
         expectedSession: { kind: "absent" },
+        expectedDeliveryOwnership: { status: "pending" },
       },
       reason: "server-restarted",
       interruptionCode: "server_restart",

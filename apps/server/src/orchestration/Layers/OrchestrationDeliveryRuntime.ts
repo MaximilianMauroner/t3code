@@ -107,6 +107,34 @@ const make = Effect.gen(function* () {
   const bootId = (yield* ServerBootIdentity).id;
   const drainLock = yield* Semaphore.make(1);
   const liveSourceEventIds = new Set<string>();
+  const uncertainBlockerIds = new Set<string>();
+
+  const blockUncertainDelivery = Effect.fn("blockUncertainDelivery")(function* (
+    deliveryId: string,
+  ) {
+    uncertainBlockerIds.add(deliveryId);
+    yield* engine.blockExternalHotAdmission(deliveryId);
+  });
+
+  const releaseUncertainDelivery = Effect.fn("releaseUncertainDelivery")(function* (
+    deliveryId: string,
+  ) {
+    uncertainBlockerIds.delete(deliveryId);
+    yield* engine.releaseExternalHotAdmissionBlocker(deliveryId);
+  });
+
+  const reconcileUncertainBlockers = Effect.fn("reconcileUncertainBlockers")(function* () {
+    for (const deliveryId of uncertainBlockerIds) {
+      const delivery = yield* deliveries.getById(deliveryId);
+      if (
+        Option.isNone(delivery) ||
+        delivery.value.status === "delivered" ||
+        delivery.value.status === "cancelled"
+      ) {
+        yield* releaseUncertainDelivery(deliveryId);
+      }
+    }
+  });
 
   const appendNonReplayCancellationEvidence = Effect.fn("appendNonReplayCancellationEvidence")(
     function* (delivery: OrchestrationReactorDelivery, detail: string, createdAt: string) {
@@ -215,6 +243,7 @@ const make = Effect.gen(function* () {
     delivery: OrchestrationReactorDelivery,
     claimToken: string,
   ) {
+    yield* blockUncertainDelivery(delivery.deliveryId);
     const deferredAtValue = yield* DateTime.now;
     const deferredAt = DateTime.formatIso(deferredAtValue);
     const deferred = yield* deliveries.deferUncertain(
@@ -245,6 +274,12 @@ const make = Effect.gen(function* () {
       readonly genericDetail: string;
     },
   ) {
+    const recoveryClaimToken = delivery.claimToken;
+    if (recoveryClaimToken === null) {
+      return yield* Effect.die(
+        `recovery delivery ${delivery.deliveryId} has no current claim ownership`,
+      );
+    }
     const event = yield* decodeOrchestrationEvent(delivery.payload);
     if (delivery.deliveryKind === "checkpoint-revert") {
       const detectedAt = DateTime.formatIso(yield* DateTime.now);
@@ -355,6 +390,10 @@ const make = Effect.gen(function* () {
             sourceEventId: delivery.sourceEventId,
             expectedSession:
               thread.session === null ? { kind: "absent" } : expectedSessionFrom(thread.session),
+            expectedDeliveryOwnership: {
+              status: "delivering",
+              claimToken: recoveryClaimToken,
+            },
           };
         }
 
@@ -383,7 +422,11 @@ const make = Effect.gen(function* () {
               () => Effect.succeed(false),
             ),
           );
-        if (settled) return "cancelled" as const;
+        if (settled) {
+          return target.kind === "pendingStart"
+            ? ("cancelled-atomically" as const)
+            : ("cancelled" as const);
+        }
       }
 
       yield* Effect.logWarning(
@@ -414,6 +457,10 @@ const make = Effect.gen(function* () {
         deliveryId: delivery.deliveryId,
         sourceEventId: delivery.sourceEventId,
         expectedSession,
+        expectedDeliveryOwnership: {
+          status: "delivering",
+          claimToken: recoveryClaimToken,
+        },
       };
     } else if (
       delivery.deliveryKind !== "runtime-mode-change" &&
@@ -459,7 +506,9 @@ const make = Effect.gen(function* () {
           () => Effect.void,
         ),
       );
-    return "cancelled" as const;
+    return target.kind === "pendingStart"
+      ? ("cancelled-atomically" as const)
+      : ("cancelled" as const);
   });
 
   const processClaimed = Effect.fn("processClaimed")(function* (
@@ -476,7 +525,7 @@ const make = Effect.gen(function* () {
       !liveSourceEventIds.has(delivery.sourceEventId);
     const hasUncertainExecution =
       delivery.replayPolicy === "cancel-with-recovery" && delivery.executionStartedAt !== null;
-    let resolution: "delivered" | "cancelled" | "retained";
+    let resolution: "delivered" | "cancelled" | "cancelled-atomically" | "retained";
     if (shouldCancelPriorExecution) {
       resolution = yield* cancelUncertainExecution(delivery, {
         reason: "server-restarted",
@@ -517,6 +566,11 @@ const make = Effect.gen(function* () {
     if (resolution === "retained") {
       return yield* deferUncertainDelivery(delivery, claimToken);
     }
+    if (resolution === "cancelled-atomically") {
+      liveSourceEventIds.delete(delivery.sourceEventId);
+      yield* releaseUncertainDelivery(delivery.deliveryId);
+      return true;
+    }
     const completedAt = DateTime.formatIso(yield* DateTime.now);
     const transitioned =
       resolution === "delivered"
@@ -526,6 +580,7 @@ const make = Effect.gen(function* () {
       return yield* Effect.die(`delivery claim was lost before terminal transition`);
     }
     liveSourceEventIds.delete(delivery.sourceEventId);
+    yield* releaseUncertainDelivery(delivery.deliveryId);
     return true;
   });
 
@@ -562,6 +617,10 @@ const make = Effect.gen(function* () {
             if (resolution === "retained") {
               return yield* deferUncertainDelivery(claimed.value, claimToken);
             }
+            if (resolution === "cancelled-atomically") {
+              yield* releaseUncertainDelivery(claimed.value.deliveryId);
+              return true;
+            }
             if (resolution === "delivered") {
               const delivered = yield* deliveries.markDelivered(
                 claimed.value.deliveryId,
@@ -573,6 +632,7 @@ const make = Effect.gen(function* () {
                   `non-replay delivery claim was lost before completion could be retained`,
                 );
               }
+              yield* releaseUncertainDelivery(claimed.value.deliveryId);
               return true;
             }
             const cancelled = yield* deliveries.markCancelled(
@@ -585,6 +645,7 @@ const make = Effect.gen(function* () {
                 `non-replay delivery claim was lost before cancellation could be retained`,
               );
             }
+            yield* releaseUncertainDelivery(claimed.value.deliveryId);
             return true;
           }
           const backoffMs =
@@ -635,6 +696,7 @@ const make = Effect.gen(function* () {
     while (yield* processNext) {
       // claimNext enforces the single global predecessor, including poison rows.
     }
+    yield* reconcileUncertainBlockers();
   });
 
   const drain = drainLock

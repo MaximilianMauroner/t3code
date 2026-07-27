@@ -217,6 +217,7 @@ const make = Effect.gen(function* () {
         deliveryId: delivery.deliveryId,
         sourceEventId: delivery.sourceEventId,
         expectedSession: expectedSession(thread),
+        expectedDeliveryOwnership: { status: "pending" },
       };
       candidates.set(delivery.threadId, {
         threadId: delivery.threadId,

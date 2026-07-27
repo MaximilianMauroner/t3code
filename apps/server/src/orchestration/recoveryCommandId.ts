@@ -28,7 +28,16 @@ export function recoveryCommandId(input: {
   const targetToken =
     input.target.kind === "turn"
       ? `turn:${input.target.turnId}`
-      : `pending:${input.target.pendingMessageId}:${input.target.deliveryId}:${input.target.sourceEventId}`;
+      : [
+          "pending",
+          input.target.pendingMessageId,
+          input.target.deliveryId,
+          input.target.sourceEventId,
+          input.target.expectedDeliveryOwnership.status,
+          input.target.expectedDeliveryOwnership.status === "delivering"
+            ? input.target.expectedDeliveryOwnership.claimToken
+            : "unclaimed",
+        ].join(":");
   return CommandId.make(
     [
       "recovery-v1",

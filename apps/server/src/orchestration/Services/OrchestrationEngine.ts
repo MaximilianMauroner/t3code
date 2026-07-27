@@ -77,6 +77,14 @@ export interface OrchestrationEngineShape {
   /** Opens hot external command admission after startup recovery is fully settled. */
   readonly openExternalAdmission: Effect.Effect<void, never, never>;
 
+  /** Fail-closes hot admission while an execution-uncertain durable predecessor exists. */
+  readonly blockExternalHotAdmission: (blockerId: string) => Effect.Effect<void, never, never>;
+
+  /** Releases one execution-uncertain predecessor without affecting lifecycle admission. */
+  readonly releaseExternalHotAdmissionBlocker: (
+    blockerId: string,
+  ) => Effect.Effect<void, never, never>;
+
   /** Reserves one hot enqueue before a bootstrap performs side effects. */
   readonly reserveExternalHotAdmission: (
     command: DispatchableClientOrchestrationCommand,

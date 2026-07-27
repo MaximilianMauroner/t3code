@@ -869,6 +869,16 @@ export const OrchestrationExpectedSession = Schema.Union([
 ]);
 export type OrchestrationExpectedSession = typeof OrchestrationExpectedSession.Type;
 
+export const OrchestrationExpectedDeliveryOwnership = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("pending") }),
+  Schema.Struct({
+    status: Schema.Literal("delivering"),
+    claimToken: TrimmedNonEmptyString,
+  }),
+]);
+export type OrchestrationExpectedDeliveryOwnership =
+  typeof OrchestrationExpectedDeliveryOwnership.Type;
+
 export const OrchestrationRecoveryTarget = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("turn"),
@@ -882,6 +892,7 @@ export const OrchestrationRecoveryTarget = Schema.Union([
     deliveryId: TrimmedNonEmptyString,
     sourceEventId: EventId,
     expectedSession: OrchestrationExpectedSession,
+    expectedDeliveryOwnership: OrchestrationExpectedDeliveryOwnership,
   }),
 ]);
 export type OrchestrationRecoveryTarget = typeof OrchestrationRecoveryTarget.Type;
@@ -1209,6 +1220,7 @@ export const ThreadSessionStartInterruptedPayload = Schema.Struct({
   detectedAt: IsoDateTime,
   executionLastObservedAt: Schema.optional(IsoDateTime),
   expectedSession: Schema.optional(OrchestrationExpectedSession),
+  expectedDeliveryOwnership: Schema.optional(OrchestrationExpectedDeliveryOwnership),
   serverBootId: TrimmedNonEmptyString,
 });
 
