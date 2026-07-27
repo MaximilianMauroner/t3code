@@ -449,6 +449,20 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       if (threadDetail._tag === "Some") {
         assert.deepEqual(threadDetail.value, snapshot.threads[0]);
       }
+
+      assert.equal(snapshotQuery.getActiveTurnCount !== undefined, true);
+      assert.deepEqual(yield* snapshotQuery.getActiveTurnCount!(), { activeTurnCount: 1 });
+      yield* sql`
+        UPDATE projection_threads
+        SET deleted_at = '2026-02-24T00:00:09.000Z'
+        WHERE thread_id = 'thread-1'
+      `;
+      assert.deepEqual(yield* snapshotQuery.getActiveTurnCount!(), { activeTurnCount: 1 });
+      yield* sql`
+        UPDATE projection_threads
+        SET deleted_at = NULL
+        WHERE thread_id = 'thread-1'
+      `;
     }),
   );
 

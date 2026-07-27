@@ -132,13 +132,20 @@ describe("t3code-availability-healthcheck", () => {
     const mockBin = NodePath.join(root, "bin");
     const stateFile = NodePath.join(root, "availability.state");
     const systemctlLog = NodePath.join(root, "systemctl.log");
+    const loggerLog = NodePath.join(root, "logger.log");
+    const activeTurnCountFile = NodePath.join(runtimeDir, "active-turn-count");
     NodeFS.mkdirSync(runtimeDir);
     NodeFS.mkdirSync(mockBin);
     NodeFS.writeFileSync(NodePath.join(runtimeDir, "availability-checker.lock"), "");
     NodeFS.writeFileSync(NodePath.join(runtimeDir, "authority.lock"), "");
+    NodeFS.writeFileSync(activeTurnCountFile, "2\n");
+    NodeFS.utimesSync(activeTurnCountFile, 995, 995);
     executable(NodePath.join(mockBin, "curl"), "#!/bin/sh\nexit 22\n");
     executable(NodePath.join(mockBin, "date"), "#!/bin/sh\nprintf '1000\\n'\n");
-    executable(NodePath.join(mockBin, "logger"), "#!/bin/sh\nexit 0\n");
+    executable(
+      NodePath.join(mockBin, "logger"),
+      '#!/bin/sh\nprintf "%s\\n" "$*" >>"$MOCK_LOGGER_LOG"\n',
+    );
     executable(
       NodePath.join(mockBin, "systemctl"),
       `#!/bin/sh
@@ -155,8 +162,10 @@ esac
     );
     const env = {
       ...process.env,
+      MOCK_LOGGER_LOG: loggerLog,
       PATH: `${mockBin}:${process.env.PATH ?? ""}`,
       MOCK_SYSTEMCTL_LOG: systemctlLog,
+      T3CODE_ACTIVE_TURN_COUNT_FILE: activeTurnCountFile,
       T3CODE_AVAILABILITY_STATE_FILE: stateFile,
       T3CODE_UPDATE_MARKER: NodePath.join(root, "verification.json"),
       T3CODE_WATCHDOG_RUNTIME_DIR: runtimeDir,
@@ -170,6 +179,13 @@ esac
     expect(NodeChildProcess.spawnSync("/bin/sh", [scriptPath], { env }).status).toBe(1);
     expect(NodeFS.readFileSync(systemctlLog, "utf8")).toContain("restart t3code.service");
     expect(NodeFS.readFileSync(stateFile, "utf8")).toContain("failures=0");
+    expect(NodeFS.readFileSync(loggerLog, "utf8")).toContain("active_turn_count=2");
+
+    NodeFS.utimesSync(activeTurnCountFile, 900, 900);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      expect(NodeChildProcess.spawnSync("/bin/sh", [scriptPath], { env }).status).toBe(1);
+    }
+    expect(NodeFS.readFileSync(loggerLog, "utf8")).toContain("active_turn_count=0");
   });
 
   it("rejects a symlinked authority without touching foreign bytes", () => {

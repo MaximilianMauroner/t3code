@@ -88,6 +88,7 @@ import * as ForkUpdate from "./cloud/forkUpdate.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as OutputPressureMonitor from "./diagnostics/OutputPressureMonitor.ts";
+import * as ActiveTurnCountPublisher from "./diagnostics/ActiveTurnCountPublisher.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import {
@@ -349,6 +350,7 @@ const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
   Layer.provideMerge(ProcessDiagnostics.layer),
   Layer.provideMerge(ProcessResourceMonitor.layer),
   Layer.provideMerge(OutputPressureMonitor.layer),
+  Layer.provideMerge(ActiveTurnCountPublisher.layer),
   Layer.provideMerge(TraceDiagnostics.layer),
   Layer.provideMerge(AnalyticsService.layer),
   Layer.provideMerge(ExternalLauncher.layer),

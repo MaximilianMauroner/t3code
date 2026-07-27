@@ -93,6 +93,7 @@ export const make = Effect.fn("OutputPressureMonitor.make")(function* (
     eventLoop: { p50Ms: 0, p95Ms: 0, p99Ms: 0 },
   };
   const latest = yield* Ref.make(initialSnapshot);
+  const eventLoopPressureSinceMs = yield* Ref.make<number | null>(null);
 
   if (enabled) {
     yield* Effect.acquireRelease(
@@ -109,11 +110,21 @@ export const make = Effect.fn("OutputPressureMonitor.make")(function* (
       p99Ms: percentileMs(histogram, 99),
     };
     histogram.reset();
+    const previousPressureSinceMs = yield* Ref.get(eventLoopPressureSinceMs);
+    const pressureSinceMs =
+      eventLoop.p99Ms >= OUTPUT_PRESSURE_SIGNAL_THRESHOLDS.eventLoopP99Ms
+        ? (previousPressureSinceMs ?? sampledAtMs)
+        : null;
+    yield* Ref.set(eventLoopPressureSinceMs, pressureSinceMs);
+    const health =
+      pressureSinceMs !== null &&
+      sampledAtMs - pressureSinceMs >= OUTPUT_PRESSURE_SIGNAL_THRESHOLDS.eventLoopSustainedMs
+        ? "degraded"
+        : "healthy";
     const sample: OutputPressureSnapshot = {
       enabled: true,
       sampledAtMs,
-      health:
-        eventLoop.p99Ms >= OUTPUT_PRESSURE_SIGNAL_THRESHOLDS.healthP99Ms ? "degraded" : "healthy",
+      health,
       eventLoop,
     };
     yield* Ref.set(latest, sample);

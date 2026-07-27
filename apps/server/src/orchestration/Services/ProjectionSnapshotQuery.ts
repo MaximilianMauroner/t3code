@@ -31,6 +31,10 @@ export interface ProjectionSnapshotCounts {
   readonly threadCount: number;
 }
 
+export interface ProjectionActiveTurnCount {
+  readonly activeTurnCount: number;
+}
+
 export interface ProjectionSnapshotSequence {
   readonly snapshotSequence: number;
 }
@@ -128,6 +132,15 @@ export interface ProjectionSnapshotQueryShape {
    * Read aggregate projection counts without hydrating the full read model.
    */
   readonly getCounts: () => Effect.Effect<ProjectionSnapshotCounts, ProjectionRepositoryError>;
+
+  /**
+   * Read the authoritative count of projected sessions with an active turn,
+   * including hidden and deleted threads.
+   */
+  readonly getActiveTurnCount?: () => Effect.Effect<
+    ProjectionActiveTurnCount,
+    ProjectionRepositoryError
+  >;
 
   /**
    * Read the active project for an exact workspace root match.

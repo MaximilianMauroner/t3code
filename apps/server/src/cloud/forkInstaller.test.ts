@@ -230,15 +230,102 @@ describe("fork service bootstrap installer", () => {
     );
   });
 
-  it("installs availability disabled with root-owned tmpfiles authority", () => {
+  it("stages availability disabled with atomic telemetry permissions", () => {
     const tmpfiles = NodeFS.readFileSync(NodePath.join(opsDir, "t3code-watchdog.tmpfiles"), "utf8");
     expect(installer).toContain('install -m 0755 "$script_dir/t3code-availability-healthcheck"');
     expect(installer).toContain('/usr/bin/systemd-tmpfiles --create "$tmpfiles_config"');
-    expect(installer).toContain(
-      '[ "$(systemctl is-enabled t3code-availability-healthcheck.timer 2>/dev/null || true)" = disabled ]',
-    );
+    expect(installer).toContain("systemctl disable --now t3code-availability-healthcheck.timer");
     expect(tmpfiles).toContain("f /run/t3code-watchdog/authority.lock 0660 root t3code-watchdog -");
-    expect(tmpfiles).toContain("d /run/t3code-watchdog 0750 root t3code-watchdog -");
+    expect(tmpfiles).toContain("d /run/t3code-watchdog 3770 root t3code-watchdog -");
+    expect(tmpfiles).toContain(
+      "f /run/t3code-watchdog/active-turn-count 0640 codex t3code-watchdog -",
+    );
+  });
+
+  it("cuts over availability with no recovery gap after staged validation", () => {
+    const transactionStart = installer.indexOf("trap exit_handler EXIT");
+    const legacySnapshot = installer.indexOf('legacy_health_enabled="$(systemctl is-enabled');
+    const stagedDisable = installer.indexOf(
+      "systemctl disable --now t3code-availability-healthcheck.timer",
+      transactionStart,
+    );
+    const restart = installer.indexOf("systemctl restart t3code.service", stagedDisable);
+    const ready = installer.indexOf("wait_for_release_ready", restart);
+    const stagedOneshot = installer.indexOf(
+      "systemctl start t3code-availability-healthcheck.service",
+      ready,
+    );
+    const stagedResult = installer.indexOf(
+      "systemctl show t3code-availability-healthcheck.service -p Result --value",
+      stagedOneshot,
+    );
+    const continuousWatch = installer.indexOf("watch_release_health", stagedResult);
+    const newTimerStart = installer.indexOf(
+      "systemctl enable --now t3code-availability-healthcheck.timer",
+      continuousWatch,
+    );
+    const newTimerActive = installer.indexOf(
+      "systemctl is-active t3code-availability-healthcheck.timer",
+      newTimerStart,
+    );
+    const legacyTimerStop = installer.indexOf(
+      'systemctl disable --now "$legacy_health_timer_unit"',
+      newTimerActive,
+    );
+
+    expect(legacySnapshot).toBeGreaterThan(-1);
+    expect(stagedDisable).toBeGreaterThan(transactionStart);
+    expect(restart).toBeGreaterThan(stagedDisable);
+    expect(ready).toBeGreaterThan(restart);
+    expect(stagedOneshot).toBeGreaterThan(ready);
+    expect(stagedResult).toBeGreaterThan(stagedOneshot);
+    expect(continuousWatch).toBeGreaterThan(stagedResult);
+    expect(newTimerStart).toBeGreaterThan(continuousWatch);
+    expect(newTimerActive).toBeGreaterThan(newTimerStart);
+    expect(legacyTimerStop).toBeGreaterThan(newTimerActive);
+    expect(installer.slice(transactionStart, newTimerActive)).not.toContain(
+      'systemctl disable --now "$legacy_health_timer_unit"',
+    );
+  });
+
+  it("captures and restores exact state for every watchdog timer and service", () => {
+    for (const state of [
+      "health_enabled",
+      "health_active",
+      "health_failed",
+      "health_service_enabled",
+      "health_service_active",
+      "health_service_failed",
+      "availability_enabled",
+      "availability_active",
+      "availability_failed",
+      "availability_service_enabled",
+      "availability_service_active",
+      "availability_service_failed",
+      "legacy_health_enabled",
+      "legacy_health_active",
+      "legacy_health_failed",
+      "legacy_health_service_enabled",
+      "legacy_health_service_active",
+      "legacy_health_service_failed",
+    ]) {
+      expect(installer).toContain(`${state}="$(systemctl`);
+    }
+
+    const restore = installer.slice(
+      installer.indexOf("restore_unit_state() {"),
+      installer.indexOf("\nexit_handler() {"),
+    );
+    expect(restore.match(/if ! restore_unit_state/g)).toHaveLength(6);
+    expect(restore).toContain(
+      '[ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" = "$enabled" ]',
+    );
+    expect(restore).toContain(
+      '[ "$(systemctl is-active "$unit" 2>/dev/null || true)" = "$active" ]',
+    );
+    expect(restore).toContain(
+      '[ "$(systemctl is-failed "$unit" 2>/dev/null || true)" = "$failed" ]',
+    );
   });
 
   it("pins the package.json pnpm version through fixed offline Corepack", () => {
@@ -449,7 +536,7 @@ describe("fork service bootstrap installer", () => {
     }
   });
 
-  it("restarts, waits, watches, then enables health checks with scoped reset-failed", () => {
+  it("restarts, waits, watches, then enables both repository-owned health checks", () => {
     const installReloadIndex = installer.lastIndexOf(
       "systemctl daemon-reload",
       installer.indexOf("systemctl show t3code.service"),
@@ -470,10 +557,7 @@ describe("fork service bootstrap installer", () => {
     expect(readinessIndex).toBeGreaterThan(restartIndex);
     expect(watchIndex).toBeGreaterThan(readinessIndex);
     expect(timerIndex).toBeGreaterThan(watchIndex);
-    expect(installer).toContain(
-      "systemctl daemon-reload || true\n  systemctl reset-failed t3code-fork-healthcheck.timer t3code-fork-healthcheck.service t3code-availability-healthcheck.timer t3code-availability-healthcheck.service || true",
-    );
-    expect(installer.match(/systemctl reset-failed/g)).toHaveLength(3);
+    expect(installer.match(/systemctl reset-failed/g)).toHaveLength(2);
     expect(installer).not.toMatch(/reset-failed[^\n]*nightly/);
   });
 
@@ -669,14 +753,24 @@ describe("fork service bootstrap installer", () => {
           'tmpfiles_config="$HARNESS_ROOT/tmpfiles.conf"',
           "health_enabled=disabled",
           "health_active=inactive",
+          "health_failed=inactive",
           "health_service_active=inactive",
           "health_service_enabled=static",
           "health_service_failed=inactive",
           "availability_enabled=disabled",
           "availability_active=inactive",
+          "availability_failed=inactive",
           "availability_service_active=inactive",
           "availability_service_enabled=not-found",
           "availability_service_failed=not-found",
+          'legacy_health_timer_unit="t3code-healthcheck.timer"',
+          'legacy_health_service_unit="t3code-healthcheck.service"',
+          "legacy_health_enabled=not-found",
+          "legacy_health_active=inactive",
+          "legacy_health_failed=inactive",
+          "legacy_health_service_enabled=not-found",
+          "legacy_health_service_active=inactive",
+          "legacy_health_service_failed=inactive",
           "service_active=inactive",
           'release_update_lock() { printf "%s\\n" released >"$LOCK_RELEASE"; }',
           'if rollback; then printf "%s\\n" 0 >"$ROLLBACK_STATUS";',

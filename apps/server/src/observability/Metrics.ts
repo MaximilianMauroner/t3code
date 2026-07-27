@@ -65,6 +65,10 @@ export const providerRuntimeEventsTotal = Metric.counter("t3_provider_runtime_ev
   description: "Total canonical provider runtime events processed.",
 });
 
+export const activeTurns = Metric.gauge("t3_active_turns", {
+  description: "Current projected sessions with an authoritative active turn.",
+});
+
 export const ingestionWorkerDepth = Metric.gauge("t3_ingestion_worker_depth", {
   description: "Current work items queued or active in a drainable ingestion worker.",
 });

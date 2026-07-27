@@ -53,6 +53,7 @@ import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityRes
 import { ORCHESTRATION_PROJECTOR_NAMES } from "./ProjectionPipeline.ts";
 import {
   ProjectionSnapshotQuery,
+  type ProjectionActiveTurnCount,
   type ProjectionFullThreadDiffContext,
   type ProjectionSnapshotCounts,
   type LegacyPendingTurnReadiness,
@@ -127,6 +128,9 @@ const ProjectionStateDbRowSchema = ProjectionState;
 const ProjectionCountsRowSchema = Schema.Struct({
   projectCount: Schema.Number,
   threadCount: Schema.Number,
+});
+const ProjectionActiveTurnCountRowSchema = Schema.Struct({
+  activeTurnCount: Schema.Number,
 });
 const WorkspaceRootLookupInput = Schema.Struct({
   workspaceRoot: Schema.String,
@@ -740,6 +744,17 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         SELECT
           (SELECT COUNT(*) FROM projection_projects) AS "projectCount",
           (SELECT COUNT(*) FROM projection_threads) AS "threadCount"
+      `,
+  });
+
+  const readActiveTurnCount = SqlSchema.findOne({
+    Request: Schema.Void,
+    Result: ProjectionActiveTurnCountRowSchema,
+    execute: () =>
+      sql`
+        SELECT COUNT(*) AS "activeTurnCount"
+        FROM projection_thread_sessions
+        WHERE active_turn_id IS NOT NULL
       `,
   });
 
@@ -2036,6 +2051,21 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       ),
     );
 
+  const getActiveTurnCount: NonNullable<ProjectionSnapshotQueryShape["getActiveTurnCount"]> = () =>
+    readActiveTurnCount(undefined).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.getActiveTurnCount:query",
+          "ProjectionSnapshotQuery.getActiveTurnCount:decodeRow",
+        ),
+      ),
+      Effect.map(
+        (row): ProjectionActiveTurnCount => ({
+          activeTurnCount: row.activeTurnCount,
+        }),
+      ),
+    );
+
   const getActiveProjectByWorkspaceRoot: ProjectionSnapshotQueryShape["getActiveProjectByWorkspaceRoot"] =
     (workspaceRoot) =>
       getActiveProjectRowByWorkspaceRoot({ workspaceRoot }).pipe(
@@ -2470,6 +2500,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getArchivedShellSnapshot,
     getSnapshotSequence,
     getCounts,
+    getActiveTurnCount,
     getActiveProjectByWorkspaceRoot,
     getProjectShellById,
     getFirstActiveThreadIdByProjectId,

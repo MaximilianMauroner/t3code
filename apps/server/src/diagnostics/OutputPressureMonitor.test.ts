@@ -46,14 +46,14 @@ describe("OutputPressureMonitor", () => {
     ),
   );
 
-  it.effect("samples event-loop pressure periodically and finalizes with its scope", () => {
+  it.effect("requires event-loop p99 pressure to persist for 30 seconds", () => {
     let enabled = 0;
     let disabled = 0;
     let resets = 0;
-    const percentiles = new Map([
+    const percentiles = new Map<number, number>([
       [50, 25 * 1_000_000],
       [95, 500 * 1_000_000],
-      [99, 2_500 * 1_000_000],
+      [99, 250 * 1_000_000],
     ]);
 
     return Effect.gen(function* () {
@@ -62,13 +62,21 @@ describe("OutputPressureMonitor", () => {
         assert.equal(enabled, 1);
         assert.equal(resets, 0);
 
-        yield* TestClock.adjust("1 second");
+        yield* TestClock.adjust("5 seconds");
         yield* Effect.yieldNow;
 
-        const snapshot = yield* monitor.snapshot;
-        assert.equal(snapshot.health, "degraded");
-        assert.deepEqual(snapshot.eventLoop, { p50Ms: 25, p95Ms: 500, p99Ms: 2_500 });
+        const initialPressure = yield* monitor.snapshot;
+        assert.equal(initialPressure.health, "healthy");
+        assert.deepEqual(initialPressure.eventLoop, { p50Ms: 25, p95Ms: 500, p99Ms: 250 });
         assert.equal(resets, 1);
+
+        yield* TestClock.adjust("25 seconds");
+        yield* Effect.yieldNow;
+        assert.equal((yield* monitor.snapshot).health, "healthy");
+
+        yield* TestClock.adjust("5 seconds");
+        yield* Effect.yieldNow;
+        assert.equal((yield* monitor.snapshot).health, "degraded");
 
         const metrics = yield* Metric.snapshot;
         const health = metrics.find((sample) => sample.id === "t3_event_loop_healthy");
@@ -76,7 +84,7 @@ describe("OutputPressureMonitor", () => {
       }).pipe(
         Effect.provide(
           OutputPressureMonitor.layerWithOptions({
-            sampleIntervalMs: 1_000,
+            sampleIntervalMs: 5_000,
             histogram: {
               enable: () => {
                 enabled += 1;
@@ -96,5 +104,50 @@ describe("OutputPressureMonitor", () => {
       );
       assert.equal(disabled, 1);
     });
+  });
+
+  it.effect("resets the sustained window after a healthy sample", () => {
+    let p99Ms = 251;
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const monitor = yield* OutputPressureMonitor.OutputPressureMonitor;
+
+        yield* TestClock.adjust("5 seconds");
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("25 seconds");
+        yield* Effect.yieldNow;
+        assert.equal((yield* monitor.snapshot).health, "healthy");
+
+        p99Ms = 249;
+        yield* TestClock.adjust("5 seconds");
+        yield* Effect.yieldNow;
+        assert.equal((yield* monitor.snapshot).health, "healthy");
+
+        p99Ms = 251;
+        yield* TestClock.adjust("5 seconds");
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("25 seconds");
+        yield* Effect.yieldNow;
+        assert.equal((yield* monitor.snapshot).health, "healthy");
+
+        yield* TestClock.adjust("5 seconds");
+        yield* Effect.yieldNow;
+        assert.equal((yield* monitor.snapshot).health, "degraded");
+      }).pipe(
+        Effect.provide(
+          OutputPressureMonitor.layerWithOptions({
+            sampleIntervalMs: 5_000,
+            histogram: {
+              enable: () => true,
+              disable: () => true,
+              percentile: (percentile) =>
+                (percentile === 99 ? p99Ms : percentile === 95 ? 100 : 25) * 1_000_000,
+              reset: () => undefined,
+            },
+          }),
+        ),
+      ),
+    );
   });
 });
