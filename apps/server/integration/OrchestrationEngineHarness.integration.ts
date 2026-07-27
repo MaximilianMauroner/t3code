@@ -23,7 +23,8 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as CheckpointStore from "../src/checkpointing/CheckpointStore.ts";
-import { TextGeneration, type TextGenerationShape } from "../src/textGeneration/TextGeneration.ts";
+import * as OutputPressureMonitor from "../src/diagnostics/OutputPressureMonitor.ts";
+import { TextGeneration } from "../src/textGeneration/TextGeneration.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../src/persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../src/persistence/Layers/OrchestrationEventStore.ts";
 import { ProjectionCheckpointRepositoryLive } from "../src/persistence/Layers/ProjectionCheckpoints.ts";
@@ -44,6 +45,7 @@ import {
   ProviderEventLoggers,
 } from "../src/provider/Layers/ProviderEventLoggers.ts";
 import { ProviderService } from "../src/provider/Services/ProviderService.ts";
+import { ServerBootIdentity } from "../src/serverBootId.ts";
 import { AnalyticsService } from "../src/telemetry/Services/AnalyticsService.ts";
 import { CheckpointReactorLive } from "../src/orchestration/Layers/CheckpointReactor.ts";
 import * as RepositoryIdentityResolver from "../src/project/RepositoryIdentityResolver.ts";
@@ -318,10 +320,10 @@ export const makeOrchestrationIntegrationHarness = (
         readonly newBranch: string;
       }) => Effect.succeed({ branch: input.newBranch }),
     });
-    const textGenerationLayer = Layer.succeed(TextGeneration, {
+    const textGenerationLayer = Layer.mock(TextGeneration)({
       generateBranchName: () => Effect.succeed({ branch: "update" }),
       generateThreadTitle: () => Effect.succeed({ title: "New thread" }),
-    } as unknown as TextGenerationShape);
+    });
     const providerCommandReactorLayer = ProviderCommandReactorLive.pipe(
       Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(gitWorkflowLayer),
@@ -356,22 +358,23 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(WorkspacePaths.layer),
       Layer.provideMerge(VcsProcess.layer),
     );
+    const threadDeletionReactorLayer = Layer.succeed(ThreadDeletionReactor, {
+      start: () => Effect.void,
+      drain: Effect.void,
+      deliver: () => Effect.succeed("delivered" as const),
+    });
+    const agentAwarenessRelayLayer = Layer.succeed(AgentAwarenessRelay.AgentAwarenessRelay, {
+      publishThread: () => Effect.void,
+      start: () => Effect.void,
+      drain: Effect.void,
+      quiesceAndDrain: Effect.void,
+    });
     const orchestrationReactorLayer = OrchestrationReactorLive.pipe(
       Layer.provideMerge(runtimeIngestionLayer),
       Layer.provideMerge(providerCommandReactorLayer),
       Layer.provideMerge(checkpointReactorLayer),
-      Layer.provideMerge(
-        Layer.succeed(ThreadDeletionReactor, {
-          start: () => Effect.void,
-          drain: Effect.void,
-        }),
-      ),
-      Layer.provideMerge(
-        Layer.succeed(AgentAwarenessRelay.AgentAwarenessRelay, {
-          publishThread: () => Effect.void,
-          start: () => Effect.void,
-        }),
-      ),
+      Layer.provideMerge(threadDeletionReactorLayer),
+      Layer.provideMerge(agentAwarenessRelayLayer),
     );
     const layer = Layer.empty.pipe(
       Layer.provideMerge(runtimeServicesLayer),
@@ -381,6 +384,8 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(RepositoryIdentityResolver.layer),
       Layer.provideMerge(ServerSettingsService.layerTest()),
       Layer.provideMerge(ServerConfig.layerTest(workspaceDir, rootDir)),
+      Layer.provideMerge(OutputPressureMonitor.disabledLayer),
+      Layer.provideMerge(ServerBootIdentity.layer),
       Layer.provideMerge(NodeServices.layer),
     );
 

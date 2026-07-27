@@ -90,6 +90,7 @@ import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts
 import * as OutputPressureMonitor from "./diagnostics/OutputPressureMonitor.ts";
 import * as ActiveTurnCountPublisher from "./diagnostics/ActiveTurnCountPublisher.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
+import { OrchestrationProjectionSnapshotQueryLive } from "./orchestration/Layers/ProjectionSnapshotQuery.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import {
   clearPersistedServerRuntimeState,
@@ -195,6 +196,11 @@ const ProviderLayerLive = ProviderServiceLive.pipe(
 );
 
 const PersistenceLayerLive = Layer.empty.pipe(Layer.provideMerge(SqlitePersistenceLayerLive));
+
+const ProjectionSnapshotQueryLayerLive = OrchestrationProjectionSnapshotQueryLive.pipe(
+  Layer.provideMerge(PersistenceLayerLive),
+  Layer.provideMerge(RepositoryIdentityResolver.layer),
+);
 
 const VcsDriverRegistryLayerLive = VcsDriverRegistry.layer.pipe(
   Layer.provide(VcsProjectConfig.layer),
@@ -356,7 +362,7 @@ const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
   Layer.provideMerge(ExternalLauncher.layer),
   Layer.provideMerge(ServerLifecycleEvents.layer),
   Layer.provide(NetService.layer),
-);
+).pipe(Layer.provideMerge(ProjectionSnapshotQueryLayerLive));
 
 const RuntimeServicesLive = ServerRuntimeStartup.layer.pipe(
   Layer.provideMerge(RuntimeDependenciesLive),
