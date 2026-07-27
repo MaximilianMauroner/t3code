@@ -33,15 +33,27 @@ evidence.
 
 The installer treats the host-only `t3code-healthcheck.timer` as the legacy
 availability owner. It records the exact enabled, active, and failed states of
-that timer and service as well as both repository-owned checker pairs. The
-legacy timer remains unchanged while the new availability assets are installed
-disabled, the new oneshot is invoked and checked explicitly, and the deployed
-release completes 120 seconds of continuous verification. Only then does the
-installer enable and start `t3code-availability-healthcheck.timer`, verify it is
-active, and disable the legacy timer. This gives a deliberately brief healthy
-overlap but no interval without an availability watchdog. Any failure before
-the transaction commits restores every recorded unit state and the prior
-assets.
+that timer and service as well as both repository-owned checker pairs. After
+the snapshots are durable, the installer stops all three timers and all three
+oneshots and waits for inactivity before replacing an asset or restarting T3
+Code. This is not an unowned watchdog gap: the installer already holds the
+shared authority lock and directly owns readiness plus the full 120-second
+release verification.
+
+The new availability assets remain disabled while their oneshot is invoked and
+checked explicitly. The installer enables the new timer only after validation,
+while the legacy timer and service are still inactive, then verifies the new
+timer before releasing authority. There is therefore neither an old oneshot
+during replacement nor a legacy/new availability-authority overlap.
+
+On rollback from a legacy-owned host, the installer keeps its authority lock,
+stops and runtime-masks the staged new service, restores the legacy timer and
+service first, and only then retires the staged timer and restores its previous
+assets and exact unit state. The temporary timer overlap is inert because the
+staged service cannot execute. If exact legacy restoration fails, rollback
+keeps the validated staged watchdog available, fails visibly, and preserves
+the root-only recovery backup instead of creating an unowned interval. Any
+successful rollback restores every recorded enabled, active, and failed state.
 
 The server samples the authoritative projected session state every five
 seconds and atomically publishes the bounded active-turn count to

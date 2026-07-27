@@ -337,6 +337,19 @@ legacy_health_service_enabled="$(systemctl is-enabled "$legacy_health_service_un
 legacy_health_service_active="$(systemctl is-active "$legacy_health_service_unit" 2>/dev/null || true)"
 legacy_health_service_failed="$(systemctl is-failed "$legacy_health_service_unit" 2>/dev/null || true)"
 service_active="$(systemctl is-active t3code.service 2>/dev/null || true)"
+legacy_general_was_active=false
+repository_availability_was_active=false
+case "$legacy_health_active:$legacy_health_service_active" in
+  active:*|*:active) legacy_general_was_active=true ;;
+esac
+case "$availability_active:$availability_service_active" in
+  active:*|*:active) repository_availability_was_active=true ;;
+esac
+if [ "$legacy_general_was_active" = true ] &&
+  [ "$repository_availability_was_active" = true ]; then
+  printf '%s\n' "Multiple general availability watchdogs are already active; refusing cutover." >&2
+  exit 1
+fi
 install_complete=false
 rollback_complete=false
 verify_nightly_original_state() {
@@ -400,6 +413,71 @@ restore_unit_state() {
   [ "$(systemctl is-active "$unit" 2>/dev/null || true)" = "$active" ] || return 1
   [ "$(systemctl is-failed "$unit" 2>/dev/null || true)" = "$failed" ] || return 1
 }
+wait_for_unit_inactive() {
+  unit="$1"
+  attempts=0
+  while [ "$attempts" -lt 30 ]; do
+    state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    case "$state" in
+      inactive|failed|unknown|not-found|"") return 0 ;;
+    esac
+    attempts=$((attempts + 1))
+    sleep 1
+  done
+  printf '%s\n' "Timed out waiting for ${unit} to become inactive." >&2
+  return 1
+}
+stop_known_unit() {
+  unit="$1"; known_state="$2"
+  case "$known_state" in
+    not-found|"") return 0 ;;
+  esac
+  systemctl stop "$unit" || return 1
+  wait_for_unit_inactive "$unit"
+}
+restore_legacy_general_watchdog() {
+  restore_unit_state "$legacy_health_service_unit" \
+    "$legacy_health_service_enabled" "$legacy_health_service_active" \
+    "$legacy_health_service_failed" || return 1
+  restore_unit_state "$legacy_health_timer_unit" \
+    "$legacy_health_enabled" "$legacy_health_active" "$legacy_health_failed"
+}
+retire_staged_availability_after_legacy_restore() {
+  # The installer still owns the shared authority lock. Prevent the staged
+  # service from entering another probe while its timer remains active, then
+  # bring the prior legacy owner back first. The timer overlap is inert: the
+  # staged service is inactive and runtime-masked, while the installer owns
+  # update authority. Only after legacy restoration succeeds do we retire the
+  # staged timer. This is the explicit no-authority-gap bridge on rollback.
+  staged_service_enabled="$(systemctl is-enabled t3code-availability-healthcheck.service \
+    2>/dev/null || true)"
+  staged_timer_enabled="$(systemctl is-enabled t3code-availability-healthcheck.timer \
+    2>/dev/null || true)"
+  if [ "$staged_service_enabled" != not-found ] && [ -n "$staged_service_enabled" ]; then
+    systemctl stop t3code-availability-healthcheck.service || return 1
+    wait_for_unit_inactive t3code-availability-healthcheck.service || return 1
+    systemctl mask --runtime t3code-availability-healthcheck.service || return 1
+  fi
+  if ! restore_legacy_general_watchdog; then
+    # Exact rollback failed. Keep the validated staged watchdog available when
+    # installer authority is released, and preserve the recovery bundle. If
+    # staging had not reached unit installation, leave the partially restored
+    # legacy owner in place rather than creating a guaranteed watchdog gap.
+    if [ "$staged_timer_enabled" != not-found ] && [ -n "$staged_timer_enabled" ]; then
+      systemctl stop "$legacy_health_timer_unit" >/dev/null 2>&1 || true
+      systemctl stop "$legacy_health_service_unit" >/dev/null 2>&1 || true
+      wait_for_unit_inactive "$legacy_health_service_unit" || true
+      if [ "$staged_service_enabled" != not-found ] && [ -n "$staged_service_enabled" ]; then
+        systemctl unmask --runtime t3code-availability-healthcheck.service \
+          >/dev/null 2>&1 || true
+      fi
+      systemctl enable --now t3code-availability-healthcheck.timer \
+        >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+  stop_known_unit t3code-availability-healthcheck.timer "$staged_timer_enabled"
+}
 rollback() {
   [ "$rollback_complete" = true ] && return
   rollback_complete=true
@@ -421,18 +499,52 @@ rollback() {
   restore_file health_lock_helper "$health_lock_helper"
   restore_file health_service "$health_service"
   restore_file health_timer "$health_timer"
-  restore_file availability_script "$availability_script"
-  restore_file availability_service "$availability_service"
-  restore_file availability_timer "$availability_timer"
   restore_file tmpfiles_config "$tmpfiles_config"
   systemctl daemon-reload || true
   if [ -f "$tmpfiles_config" ] && ! /usr/bin/systemd-tmpfiles --create "$tmpfiles_config"; then rollback_failed=true; fi
+  general_owner_restored=true
+  if [ "$legacy_general_was_active" = true ]; then
+    if ! retire_staged_availability_after_legacy_restore; then
+      general_owner_restored=false
+      rollback_failed=true
+    fi
+  else
+    rollback_availability_timer_enabled="$(
+      systemctl is-enabled t3code-availability-healthcheck.timer 2>/dev/null || true
+    )"
+    rollback_availability_service_enabled="$(
+      systemctl is-enabled t3code-availability-healthcheck.service 2>/dev/null || true
+    )"
+    if ! stop_known_unit t3code-availability-healthcheck.timer \
+      "$rollback_availability_timer_enabled"; then
+      general_owner_restored=false
+      rollback_failed=true
+    fi
+    if ! stop_known_unit t3code-availability-healthcheck.service \
+      "$rollback_availability_service_enabled"; then
+      general_owner_restored=false
+      rollback_failed=true
+    fi
+  fi
+  if [ "$general_owner_restored" = true ]; then
+    restore_file availability_script "$availability_script"
+    restore_file availability_service "$availability_service"
+    restore_file availability_timer "$availability_timer"
+    systemctl daemon-reload || rollback_failed=true
+  fi
   if ! restore_unit_state t3code-fork-healthcheck.timer "$health_enabled" "$health_active" "$health_failed"; then rollback_failed=true; fi
   if ! restore_unit_state t3code-fork-healthcheck.service "$health_service_enabled" "$health_service_active" "$health_service_failed"; then rollback_failed=true; fi
-  if ! restore_unit_state t3code-availability-healthcheck.timer "$availability_enabled" "$availability_active" "$availability_failed"; then rollback_failed=true; fi
-  if ! restore_unit_state t3code-availability-healthcheck.service "$availability_service_enabled" "$availability_service_active" "$availability_service_failed"; then rollback_failed=true; fi
-  if ! restore_unit_state "$legacy_health_timer_unit" "$legacy_health_enabled" "$legacy_health_active" "$legacy_health_failed"; then rollback_failed=true; fi
-  if ! restore_unit_state "$legacy_health_service_unit" "$legacy_health_service_enabled" "$legacy_health_service_active" "$legacy_health_service_failed"; then rollback_failed=true; fi
+  if [ "$general_owner_restored" = true ]; then
+    # If legacy was the prior owner it is already active before this retires
+    # the staged timer. Restoring availability timer before its service keeps
+    # the runtime service mask effective until the timer is back to its exact
+    # prior state.
+    if ! restore_unit_state t3code-availability-healthcheck.timer "$availability_enabled" "$availability_active" "$availability_failed"; then rollback_failed=true; fi
+    if ! restore_unit_state t3code-availability-healthcheck.service "$availability_service_enabled" "$availability_service_active" "$availability_service_failed"; then rollback_failed=true; fi
+    if [ "$legacy_general_was_active" != true ]; then
+      if ! restore_legacy_general_watchdog; then rollback_failed=true; fi
+    fi
+  fi
   [ "$service_active" = active ] && systemctl restart t3code.service || systemctl stop t3code.service || true
   if [ "$nightly_restore_failed" = true ] || [ "$rollback_failed" = true ]; then
     printf '%s\n' "Watchdog rollback backup preserved at ${backup_dir} for recovery." >&2
@@ -456,14 +568,16 @@ signal_handler() {
 trap exit_handler EXIT
 trap signal_handler HUP INT TERM
 
-# Quiesce the two repository-owned timer/service pairs before replacing them.
-# The host-only legacy availability checker remains unchanged and active.
-systemctl stop t3code-fork-healthcheck.timer
-systemctl stop t3code-fork-healthcheck.service
-systemctl stop t3code-availability-healthcheck.timer 2>/dev/null || true
-systemctl stop t3code-availability-healthcheck.service 2>/dev/null || true
-[ "$(systemctl is-active t3code-fork-healthcheck.service 2>/dev/null || true)" != active ]
-[ "$(systemctl is-active t3code-availability-healthcheck.service 2>/dev/null || true)" != active ]
+# Quiesce every watchdog timer and oneshot before replacing assets or
+# restarting T3 Code. The installer already owns the shared authority lock and
+# actively performs readiness plus 120-second verification, so this deliberate
+# timer-free interval has one explicit decision authority rather than a gap.
+stop_known_unit t3code-fork-healthcheck.timer "$health_enabled"
+stop_known_unit t3code-availability-healthcheck.timer "$availability_enabled"
+stop_known_unit "$legacy_health_timer_unit" "$legacy_health_enabled"
+stop_known_unit t3code-fork-healthcheck.service "$health_service_enabled"
+stop_known_unit t3code-availability-healthcheck.service "$availability_service_enabled"
+stop_known_unit "$legacy_health_service_unit" "$legacy_health_service_enabled"
 
 next_link="${current_link}.bootstrap.$$"
 ln -s "$release_dir" "$next_link"
@@ -513,7 +627,7 @@ systemctl mask "$nightly_service_unit"
 systemctl restart t3code.service
 wait_for_release_ready
 # Validate the newly staged checker as an explicit oneshot while its timer is
-# still disabled and the legacy availability timer remains unchanged.
+# still disabled and installer authority owns the controlled cutover interval.
 systemctl start t3code-availability-healthcheck.service
 [ "$(systemctl is-failed t3code-availability-healthcheck.service 2>/dev/null || true)" != failed ]
 [ "$(systemctl show t3code-availability-healthcheck.service -p Result --value)" = success ]
@@ -521,18 +635,18 @@ watch_release_health
 systemctl enable --now t3code-availability-healthcheck.timer
 [ "$(systemctl is-enabled t3code-availability-healthcheck.timer 2>/dev/null || true)" = enabled ]
 [ "$(systemctl is-active t3code-availability-healthcheck.timer 2>/dev/null || true)" = active ]
-# The new availability loop is active before the known host-only legacy loop
-# is retired. This intentionally allows only the smallest healthy overlap and
-# never creates an interval without a general availability watchdog.
-case "$legacy_health_enabled:$legacy_health_active" in
-  not-found:*|"":"") ;;
-  masked:*) ;;
-  *)
-    systemctl disable --now "$legacy_health_timer_unit"
-    systemctl stop "$legacy_health_service_unit" 2>/dev/null || true
+# Legacy remained inactive throughout replacement, restart, staged validation,
+# and activation. The installer-held authority transfers to the new timer only
+# after its enabled/active state is verified, so the authorities never overlap.
+[ "$(systemctl is-active "$legacy_health_timer_unit" 2>/dev/null || true)" != active ]
+[ "$(systemctl is-active "$legacy_health_service_unit" 2>/dev/null || true)" != active ]
+case "$legacy_health_enabled" in
+  enabled|disabled)
+    systemctl disable "$legacy_health_timer_unit"
     [ "$(systemctl is-enabled "$legacy_health_timer_unit" 2>/dev/null || true)" = disabled ]
-    [ "$(systemctl is-active "$legacy_health_timer_unit" 2>/dev/null || true)" = inactive ]
     ;;
+  masked|not-found|"") ;;
+  *) printf '%s\n' "Unsupported legacy watchdog enablement state." >&2; exit 1 ;;
 esac
 systemctl enable --now t3code-fork-healthcheck.timer
 

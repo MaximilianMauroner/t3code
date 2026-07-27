@@ -204,22 +204,34 @@ describe("fork service bootstrap installer", () => {
     expect(installer).toContain("exit 1");
   });
 
-  it("quiesces both checker pairs before replacing watchdog assets", () => {
+  it("quiesces every checker pair before replacing watchdog assets", () => {
     const trapIndex = installer.indexOf("trap exit_handler EXIT");
-    const forkStop = installer.indexOf("systemctl stop t3code-fork-healthcheck.service", trapIndex);
-    const availabilityStop = installer.indexOf(
-      "systemctl stop t3code-availability-healthcheck.service",
-      forkStop,
+    const quiesce = installer.indexOf(
+      'stop_known_unit t3code-fork-healthcheck.timer "$health_enabled"',
+      trapIndex,
+    );
+    const legacyTimerStop = installer.indexOf(
+      'stop_known_unit "$legacy_health_timer_unit" "$legacy_health_enabled"',
+      quiesce,
+    );
+    const legacyServiceStop = installer.indexOf(
+      'stop_known_unit "$legacy_health_service_unit" "$legacy_health_service_enabled"',
+      legacyTimerStop,
     );
     const linkSwitch = installer.indexOf('mv -Tf "$next_link" "$current_link"', trapIndex);
     const firstAssetInstall = installer.indexOf(
       'install -m 0644 "$script_dir/t3code.service.d/zz-fork-update.conf"',
       trapIndex,
     );
-    expect(forkStop).toBeGreaterThan(trapIndex);
-    expect(availabilityStop).toBeGreaterThan(forkStop);
-    expect(linkSwitch).toBeGreaterThan(availabilityStop);
+    const restart = installer.indexOf("systemctl restart t3code.service", firstAssetInstall);
+    expect(quiesce).toBeGreaterThan(trapIndex);
+    expect(legacyTimerStop).toBeGreaterThan(quiesce);
+    expect(legacyServiceStop).toBeGreaterThan(legacyTimerStop);
+    expect(linkSwitch).toBeGreaterThan(legacyServiceStop);
     expect(firstAssetInstall).toBeGreaterThan(linkSwitch);
+    expect(restart).toBeGreaterThan(firstAssetInstall);
+    expect(installer).toContain("wait_for_unit_inactive");
+    expect(installer).toContain("installer already owns the shared authority lock");
     expect(
       NodeFS.readFileSync(NodePath.join(opsDir, "t3code.service.d/zz-fork-update.conf"), "utf8"),
     ).toContain("T3_FORK_UPDATE_AUTHORITY_LOCK");
@@ -242,12 +254,16 @@ describe("fork service bootstrap installer", () => {
     );
   });
 
-  it("cuts over availability with no recovery gap after staged validation", () => {
+  it("cuts over availability under installer authority with no legacy/new overlap", () => {
     const transactionStart = installer.indexOf("trap exit_handler EXIT");
     const legacySnapshot = installer.indexOf('legacy_health_enabled="$(systemctl is-enabled');
+    const legacyTimerStop = installer.indexOf(
+      'stop_known_unit "$legacy_health_timer_unit" "$legacy_health_enabled"',
+      transactionStart,
+    );
     const stagedDisable = installer.indexOf(
       "systemctl disable --now t3code-availability-healthcheck.timer",
-      transactionStart,
+      legacyTimerStop,
     );
     const restart = installer.indexOf("systemctl restart t3code.service", stagedDisable);
     const ready = installer.indexOf("wait_for_release_ready", restart);
@@ -268,13 +284,18 @@ describe("fork service bootstrap installer", () => {
       "systemctl is-active t3code-availability-healthcheck.timer",
       newTimerStart,
     );
-    const legacyTimerStop = installer.indexOf(
-      'systemctl disable --now "$legacy_health_timer_unit"',
+    const legacyStillInactive = installer.indexOf(
+      '[ "$(systemctl is-active "$legacy_health_timer_unit" 2>/dev/null || true)" != active ]',
       newTimerActive,
+    );
+    const legacyDisable = installer.indexOf(
+      'systemctl disable "$legacy_health_timer_unit"',
+      legacyStillInactive,
     );
 
     expect(legacySnapshot).toBeGreaterThan(-1);
-    expect(stagedDisable).toBeGreaterThan(transactionStart);
+    expect(legacyTimerStop).toBeGreaterThan(transactionStart);
+    expect(stagedDisable).toBeGreaterThan(legacyTimerStop);
     expect(restart).toBeGreaterThan(stagedDisable);
     expect(ready).toBeGreaterThan(restart);
     expect(stagedOneshot).toBeGreaterThan(ready);
@@ -282,9 +303,10 @@ describe("fork service bootstrap installer", () => {
     expect(continuousWatch).toBeGreaterThan(stagedResult);
     expect(newTimerStart).toBeGreaterThan(continuousWatch);
     expect(newTimerActive).toBeGreaterThan(newTimerStart);
-    expect(legacyTimerStop).toBeGreaterThan(newTimerActive);
-    expect(installer.slice(transactionStart, newTimerActive)).not.toContain(
-      'systemctl disable --now "$legacy_health_timer_unit"',
+    expect(legacyStillInactive).toBeGreaterThan(newTimerActive);
+    expect(legacyDisable).toBeGreaterThan(legacyStillInactive);
+    expect(installer.slice(legacyTimerStop, newTimerStart)).not.toContain(
+      'systemctl start "$legacy_health_timer_unit"',
     );
   });
 
@@ -316,7 +338,7 @@ describe("fork service bootstrap installer", () => {
       installer.indexOf("restore_unit_state() {"),
       installer.indexOf("\nexit_handler() {"),
     );
-    expect(restore.match(/if ! restore_unit_state/g)).toHaveLength(6);
+    expect(restore.match(/restore_unit_state/g)?.length).toBeGreaterThanOrEqual(7);
     expect(restore).toContain(
       '[ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" = "$enabled" ]',
     );
@@ -326,6 +348,36 @@ describe("fork service bootstrap installer", () => {
     expect(restore).toContain(
       '[ "$(systemctl is-failed "$unit" 2>/dev/null || true)" = "$failed" ]',
     );
+  });
+
+  it("restores a prior legacy owner before retiring staged availability on rollback", () => {
+    const bridgeStart = installer.indexOf("retire_staged_availability_after_legacy_restore() {");
+    const bridgeEnd = installer.indexOf("\n}\nrollback() {", bridgeStart);
+    const bridge = installer.slice(bridgeStart, bridgeEnd);
+    const stagedServiceStop = bridge.indexOf(
+      "systemctl stop t3code-availability-healthcheck.service",
+    );
+    const stagedServiceInactive = bridge.indexOf(
+      "wait_for_unit_inactive t3code-availability-healthcheck.service",
+      stagedServiceStop,
+    );
+    const stagedServiceMask = bridge.indexOf(
+      "systemctl mask --runtime t3code-availability-healthcheck.service",
+      stagedServiceInactive,
+    );
+    const legacyRestore = bridge.indexOf("restore_legacy_general_watchdog", stagedServiceMask);
+    const stagedTimerStop = bridge.indexOf(
+      "stop_known_unit t3code-availability-healthcheck.timer",
+      legacyRestore,
+    );
+
+    expect(stagedServiceStop).toBeGreaterThan(-1);
+    expect(stagedServiceInactive).toBeGreaterThan(stagedServiceStop);
+    expect(stagedServiceMask).toBeGreaterThan(stagedServiceInactive);
+    expect(legacyRestore).toBeGreaterThan(stagedServiceMask);
+    expect(stagedTimerStop).toBeGreaterThan(legacyRestore);
+    expect(bridge).toContain("no-authority-gap bridge");
+    expect(bridge).toContain("Keep the validated staged watchdog available");
   });
 
   it("pins the package.json pnpm version through fixed offline Corepack", () => {
@@ -771,6 +823,7 @@ describe("fork service bootstrap installer", () => {
           "legacy_health_service_enabled=not-found",
           "legacy_health_service_active=inactive",
           "legacy_health_service_failed=inactive",
+          "legacy_general_was_active=false",
           "service_active=inactive",
           'release_update_lock() { printf "%s\\n" released >"$LOCK_RELEASE"; }',
           'if rollback; then printf "%s\\n" 0 >"$ROLLBACK_STATUS";',
