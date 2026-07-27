@@ -7,6 +7,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import * as ServerConfig from "../config.ts";
@@ -374,6 +375,61 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       ]);
       assert.equal(probe.status, 0);
     }),
+  );
+
+  it.effect("times out and cleans up when the watchdog authority is already held", () =>
+    Effect.gen(function* () {
+      const commands: Array<string> = [];
+      const context = yield* makeService({
+        active: false,
+        commands,
+        authorityMode: "regular",
+      });
+      const acquireHolder = Effect.callback<NodeChildProcess.ChildProcessWithoutNullStreams>(
+        (resume) => {
+          const child = NodeChildProcess.spawn(
+            "/usr/bin/flock",
+            ["-x", context.authorityPath, "/bin/sh", "-c", 'printf "locked\\n"; cat >/dev/null'],
+            { stdio: ["pipe", "pipe", "pipe"] },
+          );
+          let output = "";
+          const fail = (cause: unknown) => resume(Effect.die(cause));
+          child.once("error", fail);
+          child.once("exit", (code) => {
+            fail(new Error(`watchdog authority holder exited before acquisition (${code})`));
+          });
+          child.stdout.setEncoding("utf8");
+          child.stdout.on("data", (chunk: string) => {
+            output += chunk;
+            if (output.includes("locked\n")) {
+              resume(Effect.succeed(child));
+            }
+          });
+          return Effect.sync(() => child.kill("SIGKILL"));
+        },
+      );
+      const releaseHolder = (child: NodeChildProcess.ChildProcessWithoutNullStreams) =>
+        Effect.callback<void>((resume) => {
+          child.once("exit", () => resume(Effect.void));
+          child.stdin.end();
+          return Effect.sync(() => child.kill("SIGKILL"));
+        });
+
+      const failure = yield* Effect.acquireUseRelease(
+        acquireHolder,
+        () => context.service.start.pipe(Effect.flip),
+        releaseHolder,
+      );
+
+      assert.include(failure.reason, "Timed out acquiring watchdog restart authority");
+      assert.deepEqual(commands, []);
+      const probe = NodeChildProcess.spawnSync("/usr/bin/flock", [
+        "-n",
+        context.authorityPath,
+        "/bin/true",
+      ]);
+      assert.equal(probe.status, 0);
+    }).pipe(TestClock.withLive),
   );
 
   it.effect("rejects a symlinked watchdog authority before update commands", () =>

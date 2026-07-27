@@ -352,7 +352,6 @@ export const makeOrchestrationIntegrationHarness = (
         ),
       ),
       Layer.provideMerge(WorkspacePaths.layer),
-      Layer.provideMerge(VcsProcess.layer),
     );
     const providerCommandReactorWithVcsLayer = providerCommandReactorLayer.pipe(
       Layer.provideMerge(vcsStatusBroadcasterLayer),
@@ -378,7 +377,7 @@ export const makeOrchestrationIntegrationHarness = (
       threadDeletionReactorLayer,
       agentAwarenessRelayLayer,
       orphanTurnReconcilerLayer,
-    );
+    ).pipe(Layer.provideMerge(VcsProcess.layer));
     const reactorLayer = composeReactorLayer(
       reactorLeafServicesLayer,
       OrchestrationReactorLive,

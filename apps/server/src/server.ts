@@ -362,7 +362,8 @@ const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
   Layer.provideMerge(ExternalLauncher.layer),
   Layer.provideMerge(ServerLifecycleEvents.layer),
   Layer.provide(NetService.layer),
-).pipe(Layer.provideMerge(ProjectionSnapshotQueryLayerLive));
+  Layer.provideMerge(ProjectionSnapshotQueryLayerLive),
+);
 
 const RuntimeServicesLive = ServerRuntimeStartup.layer.pipe(
   Layer.provideMerge(RuntimeDependenciesLive),

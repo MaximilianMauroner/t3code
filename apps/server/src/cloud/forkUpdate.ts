@@ -8,7 +8,6 @@ import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
-import * as NodeTimers from "node:timers";
 import * as Clock from "effect/Clock";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -221,14 +220,9 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
           const finishFailure = (reason: string) => {
             if (settled) return;
             settled = true;
-            NodeTimers.clearTimeout(timer);
             child.kill("SIGKILL");
             resume(Effect.fail(statusError(reason)));
           };
-          const timer = NodeTimers.setTimeout(
-            () => finishFailure("Timed out acquiring watchdog restart authority."),
-            5_000,
-          );
           child.once("error", () => finishFailure("Could not acquire watchdog restart authority."));
           child.once("exit", (code) => {
             if (!settled) {
@@ -243,7 +237,6 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
             output += chunk;
             if (!output.includes("locked\n")) return;
             settled = true;
-            NodeTimers.clearTimeout(timer);
             let released = false;
             resume(
               Effect.succeed({
@@ -257,10 +250,17 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
           });
 
           return Effect.sync(() => {
-            NodeTimers.clearTimeout(timer);
-            if (!settled) child.kill("SIGKILL");
+            if (settled) return;
+            settled = true;
+            child.kill("SIGKILL");
           });
-        });
+        }).pipe(
+          Effect.timeoutOrElse({
+            duration: "5 seconds",
+            orElse: () =>
+              Effect.fail(statusError("Timed out acquiring watchdog restart authority.")),
+          }),
+        );
 
   const host: ForkUpdateHost = {
     hasActiveTurns:
