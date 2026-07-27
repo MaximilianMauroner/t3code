@@ -46,6 +46,13 @@ while the legacy timer and service are still inactive, then verifies the new
 timer before releasing authority. There is therefore neither an old oneshot
 during replacement nor a legacy/new availability-authority overlap.
 
+After readiness, the full 120-second health window, and both repository-owned
+watchdog timers are verified, the installer atomically publishes a terminal
+`fork-update.json` success as the application user. This publication remains
+inside the activation transaction: rollback restores the previous status bytes
+and metadata exactly, while a committed deployment records the deployed commit
+as both the current and target commit with no error.
+
 On rollback from a legacy-owned host, the installer keeps its authority lock,
 stops and runtime-masks the staged new service, restores the legacy timer and
 service first, and only then retires the staged timer and restores its previous
