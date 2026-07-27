@@ -3,6 +3,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
@@ -14,11 +15,11 @@ const DEFAULT_FILE_PATH = "/run/t3code-watchdog/active-turn-count";
 const DEFAULT_SAMPLE_INTERVAL_MS = 5_000;
 const MAX_ACTIVE_TURN_COUNT = 1_000_000;
 
-export interface ActiveTurnCountPublisherOptions {
+export interface ActiveTurnCountPublisherOptions<ReadError, WriteError> {
   readonly filePath?: string;
   readonly sampleIntervalMs?: number;
-  readonly readActiveTurnCount: Effect.Effect<number, unknown>;
-  readonly writeCount?: (count: number) => Effect.Effect<void, unknown>;
+  readonly readActiveTurnCount: Effect.Effect<number, ReadError>;
+  readonly writeCount?: (count: number) => Effect.Effect<void, WriteError>;
 }
 
 function boundedCount(count: number): number {
@@ -41,7 +42,7 @@ function canPublishTo(filePath: string): boolean {
 export function writeActiveTurnCountAtomically(
   filePath: string,
   count: number,
-): Effect.Effect<void, unknown> {
+): Effect.Effect<void, Cause.UnknownError> {
   return Effect.try({
     try: () => {
       const directory = NodePath.dirname(filePath);
@@ -70,12 +71,13 @@ export function writeActiveTurnCountAtomically(
         NodeFS.rmSync(temporaryPath, { force: true });
       }
     },
-    catch: (cause) => cause,
+    catch: (cause) =>
+      new Cause.UnknownError(cause, "Failed to publish active-turn watchdog telemetry"),
   });
 }
 
-export const make = Effect.fn("ActiveTurnCountPublisher.make")(function* (
-  options: ActiveTurnCountPublisherOptions,
+export const make = Effect.fn("ActiveTurnCountPublisher.make")(function* <ReadError, WriteError>(
+  options: ActiveTurnCountPublisherOptions<ReadError, WriteError>,
 ) {
   const filePath = options.filePath ?? DEFAULT_FILE_PATH;
   const sampleIntervalMs = Math.max(
@@ -83,7 +85,7 @@ export const make = Effect.fn("ActiveTurnCountPublisher.make")(function* (
     Math.round(options.sampleIntervalMs ?? DEFAULT_SAMPLE_INTERVAL_MS),
   );
   const readActiveTurnCount = options.readActiveTurnCount;
-  const writeCount =
+  const writeCount: (count: number) => Effect.Effect<void, WriteError | Cause.UnknownError> =
     options.writeCount ?? ((count: number) => writeActiveTurnCountAtomically(filePath, count));
 
   if (options.writeCount === undefined && !canPublishTo(filePath)) {

@@ -1,7 +1,7 @@
 import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
 
-const processServerBootId = `${process.pid}-${Date.now()}-${performance.timeOrigin}`;
+const processServerBootId = `${process.pid}-${performance.timeOrigin}`;
 
 /** One opaque identity shared by all process-owned runtime bindings and deliveries. */
 export class ServerBootIdentity extends Context.Service<

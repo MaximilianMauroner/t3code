@@ -24,22 +24,22 @@ type ShutdownCoordinatorDependencies =
   | OrphanTurnReconciler
   | ProviderRuntimeIngestionService;
 
-export interface ShutdownSequenceActions {
-  readonly closeExternalAdmission: Effect.Effect<void, unknown>;
-  readonly engineBarrier: Effect.Effect<unknown, unknown>;
-  readonly drainDeliveries: Effect.Effect<void, unknown>;
-  readonly closeProviderIngress: Effect.Effect<void, unknown>;
-  readonly drainProviderIngestion: Effect.Effect<void, unknown>;
-  readonly drainRemainingReactors: Effect.Effect<void, unknown>;
-  readonly internalEngineBarrier: Effect.Effect<unknown, unknown>;
-  readonly interruptActiveTargets: Effect.Effect<void, unknown>;
-  readonly sealAndStopEngine: Effect.Effect<void, unknown>;
-  readonly closeReactorScope: Effect.Effect<void, unknown>;
+export interface ShutdownSequenceActions<Error> {
+  readonly closeExternalAdmission: Effect.Effect<void, Error>;
+  readonly engineBarrier: Effect.Effect<unknown, Error>;
+  readonly drainDeliveries: Effect.Effect<void, Error>;
+  readonly closeProviderIngress: Effect.Effect<void, Error>;
+  readonly drainProviderIngestion: Effect.Effect<void, Error>;
+  readonly drainRemainingReactors: Effect.Effect<void, Error>;
+  readonly internalEngineBarrier: Effect.Effect<unknown, Error>;
+  readonly interruptActiveTargets: Effect.Effect<void, Error>;
+  readonly sealAndStopEngine: Effect.Effect<void, Error>;
+  readonly closeReactorScope: Effect.Effect<void, Error>;
 }
 
-export const runShutdownSequence = Effect.fn("ShutdownCoordinator.runShutdownSequence")(function* (
-  actions: ShutdownSequenceActions,
-) {
+export const runShutdownSequence = Effect.fn("ShutdownCoordinator.runShutdownSequence")(function* <
+  Error,
+>(actions: ShutdownSequenceActions<Error>) {
   yield* actions.closeExternalAdmission;
   yield* actions.engineBarrier;
   yield* actions.drainDeliveries;
@@ -55,8 +55,8 @@ export const runShutdownSequence = Effect.fn("ShutdownCoordinator.runShutdownSeq
 });
 
 export const runShutdownWithBudget = Effect.fn("ShutdownCoordinator.runShutdownWithBudget")(
-  function* (input: {
-    readonly actions: ShutdownSequenceActions;
+  function* <Error>(input: {
+    readonly actions: ShutdownSequenceActions<Error>;
     readonly forced: Effect.Effect<void, never>;
     readonly budgetMs?: number;
     readonly forcedBudgetMs?: number;

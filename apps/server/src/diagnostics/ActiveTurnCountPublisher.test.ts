@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - This filesystem boundary test verifies atomic replacement and symlink rejection.
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
