@@ -538,6 +538,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         });
       }
       const reservationScope = yield* Scope.make("parallel");
+      let detachCleanupOnFailure = false;
       return yield* Effect.gen(function* () {
         const reservationId = yield* Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
@@ -575,6 +576,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             .withPermits(1)(
               Effect.gen(function* () {
                 if (sealed || !activeReservationIds.has(reservationId)) {
+                  detachCleanupOnFailure = sealed;
                   return yield* new OrchestrationNotReadyError({
                     message: sealed
                       ? "Orchestration engine is sealed."
@@ -670,7 +672,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       }).pipe(
         Scope.provide(reservationScope),
         Effect.onExit((exit) =>
-          Exit.isFailure(exit) ? Scope.close(reservationScope, exit) : Effect.void,
+          Exit.isFailure(exit)
+            ? detachCleanupOnFailure
+              ? Scope.close(reservationScope, exit).pipe(
+                  Effect.forkDetach({ startImmediately: true }),
+                  Effect.asVoid,
+                )
+              : Scope.close(reservationScope, exit)
+            : Effect.void,
         ),
       );
     });
