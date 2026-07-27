@@ -17,6 +17,13 @@ import {
   type ShutdownCoordinatorShape,
 } from "../Services/ShutdownCoordinator.ts";
 
+type ShutdownCoordinatorDependencies =
+  | OrchestrationDeliveryRuntime
+  | OrchestrationEngineService
+  | OrchestrationReactor
+  | OrphanTurnReconciler
+  | ProviderRuntimeIngestionService;
+
 export interface ShutdownSequenceActions {
   readonly closeExternalAdmission: Effect.Effect<void, unknown>;
   readonly engineBarrier: Effect.Effect<unknown, unknown>;
@@ -150,3 +157,7 @@ const make = Effect.gen(function* () {
 });
 
 export const ShutdownCoordinatorLive = Layer.effect(ShutdownCoordinator, make);
+
+export const withShutdownCoordinator = <A, E, R>(
+  reactorServices: Layer.Layer<A | ShutdownCoordinatorDependencies, E, R>,
+) => ShutdownCoordinatorLive.pipe(Layer.provideMerge(reactorServices));

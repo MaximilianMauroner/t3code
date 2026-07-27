@@ -51,7 +51,7 @@ import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
 import { OrchestrationDeliveryRuntimeLive } from "./orchestration/Layers/OrchestrationDeliveryRuntime.ts";
 import { OrphanTurnReconcilerLive } from "./orchestration/Layers/OrphanTurnReconciler.ts";
-import { ShutdownCoordinatorLive } from "./orchestration/Layers/ShutdownCoordinator.ts";
+import { withShutdownCoordinator } from "./orchestration/Layers/ShutdownCoordinator.ts";
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
@@ -163,7 +163,7 @@ const PlatformServicesLive = Layer.unwrap(
   }),
 );
 
-const ReactorLayerLive = Layer.empty.pipe(
+const ReactorServicesLayerLive = Layer.empty.pipe(
   Layer.provideMerge(OrchestrationReactorLive),
   Layer.provideMerge(ProviderRuntimeIngestionLive),
   Layer.provideMerge(ProviderCommandReactorLive),
@@ -171,10 +171,11 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ThreadDeletionReactorLive),
   Layer.provideMerge(OrchestrationDeliveryRuntimeLive),
   Layer.provideMerge(OrphanTurnReconcilerLive),
-  Layer.provideMerge(ShutdownCoordinatorLive),
   Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(RuntimeReceiptBusLive),
 );
+
+const ReactorLayerLive = withShutdownCoordinator(ReactorServicesLayerLive);
 
 const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
   Layer.provide(ProviderSessionRuntime.layer),

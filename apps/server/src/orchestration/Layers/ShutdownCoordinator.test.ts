@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Ref from "effect/Ref";
 import * as Fiber from "effect/Fiber";
 import * as Exit from "effect/Exit";
+import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -11,11 +12,18 @@ import {
   makeReactorScopeCloser,
   runShutdownSequence,
   runShutdownWithBudget,
+  withShutdownCoordinator,
 } from "./ShutdownCoordinator.ts";
 import {
   hasSafeEffectiveTimeoutStop,
   MINIMUM_EFFECTIVE_TIMEOUT_STOP_SECONDS,
+  ShutdownCoordinator,
 } from "../Services/ShutdownCoordinator.ts";
+import { OrchestrationDeliveryRuntime } from "../Services/OrchestrationDeliveryRuntime.ts";
+import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
+import { OrchestrationReactor } from "../Services/OrchestrationReactor.ts";
+import { OrphanTurnReconciler } from "../Services/OrphanTurnReconciler.ts";
+import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeIngestion.ts";
 
 it.effect("records the graceful shutdown linearization order", () =>
   Effect.gen(function* () {
@@ -47,6 +55,46 @@ it.effect("records the graceful shutdown linearization order", () =>
       "seal",
       "reactors-close",
     ]);
+  }),
+);
+
+it.effect("provides shared reactor services to the production shutdown layer", () =>
+  Effect.gen(function* () {
+    const deliveryRuntime = OrchestrationDeliveryRuntime.of({
+      start: () => Effect.void,
+      drain: Effect.void,
+      recoverStartup: Effect.void,
+      inspectReadiness: Effect.die("unused"),
+    });
+    const dependencies = Layer.mergeAll(
+      Layer.mock(OrchestrationEngineService)({
+        closeExternalAdmission: Effect.void,
+        barrier: Effect.void,
+        sealAndStop: Effect.void,
+        forceStop: Effect.void,
+        awaitStopped: Effect.void,
+      }),
+      Layer.succeed(OrchestrationDeliveryRuntime, deliveryRuntime),
+      Layer.mock(ProviderRuntimeIngestionService)({
+        start: () => Effect.void,
+        drain: Effect.void,
+        closeProviderIngress: Effect.void,
+      }),
+      Layer.mock(OrphanTurnReconciler)({
+        snapshotAndInterrupt: () => Effect.void,
+      }),
+      Layer.mock(OrchestrationReactor)({
+        start: () => Effect.void,
+        quiesceAndDrain: Effect.void,
+      }),
+    );
+    const services = yield* Effect.all({
+      coordinator: ShutdownCoordinator,
+      deliveryRuntime: OrchestrationDeliveryRuntime,
+    }).pipe(Effect.provide(withShutdownCoordinator(dependencies)));
+
+    assert.strictEqual(services.deliveryRuntime, deliveryRuntime);
+    assert.equal(typeof services.coordinator.shutdown, "function");
   }),
 );
 
