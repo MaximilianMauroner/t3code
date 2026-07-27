@@ -1,8 +1,10 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import { ServerForkUpdateStatus } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as Schema from "effect/Schema";
 
 const opsDir = NodePath.resolve(import.meta.dirname, "../../../../ops/systemd");
 const installer = NodeFS.readFileSync(NodePath.join(opsDir, "install-t3code-fork-service"), "utf8");
@@ -11,6 +13,7 @@ const packageJson = NodeFS.readFileSync(
   "utf8",
 );
 const lockHelper = NodePath.join(opsDir, "t3code-fork-lock");
+const decodeStatus = Schema.decodeUnknownSync(ServerForkUpdateStatus);
 const firstToken = "123e4567-e89b-42d3-a456-426614174000";
 const secondToken = "987e6543-e21b-42d3-b456-426614174000";
 const deadPid = 2_147_483_647;
@@ -169,6 +172,85 @@ function runHealthHarness(
     stderr: result.stderr,
     curlLog: readLog(curlLog),
     sleepLog: readLog(sleepLog),
+  };
+}
+
+type StatusHarnessMode = "success" | "rollback-after-publish" | "fail-before-publish";
+
+function runStatusHarness(
+  stateDir: string,
+  mode: StatusHarnessMode,
+): {
+  readonly status: number | null;
+  readonly stderr: string;
+} {
+  const backupDir = NodePath.join(stateDir, "backup");
+  const mockBin = NodePath.join(stateDir, "bin");
+  const harnessPath = NodePath.join(stateDir, "status-harness");
+  NodeFS.mkdirSync(backupDir, { mode: 0o700 });
+  NodeFS.mkdirSync(mockBin);
+  NodeFS.writeFileSync(
+    NodePath.join(mockBin, "date"),
+    ["#!/bin/sh", 'printf "%s\\n" "2026-07-27T13:14:15Z"', ""].join("\n"),
+    { mode: 0o755 },
+  );
+  const backupHelpers = installer.slice(
+    installer.indexOf("backup_file() {"),
+    installer.indexOf('backup_file current "$current_link"'),
+  );
+  const statusWriter = installer.slice(
+    installer.indexOf("write_success_status() {"),
+    installer.indexOf("\nread_unit_state() {"),
+  );
+  NodeFS.writeFileSync(
+    harnessPath,
+    [
+      "#!/bin/sh",
+      "set -eu",
+      'run_as_user() { "$@"; }',
+      backupHelpers,
+      statusWriter,
+      'status_file="$HARNESS_ROOT/fork-update.json"',
+      'backup_dir="$HARNESS_ROOT/backup"',
+      'run_user="$(id -un)"',
+      'commit="target-commit"',
+      'backup_file update_status "$status_file"',
+      "install_complete=false",
+      "rollback_status() {",
+      '  [ "$install_complete" = true ] || restore_file update_status "$status_file"',
+      "}",
+      "trap rollback_status EXIT HUP INT TERM",
+      'case "$HARNESS_MODE" in',
+      "  success)",
+      "    write_success_status",
+      "    trap - EXIT HUP INT TERM",
+      "    install_complete=true",
+      "    ;;",
+      "  rollback-after-publish)",
+      "    write_success_status",
+      "    false",
+      "    ;;",
+      "  fail-before-publish)",
+      "    false",
+      "    write_success_status",
+      "    ;;",
+      "esac",
+      "",
+    ].join("\n"),
+    { mode: 0o700 },
+  );
+  const result = NodeChildProcess.spawnSync("/bin/sh", [harnessPath], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HARNESS_MODE: mode,
+      HARNESS_ROOT: stateDir,
+      PATH: `${mockBin}:/usr/bin:/bin`,
+    },
+  });
+  return {
+    status: result.status,
+    stderr: result.stderr,
   };
 }
 
@@ -1201,6 +1283,7 @@ describe("fork service bootstrap installer", () => {
         "availability_service",
         "availability_timer",
         "tmpfiles_config",
+        "update_status",
       ]) {
         NodeFS.writeFileSync(NodePath.join(backupDir, `${label}.absent`), "");
       }
@@ -1251,6 +1334,7 @@ describe("fork service bootstrap installer", () => {
           'availability_service="$HARNESS_ROOT/availability.service"',
           'availability_timer="$HARNESS_ROOT/availability.timer"',
           'tmpfiles_config="$HARNESS_ROOT/tmpfiles.conf"',
+          'status_file="$HARNESS_ROOT/fork-update.json"',
           "health_enabled=disabled",
           "health_active=inactive",
           "health_failed=inactive",
@@ -1320,6 +1404,102 @@ describe("fork service bootstrap installer", () => {
         "unmask t3code-nightly-update.service",
       );
     });
+  });
+
+  it("publishes a user-owned terminal success for the exact deployed commit", () => {
+    withStateDir((stateDir) => {
+      const statusPath = NodePath.join(stateDir, "fork-update.json");
+      NodeFS.writeFileSync(
+        statusPath,
+        '{"stage":"failed","message":"stale failure","startedAt":null,"completedAt":"2026-07-25T00:00:00Z","currentCommit":null,"targetCommit":null,"error":"old"}\n',
+        { mode: 0o600 },
+      );
+      const result = runStatusHarness(stateDir, "success");
+      expect(result.status, result.stderr).toBe(0);
+      expect(decodeStatus(JSON.parse(NodeFS.readFileSync(statusPath, "utf8")))).toEqual({
+        stage: "succeeded",
+        message: "The immutable fork release passed continuous health verification.",
+        startedAt: null,
+        completedAt: "2026-07-27T13:14:15Z",
+        currentCommit: "target-commit",
+        targetCommit: "target-commit",
+        error: null,
+      });
+      const published = NodeFS.statSync(statusPath);
+      expect(published.mode & 0o777).toBe(0o644);
+      expect(published.uid).toBe(process.getuid?.());
+      expect(NodeFS.readdirSync(stateDir).some((entry) => entry.includes(".installer."))).toBe(
+        false,
+      );
+    });
+  });
+
+  it("restores stale status bytes when activation rolls back after publication", () => {
+    withStateDir((stateDir) => {
+      const statusPath = NodePath.join(stateDir, "fork-update.json");
+      const staleBytes =
+        '{"stage":"failed", "message":"preserve spacing", "startedAt":null, "completedAt":null, "currentCommit":null, "targetCommit":null, "error":"old failure"}\n';
+      NodeFS.writeFileSync(statusPath, staleBytes, { mode: 0o600 });
+      const result = runStatusHarness(stateDir, "rollback-after-publish");
+      expect(result.status).not.toBe(0);
+      expect(NodeFS.readFileSync(statusPath, "utf8")).toBe(staleBytes);
+      expect(NodeFS.statSync(statusPath).mode & 0o777).toBe(0o600);
+    });
+  });
+
+  it("never publishes success when activation fails before the final status gate", () => {
+    withStateDir((stateDir) => {
+      const statusPath = NodePath.join(stateDir, "fork-update.json");
+      const staleBytes = "preexisting-status-bytes\n";
+      NodeFS.writeFileSync(statusPath, staleBytes, { mode: 0o640 });
+      NodeFS.chmodSync(statusPath, 0o640);
+      const result = runStatusHarness(stateDir, "fail-before-publish");
+      expect(result.status).not.toBe(0);
+      expect(NodeFS.readFileSync(statusPath, "utf8")).toBe(staleBytes);
+      expect(NodeFS.statSync(statusPath).mode & 0o777).toBe(0o640);
+    });
+  });
+
+  it("orders success publication after every health gate and before transaction commit", () => {
+    const transactionStart = installer.indexOf("trap exit_handler EXIT");
+    const readiness = installer.indexOf("wait_for_release_ready", transactionStart);
+    const availabilityOneshot = installer.indexOf(
+      "systemctl start t3code-availability-healthcheck.service",
+      readiness,
+    );
+    const continuousHealth = installer.indexOf("watch_release_health", availabilityOneshot);
+    const availabilityActive = installer.indexOf(
+      "systemctl is-active t3code-availability-healthcheck.timer",
+      continuousHealth,
+    );
+    const forkTimerStart = installer.indexOf(
+      "systemctl enable --now t3code-fork-healthcheck.timer",
+      availabilityActive,
+    );
+    const forkTimerActive = installer.indexOf(
+      "systemctl is-active t3code-fork-healthcheck.timer",
+      forkTimerStart,
+    );
+    const publish = installer.indexOf("write_success_status", forkTimerActive);
+    const disableTraps = installer.indexOf("trap - EXIT HUP INT TERM", publish);
+
+    expect(readiness).toBeGreaterThan(transactionStart);
+    expect(availabilityOneshot).toBeGreaterThan(readiness);
+    expect(continuousHealth).toBeGreaterThan(availabilityOneshot);
+    expect(availabilityActive).toBeGreaterThan(continuousHealth);
+    expect(forkTimerStart).toBeGreaterThan(availabilityActive);
+    expect(forkTimerActive).toBeGreaterThan(forkTimerStart);
+    expect(publish).toBeGreaterThan(forkTimerActive);
+    expect(disableTraps).toBeGreaterThan(publish);
+    expect(installer.indexOf("install_complete=true", disableTraps)).toBeGreaterThan(disableTraps);
+    expect(installer.indexOf('backup_file update_status "$status_file"')).toBeLessThan(
+      transactionStart,
+    );
+    const rollback = installer.slice(
+      installer.indexOf("rollback() {"),
+      installer.indexOf("\nexit_handler() {"),
+    );
+    expect(rollback).toContain('restore_file update_status "$status_file"');
   });
 
   it("commits and disables signal rollback before releasing the verified activation", () => {

@@ -24,6 +24,7 @@ health_timer="/etc/systemd/system/t3code-fork-healthcheck.timer"
 availability_script="/usr/local/sbin/t3code-availability-healthcheck"
 availability_service="/etc/systemd/system/t3code-availability-healthcheck.service"
 availability_timer="/etc/systemd/system/t3code-availability-healthcheck.timer"
+status_file="${state_dir}/fork-update.json"
 legacy_health_service_unit="t3code-healthcheck.service"
 legacy_health_timer_unit="t3code-healthcheck.timer"
 tmpfiles_config="/etc/tmpfiles.d/t3code-watchdog.conf"
@@ -230,6 +231,31 @@ watch_release_health() {
     verified_seconds=$((verified_seconds + 5))
   done
 }
+write_success_status() {
+  completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  run_as_user sh -c '
+    set -eu
+    target="$1"
+    target_commit="$2"
+    completed_at="$3"
+    temporary="$(mktemp "${target}.installer.XXXXXX")"
+    trap '\''rm -f "$temporary"'\'' EXIT HUP INT TERM
+    chmod 0644 "$temporary"
+    printf "%s\n" \
+"{
+  \"stage\": \"succeeded\",
+  \"message\": \"The immutable fork release passed continuous health verification.\",
+  \"startedAt\": null,
+  \"completedAt\": \"${completed_at}\",
+  \"currentCommit\": \"${target_commit}\",
+  \"targetCommit\": \"${target_commit}\",
+  \"error\": null
+}" >"$temporary"
+    mv -f "$temporary" "$target"
+    trap - EXIT HUP INT TERM
+  ' fork-status-writer "$status_file" "$commit" "$completed_at"
+  [ "$(stat -c '%U:%G:%a' "$status_file")" = "${run_user}:${run_user}:644" ]
+}
 read_unit_state() {
   operation="$1"; unit="$2"
   if unit_state="$(systemctl "$operation" "$unit" 2>/dev/null)"; then :; else :; fi
@@ -311,6 +337,7 @@ backup_file availability_script "$availability_script"
 backup_file availability_service "$availability_service"
 backup_file availability_timer "$availability_timer"
 backup_file tmpfiles_config "$tmpfiles_config"
+backup_file update_status "$status_file"
 validate_nightly_source_path "$nightly_timer_path"
 validate_nightly_source_path "$nightly_service_path"
 validate_nightly_wants_link
@@ -516,6 +543,7 @@ rollback() {
   restore_file health_service "$health_service"
   restore_file health_timer "$health_timer"
   restore_file tmpfiles_config "$tmpfiles_config"
+  restore_file update_status "$status_file"
   systemctl daemon-reload || true
   if [ -f "$tmpfiles_config" ] && ! /usr/bin/systemd-tmpfiles --create "$tmpfiles_config"; then rollback_failed=true; fi
   general_owner_restored=true
@@ -674,6 +702,9 @@ case "$legacy_health_enabled" in
   *) printf '%s\n' "Unsupported legacy watchdog enablement state." >&2; exit 1 ;;
 esac
 systemctl enable --now t3code-fork-healthcheck.timer
+[ "$(systemctl is-enabled t3code-fork-healthcheck.timer 2>/dev/null || true)" = enabled ]
+[ "$(systemctl is-active t3code-fork-healthcheck.timer 2>/dev/null || true)" = active ]
+write_success_status
 
 # Commit activation before releasing ownership. From here on, failures leave
 # the verified deployment in place and never run rollback.

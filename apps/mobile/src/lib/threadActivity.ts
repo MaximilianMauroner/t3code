@@ -36,9 +36,10 @@ export interface ThreadFeedActivity {
   readonly turnId: TurnId | null;
   readonly summary: string;
   readonly detail: string | null;
-  readonly fullDetail: string | null;
-  readonly copyText: string;
   readonly payloadOmitted?: true;
+  readonly canExpand: boolean;
+  readonly getFullDetail: () => string | null;
+  readonly getCopyText: () => string;
   readonly icon:
     | "agent"
     | "alert"
@@ -572,6 +573,27 @@ function buildWorkEntryExpandedBody(entry: WorkLogEntry): string | null {
   }
 
   return blocks.length > 0 ? blocks.join("\n\n") : null;
+}
+
+function workEntryHasExpandedBody(entry: WorkLogEntry): boolean {
+  return (
+    (entry.itemType === "mcp_tool_call" && entry.toolData !== undefined) ||
+    Boolean((entry.rawCommand ?? entry.command)?.trim()) ||
+    Boolean(entry.detail?.trim()) ||
+    (entry.changedFiles?.some((path) => path.trim().length > 0) ?? false)
+  );
+}
+
+function memoizeValue<T>(build: () => T): () => T {
+  let value: T;
+  let initialized = false;
+  return () => {
+    if (!initialized) {
+      value = build();
+      initialized = true;
+    }
+    return value;
+  };
 }
 
 function workEntryPreview(
@@ -1373,8 +1395,16 @@ export function buildThreadFeed(
         .map<RawThreadFeedEntry>((entry) => {
           const summary = workEntryHeading(entry);
           const detail = workEntryPreview(entry);
-          const fullDetail =
-            entry.payloadOmitted === true ? null : buildWorkEntryExpandedBody(entry);
+          const getFullDetail = memoizeValue(() =>
+            entry.payloadOmitted === true ? null : buildWorkEntryExpandedBody(entry),
+          );
+          const getCopyText = memoizeValue(() =>
+            (entry.payloadOmitted === true ? [summary] : [summary, detail, getFullDetail()])
+              .filter((value, index, values): value is string => {
+                return Boolean(value) && values.indexOf(value) === index;
+              })
+              .join("\n"),
+          );
           return {
             type: "activity",
             id: entry.id,
@@ -1386,14 +1416,11 @@ export function buildThreadFeed(
               turnId: entry.turnId,
               summary,
               detail,
-              fullDetail,
               ...(entry.payloadOmitted === true ? { payloadOmitted: true as const } : {}),
+              canExpand: entry.payloadOmitted !== true && workEntryHasExpandedBody(entry),
+              getFullDetail,
+              getCopyText,
               icon: workEntryIcon(entry),
-              copyText: (entry.payloadOmitted === true ? [summary] : [summary, detail, fullDetail])
-                .filter((value, index, values): value is string => {
-                  return Boolean(value) && values.indexOf(value) === index;
-                })
-                .join("\n"),
               toolLike: workLogEntryIsToolLike(entry),
               status: workEntryStatus(entry),
             },
