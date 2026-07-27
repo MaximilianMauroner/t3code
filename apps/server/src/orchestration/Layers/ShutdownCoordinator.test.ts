@@ -69,7 +69,7 @@ it.effect("provides shared reactor services to the production shutdown layer", (
     const dependencies = Layer.mergeAll(
       Layer.mock(OrchestrationEngineService)({
         closeExternalAdmission: Effect.void,
-        barrier: Effect.void,
+        barrier: Effect.succeed({ sequence: 0 }),
         sealAndStop: Effect.void,
         forceStop: Effect.void,
         awaitStopped: Effect.void,
@@ -121,6 +121,110 @@ it.effect("shares one reactor scope close fiber across interrupted callers", () 
     assert.equal(yield* Ref.get(starts), 1);
     yield* Deferred.succeed(allowFinalizer, undefined);
     yield* Fiber.join(second);
+    assert.equal(yield* Ref.get(starts), 1);
+  }),
+);
+
+it.effect("reuses a graceful reactor close fiber across the forced handoff", () =>
+  Effect.gen(function* () {
+    const scope = yield* Scope.make("sequential");
+    const enterFinalizer = yield* Deferred.make<void>();
+    const finalizerStarted = yield* Deferred.make<void>();
+    const allowFinalizer = yield* Deferred.make<void>();
+    const forcedStarted = yield* Deferred.make<void>();
+    const starts = yield* Ref.make(0);
+    yield* Scope.addFinalizer(
+      scope,
+      Ref.update(starts, (count) => count + 1).pipe(
+        Effect.andThen(Deferred.succeed(finalizerStarted, undefined)),
+        Effect.andThen(Deferred.await(allowFinalizer)),
+      ),
+    );
+    const { close } = yield* makeReactorScopeCloser(scope);
+    const fiber = yield* runShutdownWithBudget({
+      actions: {
+        closeExternalAdmission: Effect.void,
+        engineBarrier: Effect.void,
+        drainDeliveries: Effect.void,
+        closeProviderIngress: Effect.void,
+        drainProviderIngestion: Effect.void,
+        drainRemainingReactors: Effect.void,
+        internalEngineBarrier: Effect.void,
+        interruptActiveTargets: Effect.void,
+        sealAndStopEngine: Deferred.await(enterFinalizer),
+        closeReactorScope: close,
+      },
+      forced: Deferred.succeed(forcedStarted, undefined).pipe(Effect.andThen(close)),
+      budgetMs: 4_000,
+      forcedBudgetMs: 2_000,
+    }).pipe(Effect.forkChild);
+
+    yield* Effect.yieldNow;
+    yield* TestClock.adjust("3999 millis");
+    assert.equal(yield* Deferred.isDone(finalizerStarted), false);
+    yield* Deferred.succeed(enterFinalizer, undefined);
+    yield* Deferred.await(finalizerStarted);
+    yield* TestClock.adjust("1 millis");
+    yield* Deferred.await(forcedStarted);
+    assert.equal(yield* Ref.get(starts), 1);
+    assert.equal(fiber.pollUnsafe(), undefined);
+
+    yield* Deferred.succeed(allowFinalizer, undefined);
+    yield* Fiber.join(fiber);
+    assert.equal(yield* Ref.get(starts), 1);
+  }),
+);
+
+it.effect("bounds a forced handoff waiting on the graceful reactor close fiber", () =>
+  Effect.gen(function* () {
+    const scope = yield* Scope.make("sequential");
+    const enterFinalizer = yield* Deferred.make<void>();
+    const finalizerStarted = yield* Deferred.make<void>();
+    const allowFinalizer = yield* Deferred.make<void>();
+    const forcedStarted = yield* Deferred.make<void>();
+    const forcedTimedOut = yield* Deferred.make<void>();
+    const starts = yield* Ref.make(0);
+    yield* Scope.addFinalizer(
+      scope,
+      Ref.update(starts, (count) => count + 1).pipe(
+        Effect.andThen(Deferred.succeed(finalizerStarted, undefined)),
+        Effect.andThen(Deferred.await(allowFinalizer)),
+      ),
+    );
+    const { close } = yield* makeReactorScopeCloser(scope);
+    const fiber = yield* runShutdownWithBudget({
+      actions: {
+        closeExternalAdmission: Effect.void,
+        engineBarrier: Effect.void,
+        drainDeliveries: Effect.void,
+        closeProviderIngress: Effect.void,
+        drainProviderIngestion: Effect.void,
+        drainRemainingReactors: Effect.void,
+        internalEngineBarrier: Effect.void,
+        interruptActiveTargets: Effect.void,
+        sealAndStopEngine: Deferred.await(enterFinalizer),
+        closeReactorScope: close,
+      },
+      forced: Deferred.succeed(forcedStarted, undefined).pipe(Effect.andThen(close)),
+      onForcedTimeout: Deferred.succeed(forcedTimedOut, undefined),
+      budgetMs: 4_000,
+      forcedBudgetMs: 2_000,
+    }).pipe(Effect.forkChild);
+
+    yield* Effect.yieldNow;
+    yield* TestClock.adjust("3999 millis");
+    assert.equal(yield* Deferred.isDone(finalizerStarted), false);
+    yield* Deferred.succeed(enterFinalizer, undefined);
+    yield* Deferred.await(finalizerStarted);
+    yield* TestClock.adjust("1 millis");
+    yield* Deferred.await(forcedStarted);
+    yield* TestClock.adjust("2 seconds");
+    yield* Deferred.await(forcedTimedOut);
+    yield* Fiber.join(fiber);
+    assert.equal(yield* Ref.get(starts), 1);
+
+    yield* Deferred.succeed(allowFinalizer, undefined);
+    yield* close;
     assert.equal(yield* Ref.get(starts), 1);
   }),
 );

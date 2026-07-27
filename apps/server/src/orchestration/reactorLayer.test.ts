@@ -56,25 +56,26 @@ it.effect("builds the complete production reactor dependency topology", () =>
         });
       }),
     );
+    const engine = Layer.mock(OrchestrationEngineService)({
+      closeExternalAdmission: Effect.void,
+      barrier: Effect.succeed({ sequence: 17 }),
+      sealAndStop: Effect.void,
+      forceStop: Effect.void,
+      awaitStopped: Effect.void,
+    });
     const layer = composeReactorLayer(leafServices, coordination, deliveryRuntime).pipe(
-      Layer.provide(
-        Layer.mock(OrchestrationEngineService)({
-          closeExternalAdmission: Effect.void,
-          barrier: Effect.void,
-          sealAndStop: Effect.void,
-          forceStop: Effect.void,
-          awaitStopped: Effect.void,
-        }),
-      ),
+      Layer.provide(engine),
     );
     const services = yield* Effect.all({
       coordinator: ShutdownCoordinator,
       deliveryRuntime: OrchestrationDeliveryRuntime,
+      engine: OrchestrationEngineService,
       providerCommandReactor: ProviderCommandReactor,
     }).pipe(Effect.provide(layer));
 
     assert.equal(typeof services.coordinator.shutdown, "function");
     assert.ok(services.deliveryRuntime);
+    assert.deepStrictEqual(yield* services.engine.barrier, { sequence: 17 });
     assert.ok(services.providerCommandReactor);
   }),
 );
