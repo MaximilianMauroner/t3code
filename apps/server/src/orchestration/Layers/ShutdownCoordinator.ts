@@ -81,6 +81,32 @@ export const runShutdownWithBudget = Effect.fn("ShutdownCoordinator.runShutdownW
   },
 );
 
+export const makeReactorScopeCloser = Effect.fn("ShutdownCoordinator.makeReactorScopeCloser")(
+  function* (reactorScope: Scope.Scope) {
+    const lock = yield* Semaphore.make(1);
+    let closeFiber: Fiber.Fiber<void> | null = null;
+    return {
+      close: Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          yield* lock.take(1);
+          const ownedFiber = yield* Effect.suspend(() => {
+            if (closeFiber !== null) return Effect.succeed(closeFiber);
+            return Scope.close(reactorScope, Exit.void).pipe(
+              Effect.forkDetach({ startImmediately: true }),
+              Effect.tap((fiber) =>
+                Effect.sync(() => {
+                  closeFiber = fiber;
+                }),
+              ),
+            );
+          }).pipe(Effect.ensuring(lock.release(1)));
+          yield* restore(Fiber.join(ownedFiber));
+        }),
+      ),
+    };
+  },
+);
+
 const make = Effect.gen(function* () {
   const engine = yield* OrchestrationEngineService;
   const deliveries = yield* OrchestrationDeliveryRuntime;
@@ -90,25 +116,7 @@ const make = Effect.gen(function* () {
 
   const shutdown: ShutdownCoordinatorShape["shutdown"] = Effect.fn("ShutdownCoordinator.shutdown")(
     function* ({ reactorScope, closeExternalAdmission }) {
-      const reactorScopeCloseLock = yield* Semaphore.make(1);
-      let reactorScopeCloseFiber: Fiber.Fiber<void> | null = null;
-      const closeReactorScope = Effect.gen(function* () {
-        const closeFiber = yield* reactorScopeCloseLock.withPermit(
-          Effect.suspend(() =>
-            reactorScopeCloseFiber === null
-              ? Scope.close(reactorScope, Exit.void).pipe(
-                  Effect.forkDetach({ startImmediately: true }),
-                  Effect.tap((fiber) =>
-                    Effect.sync(() => {
-                      reactorScopeCloseFiber = fiber;
-                    }),
-                  ),
-                )
-              : Effect.succeed(reactorScopeCloseFiber),
-          ),
-        );
-        yield* Fiber.join(closeFiber);
-      });
+      const { close: closeReactorScope } = yield* makeReactorScopeCloser(reactorScope);
       yield* runShutdownWithBudget({
         actions: {
           closeExternalAdmission: closeExternalAdmission.pipe(

@@ -503,6 +503,55 @@ describe("OrchestrationDeliveryRuntime", () => {
   );
 
   effectIt.effect(
+    "cancels a current-boot uncertain turn start against its exact pending target",
+    () =>
+      Effect.gen(function* () {
+        const providerDeliver = vi.fn<ProviderCommandReactor["Service"]["deliver"]>(() =>
+          Effect.succeed("delivered" as const),
+        );
+        const dispatchInternal = vi.fn<OrchestrationEngineService["Service"]["dispatchInternal"]>(
+          () => Effect.succeed({ sequence: 2 }),
+        );
+        const delivery = decodeNewDelivery({
+          ...deliveryFor(turnStartEvent(1, "current-boot-uncertain"), "current-boot"),
+          executionStartedAt: now,
+        });
+        const status = yield* Effect.gen(function* () {
+          const repository = yield* OrchestrationReactorDeliveries;
+          const runtime = yield* OrchestrationDeliveryRuntime;
+          yield* repository.insert(delivery);
+          yield* runtime.drain;
+          return Option.getOrThrow(yield* repository.getById(delivery.deliveryId)).status;
+        }).pipe(
+          Effect.provide(
+            createLayer({
+              providerDeliver,
+              dispatchInternal,
+              thread: absentSessionThread(),
+            }),
+          ),
+        );
+
+        expect(providerDeliver).not.toHaveBeenCalled();
+        expect(dispatchInternal).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "thread.session.interrupt-if-active",
+            reason: "provider-state-mismatch",
+            interruptionCode: "provider_state_mismatch",
+            target: expect.objectContaining({
+              kind: "pendingStart",
+              pendingMessageId: MessageId.make("message-1"),
+              deliveryId: delivery.deliveryId,
+              sourceEventId: delivery.sourceEventId,
+              expectedSession: { kind: "absent" },
+            }),
+          }),
+        );
+        expect(status).toBe("cancelled");
+      }),
+  );
+
+  effectIt.effect(
     "suppresses replay when an external effect succeeds but its terminal row update fails",
     () =>
       Effect.gen(function* () {

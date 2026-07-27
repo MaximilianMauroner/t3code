@@ -465,6 +465,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
   const enqueueCommand = (command: OrchestrationCommand, externalEffect: "hot" | "pure" | null) =>
     Effect.gen(function* () {
+      const maintenanceAcceptance = yield* maintenanceGate.ensureDispatchAllowed(command);
       const result = yield* admissionLock.withPermits(1)(
         Effect.gen(function* () {
           if (sealed) {
@@ -483,7 +484,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               phase: "quiescing",
             });
           }
-          const maintenanceAcceptance = yield* maintenanceGate.ensureDispatchAllowed(command);
           const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
           const envelope = {
             _tag: "command",
@@ -494,9 +494,18 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             startedAtMs: yield* Clock.currentTimeMillis,
           } satisfies CommandEnvelope;
           pendingCommands.add(envelope);
-          yield* Queue.offer(commandQueue, envelope);
+          const offered = yield* Queue.offer(commandQueue, envelope);
+          if (!offered) {
+            pendingCommands.delete(envelope);
+            return yield* new OrchestrationNotReadyError({
+              message: "Orchestration engine queue is unavailable.",
+              retryable: false,
+              retryAfterMs: 0,
+              phase: "sealed",
+            });
+          }
           return result;
-        }),
+        }).pipe(Effect.uninterruptible),
       );
       return yield* Deferred.await(result);
     });
@@ -623,7 +632,19 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 } satisfies CommandEnvelope;
                 yield* Effect.gen(function* () {
                   pendingCommands.add(envelope);
-                  yield* Queue.offer(commandQueue, envelope);
+                  const offered = yield* Queue.offer(commandQueue, envelope);
+                  if (!offered) {
+                    pendingCommands.delete(envelope);
+                    yield* releaseOwnedReservation.pipe(
+                      Effect.forkDetach({ startImmediately: true }),
+                    );
+                    return yield* new OrchestrationNotReadyError({
+                      message: "Orchestration engine queue is unavailable.",
+                      retryable: false,
+                      retryAfterMs: 0,
+                      phase: "sealed",
+                    });
+                  }
                   enqueued = true;
                 }).pipe(Effect.uninterruptible);
                 return deferred;
@@ -669,9 +690,18 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         const deferred = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
         const envelope = { _tag: "barrier", result: deferred } satisfies BarrierEnvelope;
         pendingBarriers.add(envelope);
-        yield* Queue.offer(commandQueue, envelope);
+        const offered = yield* Queue.offer(commandQueue, envelope);
+        if (!offered) {
+          pendingBarriers.delete(envelope);
+          return yield* new OrchestrationNotReadyError({
+            message: "Orchestration engine queue is unavailable.",
+            retryable: false,
+            retryAfterMs: 0,
+            phase: "sealed",
+          });
+        }
         return deferred;
-      }),
+      }).pipe(Effect.uninterruptible),
     );
     return yield* Deferred.await(result);
   });
@@ -684,9 +714,13 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         const deferred = yield* Deferred.make<void>();
         const envelope = { _tag: "stop", completed: deferred } satisfies StopEnvelope;
         pendingStops.add(envelope);
-        yield* Queue.offer(commandQueue, envelope);
+        const offered = yield* Queue.offer(commandQueue, envelope);
+        if (!offered) {
+          pendingStops.delete(envelope);
+          return null;
+        }
         return deferred;
-      }),
+      }).pipe(Effect.uninterruptible),
     );
     if (completed === null) return;
     yield* Deferred.await(completed);
@@ -695,24 +729,26 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     yield* PubSub.shutdown(eventPubSub);
   });
   const forceStop: OrchestrationEngineShape["forceStop"] = Effect.gen(function* () {
-    const snapshot = yield* Effect.sync(() => {
-      sealed = true;
-      externalAdmissionClosed = true;
-      activeReservationIds.clear();
-      const pending = {
-        commands: [...pendingCommands],
-        barriers: [...pendingBarriers],
-        stops: [...pendingStops],
-        maintenanceReservations: new Set([
-          ...activeBootstrapMaintenanceReservations,
-          ...[...pendingCommands].flatMap((envelope) =>
-            envelope.maintenanceReservation === null ? [] : [envelope.maintenanceReservation],
-          ),
-        ]),
-      };
-      workerFiber.interruptUnsafe();
-      return pending;
-    });
+    const snapshot = yield* admissionLock.withPermits(1)(
+      Effect.sync(() => {
+        sealed = true;
+        externalAdmissionClosed = true;
+        activeReservationIds.clear();
+        const pending = {
+          commands: [...pendingCommands],
+          barriers: [...pendingBarriers],
+          stops: [...pendingStops],
+          maintenanceReservations: new Set([
+            ...activeBootstrapMaintenanceReservations,
+            ...[...pendingCommands].flatMap((envelope) =>
+              envelope.maintenanceReservation === null ? [] : [envelope.maintenanceReservation],
+            ),
+          ]),
+        };
+        workerFiber.interruptUnsafe();
+        return pending;
+      }),
+    );
     yield* Deferred.succeed(reservationsDrained, undefined);
     const forceError = new OrchestrationNotReadyError({
       message: "Orchestration engine was force-stopped.",

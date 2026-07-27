@@ -55,9 +55,19 @@ export function threadRecoveryEvidence(thread: OrchestrationThread): ThreadRecov
   const startInterruption = thread.activities.findLast(
     (activity) => activity.kind === "session.start.interrupted" && activity.turnId === null,
   );
-  return startInterruption === undefined
-    ? null
-    : { kind: "start-interrupted", detectedAt: startInterruption.createdAt };
+  if (startInterruption === undefined) return null;
+
+  const supersededByTurn =
+    latestTurn !== null && latestTurn.requestedAt > startInterruption.createdAt;
+  const supersededByPendingRetry = thread.messages.some(
+    (message) =>
+      message.role === "user" &&
+      message.turnId === null &&
+      message.createdAt > startInterruption.createdAt,
+  );
+  if (supersededByTurn || supersededByPendingRetry) return null;
+
+  return { kind: "start-interrupted", detectedAt: startInterruption.createdAt };
 }
 
 /**

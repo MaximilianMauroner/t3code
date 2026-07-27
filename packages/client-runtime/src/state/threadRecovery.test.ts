@@ -288,6 +288,70 @@ describe("thread recovery events", () => {
 });
 
 describe("thread recovery helpers", () => {
+  const startInterruptionActivity = {
+    id: EventId.make("start-interruption"),
+    tone: "error" as const,
+    kind: "session.start.interrupted",
+    summary: "Turn start was interrupted.",
+    payload: { pendingMessageId: "message-pending" },
+    turnId: null,
+    sequence: 43,
+    createdAt: DETECTED_AT,
+  };
+
+  it("surfaces only an unresolved latest start interruption", () => {
+    const interrupted = {
+      ...baseThread,
+      latestTurn: null,
+      session: { ...baseThread.session!, status: "interrupted" as const, activeTurnId: null },
+      activities: [startInterruptionActivity],
+    };
+    expect(threadRecoveryEvidence(interrupted)).toEqual({
+      kind: "start-interrupted",
+      detectedAt: DETECTED_AT,
+    });
+
+    expect(
+      threadRecoveryEvidence({
+        ...interrupted,
+        latestTurn: {
+          ...baseThread.latestTurn!,
+          requestedAt: "2026-07-26T02:01:00.000Z",
+        },
+      }),
+    ).toBeNull();
+    expect(
+      threadRecoveryEvidence({
+        ...interrupted,
+        messages: [
+          ...interrupted.messages,
+          {
+            ...interrupted.messages[0]!,
+            id: MessageId.make("retry-pending"),
+            turnId: null,
+            createdAt: "2026-07-26T02:01:00.000Z",
+          },
+        ],
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps a newer pending-start interruption after an older completed turn", () => {
+    expect(
+      threadRecoveryEvidence({
+        ...baseThread,
+        latestTurn: {
+          ...baseThread.latestTurn!,
+          state: "completed",
+          requestedAt: "2026-07-26T01:00:00.000Z",
+          completedAt: "2026-07-26T01:30:00.000Z",
+        },
+        session: { ...baseThread.session!, status: "interrupted", activeTurnId: null },
+        activities: [startInterruptionActivity],
+      }),
+    ).toEqual({ kind: "start-interrupted", detectedAt: DETECTED_AT });
+  });
+
   it("resolves the exact older retry source with attachments", () => {
     const newerMessage = {
       ...baseThread.messages[0]!,

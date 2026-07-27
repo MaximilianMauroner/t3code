@@ -170,17 +170,19 @@ const make = Effect.gen(function* () {
     }
   });
 
-  const cancelPriorBootExecution = Effect.fn("cancelPriorBootExecution")(function* (
+  const cancelUncertainExecution = Effect.fn("cancelUncertainExecution")(function* (
     delivery: OrchestrationReactorDelivery,
+    recovery: {
+      readonly reason: "server-restarted" | "provider-state-mismatch";
+      readonly interruptionCode: "server_restart" | "provider_state_mismatch";
+      readonly checkpointDetail: string;
+      readonly genericDetail: string;
+    },
   ) {
     const event = yield* decodeOrchestrationEvent(delivery.payload);
     if (delivery.deliveryKind === "checkpoint-revert") {
       const detectedAt = DateTime.formatIso(yield* DateTime.now);
-      yield* appendNonReplayCancellationEvidence(
-        delivery,
-        "The server restarted while checkpoint rollback completion was uncertain; replay was suppressed to prevent duplicate provider rollback.",
-        detectedAt,
-      );
+      yield* appendNonReplayCancellationEvidence(delivery, recovery.checkpointDetail, detectedAt);
       return "cancelled" as const;
     }
     const thread = yield* snapshots
@@ -218,11 +220,7 @@ const make = Effect.gen(function* () {
     }
     if (target === null) {
       const detectedAt = DateTime.formatIso(yield* DateTime.now);
-      yield* appendNonReplayCancellationEvidence(
-        delivery,
-        "The server restarted before this external action reached a durable terminal result; replay was suppressed.",
-        detectedAt,
-      );
+      yield* appendNonReplayCancellationEvidence(delivery, recovery.genericDetail, detectedAt);
       return "cancelled" as const;
     }
 
@@ -234,12 +232,12 @@ const make = Effect.gen(function* () {
           threadId: delivery.threadId,
           target,
           serverBootId: bootId,
-          reason: "server-restarted",
+          reason: recovery.reason,
         }),
         threadId: delivery.threadId,
         target,
-        reason: "server-restarted",
-        interruptionCode: "server_restart",
+        reason: recovery.reason,
+        interruptionCode: recovery.interruptionCode,
         serverBootId: bootId,
         detectedAt,
         createdAt: detectedAt,
@@ -269,16 +267,24 @@ const make = Effect.gen(function* () {
       delivery.replayPolicy === "cancel-with-recovery" && delivery.executionStartedAt !== null;
     let resolution: "delivered" | "cancelled";
     if (shouldCancelPriorExecution) {
-      resolution = yield* cancelPriorBootExecution(delivery);
+      resolution = yield* cancelUncertainExecution(delivery, {
+        reason: "server-restarted",
+        interruptionCode: "server_restart",
+        checkpointDetail:
+          "The server restarted while checkpoint rollback completion was uncertain; replay was suppressed to prevent duplicate provider rollback.",
+        genericDetail:
+          "The server restarted before this external action reached a durable terminal result; replay was suppressed.",
+      });
     } else if (hasUncertainExecution) {
       noteExecutionMayHaveStarted();
-      const detectedAt = DateTime.formatIso(yield* DateTime.now);
-      yield* appendNonReplayCancellationEvidence(
-        delivery,
-        "A previous claim reached the external-execution boundary but did not persist a terminal result; replay was suppressed.",
-        detectedAt,
-      );
-      resolution = "cancelled";
+      resolution = yield* cancelUncertainExecution(delivery, {
+        reason: "provider-state-mismatch",
+        interruptionCode: "provider_state_mismatch",
+        checkpointDetail:
+          "A checkpoint rollback reached the external-execution boundary without a durable terminal result; replay was suppressed.",
+        genericDetail:
+          "A previous claim reached the external-execution boundary but did not persist a terminal result; replay was suppressed.",
+      });
     } else {
       yield* validateClaimed(delivery);
       if (delivery.replayPolicy === "cancel-with-recovery") {

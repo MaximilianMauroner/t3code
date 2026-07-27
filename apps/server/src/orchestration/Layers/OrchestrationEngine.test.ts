@@ -1084,6 +1084,48 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
+  it("force-stops while a producer is paused before final admission", async () => {
+    const producerEntered = Deferred.makeUnsafe<void>();
+    const allowProducer = Deferred.makeUnsafe<void>();
+    const gateService: UpdateMaintenanceGateService = {
+      acquire: Effect.succeed({ pid: process.pid, token: "test-maintenance-token" }),
+      release: Effect.void,
+      isHeld: Effect.succeed(false),
+      ensureDispatchAllowed: () =>
+        Deferred.succeed(producerEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(allowProducer)),
+          Effect.as({ generation: 0 }),
+        ),
+      reserveDispatchAllowed: (_command, ownerScope) => {
+        const reservation: UpdateDispatchReservation = {
+          withDispatchAllowed: (_command, effect) => effect,
+          cancel: Effect.void,
+        };
+        return Scope.addFinalizer(ownerScope, reservation.cancel).pipe(Effect.as(reservation));
+      },
+      withDispatchAllowed: (_command, _acceptance, effect) => effect,
+    };
+    const system = await createOrchestrationSystem(gateService);
+    const dispatchFiber = await system.run(
+      system.engine
+        .dispatchInternal({
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-paused-before-force-stop"),
+          threadId: ThreadId.make("thread-paused-before-force-stop"),
+        })
+        .pipe(Effect.forkDetach({ startImmediately: true })),
+    );
+    await system.run(Deferred.await(producerEntered));
+
+    await expect(
+      system.run(system.engine.forceStop.pipe(Effect.timeout("250 millis"))),
+    ).resolves.toBeUndefined();
+    await system.run(Deferred.succeed(allowProducer, undefined));
+    const exit = await system.run(Fiber.await(dispatchFiber).pipe(Effect.timeout("250 millis")));
+    expect(Exit.isFailure(exit)).toBe(true);
+    await system.dispose();
+  });
+
   it("force-stops without awaiting a stuck maintenance reservation cancellation", async () => {
     const gateService: UpdateMaintenanceGateService = {
       acquire: Effect.succeed({ pid: process.pid, token: "test-maintenance-token" }),

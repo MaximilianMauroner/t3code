@@ -7,7 +7,11 @@ import * as Exit from "effect/Exit";
 import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 
-import { runShutdownSequence, runShutdownWithBudget } from "./ShutdownCoordinator.ts";
+import {
+  makeReactorScopeCloser,
+  runShutdownSequence,
+  runShutdownWithBudget,
+} from "./ShutdownCoordinator.ts";
 import {
   hasSafeEffectiveTimeoutStop,
   MINIMUM_EFFECTIVE_TIMEOUT_STOP_SECONDS,
@@ -43,6 +47,33 @@ it.effect("records the graceful shutdown linearization order", () =>
       "seal",
       "reactors-close",
     ]);
+  }),
+);
+
+it.effect("shares one reactor scope close fiber across interrupted callers", () =>
+  Effect.gen(function* () {
+    const scope = yield* Scope.make("sequential");
+    const finalizerStarted = yield* Deferred.make<void>();
+    const allowFinalizer = yield* Deferred.make<void>();
+    const starts = yield* Ref.make(0);
+    yield* Scope.addFinalizer(
+      scope,
+      Ref.update(starts, (count) => count + 1).pipe(
+        Effect.andThen(Deferred.succeed(finalizerStarted, undefined)),
+        Effect.andThen(Deferred.await(allowFinalizer)),
+      ),
+    );
+    const { close } = yield* makeReactorScopeCloser(scope);
+    const first = yield* close.pipe(Effect.forkChild);
+    yield* Deferred.await(finalizerStarted);
+    first.interruptUnsafe();
+    const second = yield* close.pipe(Effect.forkChild);
+    yield* Effect.yieldNow;
+    assert.equal(second.pollUnsafe(), undefined);
+    assert.equal(yield* Ref.get(starts), 1);
+    yield* Deferred.succeed(allowFinalizer, undefined);
+    yield* Fiber.join(second);
+    assert.equal(yield* Ref.get(starts), 1);
   }),
 );
 
