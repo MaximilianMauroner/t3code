@@ -77,10 +77,7 @@ export function resolveCodexUsageSnapshot(input: {
 
   if (!selected && exact.length === 0) {
     const generic = entries.filter(([key, bucket]) => bucketIdentifiers(key, bucket).has("codex"));
-    const competing = entries.filter(
-      ([key, bucket]) => !bucketIdentifiers(key, bucket).has("codex"),
-    );
-    if (generic.length === 1 && competing.length === 0) selected = generic[0]!;
+    if (generic.length === 1) selected = generic[0]!;
     if (entries.length === 0 && input.payload.rateLimits) {
       const legacy = input.payload.rateLimits;
       const legacyKey = legacy.limitId?.trim() ?? "";

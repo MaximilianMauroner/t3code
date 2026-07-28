@@ -2193,6 +2193,34 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     ],
   );
 
+  const showCodexUsage = canShowCodexUsage(selectedProviderStatus) && !noProviderAvailable;
+  const providerModelPicker = (
+    <ProviderModelPicker
+      compact={isComposerFooterCompact}
+      activeInstanceId={selectedInstanceId}
+      model={selectedModelForPickerWithCustomFallback}
+      lockedProvider={lockedProvider}
+      lockedContinuationGroupKey={lockedContinuationGroupKey}
+      instanceEntries={providerInstanceEntries}
+      keybindings={keybindings}
+      modelOptionsByInstance={modelOptionsByInstance}
+      terminalOpen={terminalOpen}
+      open={isComposerModelPickerOpen}
+      hideTriggerTooltip={showCodexUsage}
+      popoverSide={showCodexUsage ? "top" : "bottom"}
+      {...(composerProviderState.modelPickerIconClassName
+        ? {
+            activeProviderIconClassName: composerProviderState.modelPickerIconClassName,
+          }
+        : {})}
+      onOpenChange={(open) => {
+        setIsComposerModelPickerOpen(open);
+      }}
+      getModelDisabledReason={getModelDisabledReason}
+      onInstanceModelChange={onProviderModelSelect}
+    />
+  );
+
   // Render
   // ------------------------------------------------------------------
   return (
@@ -2647,39 +2675,19 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     <CircleAlertIcon className="size-4" />
                     No provider available
                   </Button>
-                ) : (
-                  <ProviderModelPicker
-                    compact={isComposerFooterCompact}
-                    activeInstanceId={selectedInstanceId}
-                    model={selectedModelForPickerWithCustomFallback}
-                    lockedProvider={lockedProvider}
-                    lockedContinuationGroupKey={lockedContinuationGroupKey}
-                    instanceEntries={providerInstanceEntries}
-                    keybindings={keybindings}
-                    modelOptionsByInstance={modelOptionsByInstance}
-                    terminalOpen={terminalOpen}
-                    open={isComposerModelPickerOpen}
-                    {...(composerProviderState.modelPickerIconClassName
-                      ? {
-                          activeProviderIconClassName:
-                            composerProviderState.modelPickerIconClassName,
-                        }
-                      : {})}
-                    onOpenChange={(open) => {
-                      setIsComposerModelPickerOpen(open);
-                    }}
-                    getModelDisabledReason={getModelDisabledReason}
-                    onInstanceModelChange={onProviderModelSelect}
-                  />
-                )}
-                {canShowCodexUsage(selectedProviderStatus) && !noProviderAvailable ? (
+                ) : showCodexUsage ? (
                   <CodexUsageIndicator
                     key={`${selectedInstanceId}:${selectedModel}`}
                     environmentId={environmentId}
                     providerInstanceId={selectedInstanceId}
                     model={selectedModel}
-                  />
-                ) : null}
+                    modelPickerOpen={isComposerModelPickerOpen}
+                  >
+                    {providerModelPicker}
+                  </CodexUsageIndicator>
+                ) : (
+                  providerModelPicker
+                )}
 
                 {isComposerFooterCompact ? (
                   <CompactComposerControlsMenu

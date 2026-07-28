@@ -29,16 +29,22 @@ describe("resolveCodexUsageSnapshot", () => {
     });
   });
 
-  it("uses a generic bucket only when it is the sole bucket", () => {
+  it("uses the generic bucket when dedicated model buckets do not match", () => {
     expect(
       resolve("gpt-5.3", { rateLimitsByLimitId: { codex: bucket("codex", 25) } })?.windows[0]
         ?.remainingPercent,
     ).toBe(75);
-    expect(
-      resolve("gpt-5.3", {
-        rateLimitsByLimitId: { codex: bucket("codex", 25), other: bucket("other", 10) },
-      }),
-    ).toBeNull();
+    const payload = {
+      rateLimitsByLimitId: {
+        codex: bucket("codex", 25),
+        codex_bengalfox: {
+          ...bucket("codex_bengalfox", 10),
+          limitName: "GPT-5.3-Codex-Spark",
+        },
+      },
+    };
+    expect(resolve("gpt-5.6-sol", payload)?.windows[0]?.remainingPercent).toBe(75);
+    expect(resolve("gpt-5.3-codex-spark", payload)?.windows[0]?.remainingPercent).toBe(90);
   });
 
   it("never falls back to the first unmatched model bucket", () => {

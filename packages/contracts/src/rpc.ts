@@ -276,6 +276,7 @@ export const WsServerGetCodexUsageRpc = Rpc.make(WS_METHODS.serverGetCodexUsage,
     model: Schema.String,
   }),
   success: Schema.NullOr(CodexUsageSnapshot),
+  error: EnvironmentAuthorizationError,
 });
 
 export const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
