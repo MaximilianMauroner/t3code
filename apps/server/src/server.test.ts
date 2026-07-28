@@ -563,12 +563,6 @@ const buildAppUnderTest = (options?: {
         }),
       ),
       Layer.provide(
-        Layer.mock(ProviderService.ProviderService)({
-          getCodexUsage: () => Effect.succeed(null),
-          ...options?.layers?.providerService,
-        }),
-      ),
-      Layer.provide(
         Layer.mock(ServerSettings.ServerSettingsService)({
           start: Effect.void,
           ready: Effect.void,
@@ -765,6 +759,12 @@ const buildAppUnderTest = (options?: {
     );
 
     const appLayer = servedRoutesLayer.pipe(
+      Layer.provide(
+        Layer.mock(ProviderService.ProviderService)({
+          getCodexUsage: () => Effect.succeed(null),
+          ...options?.layers?.providerService,
+        }),
+      ),
       Layer.provide(
         Layer.mock(BrowserTraceCollector.BrowserTraceCollector)({
           record: () => Effect.void,
