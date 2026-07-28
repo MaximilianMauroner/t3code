@@ -188,7 +188,7 @@ if [ ! -f "$sentinel" ] || [ "$(cat "$sentinel")" != "$commit" ] || [ ! -f "$ent
   run_pnpm -C "$repo" exec vp run --filter @t3tools/contracts --filter @t3tools/web --filter t3 typecheck
   run_pnpm -C "$repo" exec vp run --filter @t3tools/web build
   run_pnpm -C "$repo" exec vp run --filter t3 build
-  run_pnpm -C "$repo" --filter t3 deploy --prod --legacy --offline "$staged_package"
+  run_pnpm -C "$repo" --config.inject-workspace-packages=true --filter t3 deploy --prod --offline "$staged_package"
   run_as_user "$node_path" "$staged_package/dist/bin.mjs" --version >/dev/null
   run_as_user sh -c 'printf "%s\n" "$1" >"$2"' bootstrap "$commit" "$staged_release/.t3-fork-release-complete"
   rm -rf "$release_dir"

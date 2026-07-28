@@ -665,7 +665,15 @@ export const make = Effect.fn("cloud.fork_update.make")(function* (options?: {
         const stagedPackage = path.join(stagedRelease, "node_modules", "t3");
         yield* run(
           "pnpm",
-          ["--filter", "t3", "deploy", "--prod", "--legacy", "--offline", stagedPackage],
+          [
+            "--config.inject-workspace-packages=true",
+            "--filter",
+            "t3",
+            "deploy",
+            "--prod",
+            "--offline",
+            stagedPackage,
+          ],
           repo,
         );
         const stagedEntry = path.join(stagedPackage, "dist", "bin.mjs");

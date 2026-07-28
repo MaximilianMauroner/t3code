@@ -986,7 +986,7 @@ describe("fork service bootstrap installer", () => {
   it("deploys the built server offline before publishing the immutable release", () => {
     const buildIndex = installer.indexOf('run_pnpm -C "$repo" exec vp run --filter t3 build');
     const deployIndex = installer.indexOf(
-      'run_pnpm -C "$repo" --filter t3 deploy --prod --legacy --offline "$staged_package"',
+      'run_pnpm -C "$repo" --config.inject-workspace-packages=true --filter t3 deploy --prod --offline "$staged_package"',
     );
     const stagedPreflightIndex = installer.indexOf(
       'run_as_user "$node_path" "$staged_package/dist/bin.mjs" --version',
@@ -1002,7 +1002,7 @@ describe("fork service bootstrap installer", () => {
     expect(sentinelIndex).toBeGreaterThan(stagedPreflightIndex);
     expect(renameIndex).toBeGreaterThan(sentinelIndex);
     expect(finalPreflightIndex).toBeGreaterThan(renameIndex);
-    expect(installer.match(/--filter t3 deploy --prod --legacy --offline/g)).toHaveLength(1);
+    expect(installer.match(/--filter t3 deploy --prod --offline/g)).toHaveLength(1);
     expect(installer).not.toContain("--filter t3 pack");
     expect(installer).not.toContain(" add --prod ");
     expect(installer).not.toContain("tarball=");

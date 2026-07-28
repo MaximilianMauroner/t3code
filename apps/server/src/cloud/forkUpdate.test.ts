@@ -316,7 +316,7 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
       const buildIndex = commands.findIndex((command) =>
         command.includes("pnpm exec vp run --filter t3 build"),
       );
-      const deployCommand = `pnpm --filter t3 deploy --prod --legacy --offline ${context.releasesDir}/.release-new-commit/node_modules/t3`;
+      const deployCommand = `pnpm --config.inject-workspace-packages=true --filter t3 deploy --prod --offline ${context.releasesDir}/.release-new-commit/node_modules/t3`;
       const deployIndex = commands.indexOf(deployCommand);
       const stagedPreflightIndex = commands.findIndex((command) =>
         command.endsWith(
@@ -667,7 +667,7 @@ it.layer(NodeServices.layer)("ForkUpdate", (it) => {
         commands.some(
           (command) =>
             command ===
-            `pnpm --filter t3 deploy --prod --legacy --offline ${context.releasesDir}/.release-new-commit/node_modules/t3`,
+            `pnpm --config.inject-workspace-packages=true --filter t3 deploy --prod --offline ${context.releasesDir}/.release-new-commit/node_modules/t3`,
         ),
       );
       const fs = yield* FileSystem.FileSystem;
