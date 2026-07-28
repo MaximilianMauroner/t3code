@@ -83,6 +83,7 @@ import {
   observeRpcStreamEffect as instrumentRpcStreamEffect,
 } from "./observability/RpcInstrumentation.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
+import * as ProviderService from "./provider/Services/ProviderService.ts";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ForkUpdate from "./cloud/forkUpdate.ts";
@@ -308,6 +309,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [ORCHESTRATION_WS_METHODS.subscribeThread, AuthOrchestrationReadScope],
   [WS_METHODS.serverProbe, AuthOrchestrationReadScope],
   [WS_METHODS.serverGetConfig, AuthOrchestrationReadScope],
+  [WS_METHODS.serverGetCodexUsage, AuthOrchestrationReadScope],
   [WS_METHODS.serverRefreshProviders, AuthOrchestrationOperateScope],
   [WS_METHODS.serverUpdateProvider, AuthOrchestrationOperateScope],
   [WS_METHODS.serverUpdateServer, AuthOrchestrationOperateScope],
@@ -373,6 +375,14 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.subscribeAuthAccess, AuthAccessReadScope],
 ]);
 
+export function requiredScopeForRpcMethod(method: string): AuthEnvironmentScope {
+  const requiredScope = RPC_REQUIRED_SCOPE.get(method);
+  if (requiredScope === undefined) {
+    throw new Error(`RPC method ${method} has no declared authorization scope.`);
+  }
+  return requiredScope;
+}
+
 function toAuthAccessStreamEvent(
   change: PairingGrantStore.BootstrapCredentialChange | SessionStore.SessionCredentialChange,
   revision: number,
@@ -434,6 +444,7 @@ const makeWsRpcLayer = (
       const previewManager = yield* PreviewManager.PreviewManager;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
+      const providerService = yield* ProviderService.ProviderService;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
       const forkUpdate = yield* ForkUpdate.ForkUpdate;
@@ -483,13 +494,6 @@ const makeWsRpcLayer = (
         currentSession.scopes.includes(requiredScope)
           ? stream
           : Stream.fail(authorizationError(requiredScope));
-      const requiredScopeForMethod = (method: string): AuthEnvironmentScope => {
-        const requiredScope = RPC_REQUIRED_SCOPE.get(method);
-        if (requiredScope === undefined) {
-          throw new Error(`RPC method ${method} has no declared authorization scope.`);
-        }
-        return requiredScope;
-      };
       const observeRpcEffect = <A, E, R>(
         method: string,
         effect: Effect.Effect<A, E, R>,
@@ -497,7 +501,7 @@ const makeWsRpcLayer = (
       ) =>
         instrumentRpcEffect(
           method,
-          authorizeEffect(requiredScopeForMethod(method), effect),
+          authorizeEffect(requiredScopeForRpcMethod(method), effect),
           traceAttributes,
         );
       const observeRpcStream = <A, E, R>(
@@ -507,7 +511,7 @@ const makeWsRpcLayer = (
       ) =>
         instrumentRpcStream(
           method,
-          authorizeStream(requiredScopeForMethod(method), stream),
+          authorizeStream(requiredScopeForRpcMethod(method), stream),
           traceAttributes,
         );
       const observeRpcStreamEffect = <A, StreamError, StreamContext, EffectError, EffectContext>(
@@ -521,7 +525,7 @@ const makeWsRpcLayer = (
       ) =>
         instrumentRpcStreamEffect(
           method,
-          authorizeEffect(requiredScopeForMethod(method), effect),
+          authorizeEffect(requiredScopeForRpcMethod(method), effect),
           traceAttributes,
         );
       const toDispatchCommandError = (cause: unknown, fallbackMessage: string) =>
@@ -1463,6 +1467,12 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.serverGetConfig, loadServerConfig, {
             "rpc.aggregate": "server",
           }),
+        [WS_METHODS.serverGetCodexUsage]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.serverGetCodexUsage,
+            providerService.getCodexUsage(input).pipe(Effect.catch(() => Effect.succeed(null))),
+            { "rpc.aggregate": "server" },
+          ),
         [WS_METHODS.serverRefreshProviders]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverRefreshProviders,

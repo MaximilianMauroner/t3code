@@ -9,6 +9,7 @@
  */
 import type {
   ApprovalRequestId,
+  CodexUsageSnapshot,
   ProviderApprovalDecision,
   ProviderDriverKind,
   ProviderUserInputAnswers,
@@ -165,6 +166,8 @@ export interface ProviderAdapterShape<TError> {
     threadId: ThreadId,
     numTurns: number,
   ) => Effect.Effect<ProviderThreadSnapshot, TError>;
+
+  readonly readCodexUsage?: (model: string) => Effect.Effect<CodexUsageSnapshot | null, TError>;
 
   /**
    * Stop all sessions owned by this adapter.

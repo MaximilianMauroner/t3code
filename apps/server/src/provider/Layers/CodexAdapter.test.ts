@@ -34,6 +34,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as CodexErrors from "effect-codex-app-server/errors";
+import type * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -63,6 +64,10 @@ const asItemId = (value: string): ProviderItemId => ProviderItemId.make(value);
 class FakeCodexRuntime implements CodexSessionRuntimeShape {
   private readonly eventQueue = Effect.runSync(Queue.unbounded<ProviderEvent>());
   private readonly now = "2026-01-01T00:00:00.000Z";
+  public rateLimitsShouldFail = false;
+  public accountShouldFail = false;
+  public rateLimitsGate: Deferred.Deferred<void> | null = null;
+  public rateLimitsStarted: Deferred.Deferred<void> | null = null;
 
   public readonly startImpl = vi.fn(() =>
     Promise.resolve({
@@ -116,6 +121,28 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
   );
 
   public readonly closeImpl = vi.fn(() => Promise.resolve(undefined));
+  public readonly readAccountRateLimitsImpl = vi.fn(
+    (): Promise<EffectCodexSchema.V2GetAccountRateLimitsResponse> =>
+      Promise.resolve({
+        rateLimits: {
+          limitId: "codex",
+          primary: { usedPercent: 25, windowDurationMins: 300 },
+        },
+        rateLimitsByLimitId: {
+          "gpt-5.3-codex": {
+            limitId: "gpt-5.3-codex",
+            primary: { usedPercent: 40, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+          },
+        },
+      }),
+  );
+  public readonly readAccountImpl = vi.fn(
+    (): Promise<EffectCodexSchema.V2GetAccountResponse> =>
+      Promise.resolve({
+        account: { type: "chatgpt", email: "test@example.com", planType: "plus" },
+        requiresOpenaiAuth: true,
+      }),
+  );
 
   readonly options: CodexSessionRuntimeOptions;
 
@@ -128,6 +155,33 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
   }
 
   getSession = Effect.promise(() => this.startImpl());
+  get readAccountRateLimits() {
+    const started = this.rateLimitsStarted;
+    const gate = this.rateLimitsGate;
+    const read = () => this.readAccountRateLimitsImpl();
+    return this.rateLimitsShouldFail
+      ? Effect.fail(
+          new CodexErrors.CodexAppServerTransportError({
+            operation: "read-input-stream",
+            cause: new Error("temporary usage failure"),
+          }),
+        )
+      : Effect.gen(function* () {
+          if (started) yield* Deferred.succeed(started, undefined);
+          if (gate) yield* Deferred.await(gate);
+          return yield* Effect.promise(read);
+        });
+  }
+  readAccount = Effect.suspend(() =>
+    this.accountShouldFail
+      ? Effect.fail(
+          new CodexErrors.CodexAppServerTransportError({
+            operation: "read-input-stream",
+            cause: new Error("temporary account failure"),
+          }),
+        )
+      : Effect.promise(() => this.readAccountImpl()),
+  );
 
   sendTurn(input: CodexSessionRuntimeSendTurnInput) {
     return Effect.promise(() => this.sendTurnImpl(input));
@@ -164,8 +218,10 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
 
 function makeRuntimeFactory() {
   const runtimes: Array<FakeCodexRuntime> = [];
+  let accountResponse: EffectCodexSchema.V2GetAccountResponse | null = null;
   const factory = vi.fn((options: CodexSessionRuntimeOptions) => {
     const runtime = new FakeCodexRuntime(options);
+    if (accountResponse) runtime.readAccountImpl.mockResolvedValue(accountResponse);
     runtimes.push(runtime);
     return Effect.succeed(runtime);
   });
@@ -174,6 +230,9 @@ function makeRuntimeFactory() {
     factory,
     get lastRuntime(): FakeCodexRuntime | undefined {
       return runtimes.at(-1);
+    },
+    set accountResponse(value: EffectCodexSchema.V2GetAccountResponse | null) {
+      accountResponse = value;
     },
   };
 }
@@ -241,6 +300,38 @@ const validationLayer = it.layer(
 );
 
 validationLayer("CodexAdapterLive validation", (it) => {
+  it.effect("reads model-specific usage without starting a thread", () =>
+    Effect.gen(function* () {
+      validationRuntimeFactory.factory.mockClear();
+      const adapter = yield* CodexAdapter;
+      const usage = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+
+      NodeAssert.equal(validationRuntimeFactory.factory.mock.calls.length, 1);
+      NodeAssert.equal(validationRuntimeFactory.lastRuntime?.startImpl.mock.calls.length, 0);
+      NodeAssert.deepStrictEqual(
+        usage?.windows.map((window) => window.remainingPercent),
+        [60],
+      );
+      NodeAssert.equal(usage?.model, "gpt-5.3-codex");
+      validationRuntimeFactory.factory.mockClear();
+    }),
+  );
+  it.effect("suppresses API-key usage without reading rate limits", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      validationRuntimeFactory.factory.mockClear();
+      validationRuntimeFactory.accountResponse = {
+        account: { type: "apiKey" },
+        requiresOpenaiAuth: false,
+      };
+      const usage = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+      const runtime = validationRuntimeFactory.lastRuntime;
+      NodeAssert.equal(usage, null);
+      NodeAssert.equal(runtime?.readAccountRateLimitsImpl.mock.calls.length ?? 0, 0);
+      validationRuntimeFactory.accountResponse = null;
+      validationRuntimeFactory.factory.mockClear();
+    }),
+  );
   it.effect("returns validation error for non-codex provider on startSession", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;
@@ -482,6 +573,7 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
 });
 
 const lifecycleRuntimeFactory = makeRuntimeFactory();
+let lifecycleUsageNow = new Date("2026-01-01T00:00:00.000Z");
 const lifecycleLayer = it.layer(
   Layer.effect(
     CodexAdapter,
@@ -489,6 +581,7 @@ const lifecycleLayer = it.layer(
       const codexConfig = decodeCodexSettings({});
       return yield* makeCodexAdapter(codexConfig, {
         makeRuntime: lifecycleRuntimeFactory.factory,
+        now: () => lifecycleUsageNow,
       });
     }),
   ).pipe(
@@ -514,6 +607,59 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect(
+    "merges sparse notifications, preserves observation time, and reconciles full reads",
+    () =>
+      Effect.gen(function* () {
+        const { adapter, runtime } = yield* startLifecycleRuntime();
+        lifecycleUsageNow = new Date("2026-01-02T00:00:00.000Z");
+        const initial = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+        NodeAssert.equal(initial?.windows[0]?.remainingPercent, 60);
+        NodeAssert.equal(initial?.checkedAt, "2026-01-02T00:00:00.000Z");
+
+        const eventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+        yield* runtime.emit({
+          id: asEventId("evt-rate-limits"),
+          kind: "notification",
+          provider: ProviderDriverKind.make("codex"),
+          createdAt: "2026-02-03T04:05:06.000Z",
+          method: "account/rateLimits/updated",
+          threadId: asThreadId("thread-1"),
+          payload: {
+            rateLimits: {
+              limitId: "gpt-5.3-codex",
+              primary: { usedPercent: 65 },
+            },
+          },
+        });
+        yield* Fiber.join(eventFiber);
+
+        runtime.rateLimitsShouldFail = true;
+        const retained = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+        NodeAssert.equal(retained?.source, "notification");
+        NodeAssert.equal(retained?.checkedAt, "2026-02-03T04:05:06.000Z");
+        NodeAssert.equal(retained?.windows[0]?.remainingPercent, 35);
+        NodeAssert.equal(retained?.windows[0]?.windowDurationMins, 300);
+        NodeAssert.equal(retained?.windows[0]?.resetsAt, "2027-01-15T08:00:00.000Z");
+
+        runtime.rateLimitsShouldFail = false;
+        lifecycleUsageNow = new Date("2026-02-04T00:00:00.000Z");
+        runtime.readAccountRateLimitsImpl.mockResolvedValue({
+          rateLimits: { limitId: "codex", primary: { usedPercent: 5 } },
+          rateLimitsByLimitId: {
+            "gpt-5.3-codex": {
+              limitId: "gpt-5.3-codex",
+              primary: { usedPercent: 10, windowDurationMins: 300 },
+            },
+          },
+        });
+        const reconciled = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+        NodeAssert.equal(reconciled?.source, "read");
+        NodeAssert.equal(reconciled?.windows[0]?.remainingPercent, 90);
+        NodeAssert.equal(reconciled?.checkedAt, "2026-02-04T00:00:00.000Z");
+      }),
+  );
+
   it.effect("holds a liveness marker behind a paused lifecycle enqueue", () =>
     Effect.gen(function* () {
       const mutationObserved = yield* Deferred.make<void>();
@@ -584,6 +730,116 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
         yield* Fiber.join(markerFiber);
         yield* adapter.stopAll();
       }).pipe(Effect.provide(raceLayer));
+    }),
+  );
+
+  it.effect("invalidates retained usage across account transitions", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      NodeAssert.ok(yield* adapter.readCodexUsage!("gpt-5.3-codex"));
+      const rateLimitReads = runtime.readAccountRateLimitsImpl.mock.calls.length;
+
+      runtime.readAccountImpl.mockResolvedValue({
+        account: { type: "apiKey" },
+        requiresOpenaiAuth: false,
+      });
+      NodeAssert.equal(yield* adapter.readCodexUsage!("gpt-5.3-codex"), null);
+      NodeAssert.equal(runtime.readAccountRateLimitsImpl.mock.calls.length, rateLimitReads);
+
+      runtime.accountShouldFail = true;
+      NodeAssert.equal(yield* adapter.readCodexUsage!("gpt-5.3-codex"), null);
+    }),
+  );
+
+  it.effect("invalidates retained usage on account update notifications", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      NodeAssert.ok(yield* adapter.readCodexUsage!("gpt-5.3-codex"));
+      const eventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      yield* runtime.emit({
+        id: asEventId("evt-account-updated"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-02-03T04:05:06.000Z",
+        method: "account/updated",
+        threadId: asThreadId("thread-1"),
+        payload: { authMode: "apikey" },
+      });
+      yield* Fiber.join(eventFiber);
+      runtime.accountShouldFail = true;
+      NodeAssert.equal(yield* adapter.readCodexUsage!("gpt-5.3-codex"), null);
+    }),
+  );
+
+  it.effect("does not let an older in-flight read overwrite a newer notification", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      NodeAssert.ok(yield* adapter.readCodexUsage!("gpt-5.3-codex"));
+      runtime.rateLimitsStarted = yield* Deferred.make<void>();
+      runtime.rateLimitsGate = yield* Deferred.make<void>();
+      runtime.readAccountRateLimitsImpl.mockResolvedValue({
+        rateLimits: { limitId: "codex", primary: { usedPercent: 5 } },
+        rateLimitsByLimitId: {
+          "gpt-5.3-codex": {
+            limitId: "gpt-5.3-codex",
+            primary: { usedPercent: 10, windowDurationMins: 300 },
+          },
+        },
+      });
+      const readFiber = yield* adapter.readCodexUsage!("gpt-5.3-codex").pipe(Effect.forkChild);
+      yield* Deferred.await(runtime.rateLimitsStarted);
+
+      const eventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      yield* runtime.emit({
+        id: asEventId("evt-race-rate-limits"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-03-01T00:00:00.000Z",
+        method: "account/rateLimits/updated",
+        threadId: asThreadId("thread-1"),
+        payload: {
+          rateLimits: {
+            limitId: "gpt-5.3-codex",
+            primary: { usedPercent: 70 },
+          },
+        },
+      });
+      yield* Fiber.join(eventFiber);
+      yield* Deferred.succeed(runtime.rateLimitsGate, undefined);
+      const raced = yield* Fiber.join(readFiber);
+      NodeAssert.equal(raced?.source, "notification");
+      NodeAssert.equal(raced?.checkedAt, "2026-03-01T00:00:00.000Z");
+      NodeAssert.equal(raced?.windows[0]?.remainingPercent, 30);
+      runtime.rateLimitsGate = null;
+      runtime.rateLimitsStarted = null;
+    }),
+  );
+
+  it.effect("applies a notification that arrives after a completed read", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const read = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+      NodeAssert.equal(read?.source, "read");
+      const eventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      yield* runtime.emit({
+        id: asEventId("evt-after-read-rate-limits"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: "2026-03-02T00:00:00.000Z",
+        method: "account/rateLimits/updated",
+        threadId: asThreadId("thread-1"),
+        payload: {
+          rateLimits: {
+            limitId: "gpt-5.3-codex",
+            primary: { usedPercent: 75 },
+          },
+        },
+      });
+      yield* Fiber.join(eventFiber);
+      runtime.rateLimitsShouldFail = true;
+      const retained = yield* adapter.readCodexUsage!("gpt-5.3-codex");
+      NodeAssert.equal(retained?.source, "notification");
+      NodeAssert.equal(retained?.windows[0]?.remainingPercent, 25);
     }),
   );
 

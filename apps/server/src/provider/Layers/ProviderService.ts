@@ -1045,6 +1045,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const getInstanceInfo: ProviderServiceMethod<"getInstanceInfo"> = (instanceId) =>
     registry.getInstanceInfo(instanceId);
 
+  const getCodexUsage: ProviderServiceMethod<"getCodexUsage"> = Effect.fn(
+    "ProviderService.getCodexUsage",
+  )(function* (input) {
+    const info = yield* registry
+      .getInstanceInfo(input.providerInstanceId)
+      .pipe(Effect.catch(() => Effect.succeed(null)));
+    if (!info || info.driverKind !== "codex") return null;
+    const adapter = yield* registry
+      .getByInstance(input.providerInstanceId)
+      .pipe(Effect.catch(() => Effect.succeed(null)));
+    if (!adapter?.readCodexUsage) return null;
+    return yield* adapter
+      .readCodexUsage(input.model)
+      .pipe(Effect.catch(() => Effect.succeed(null)));
+  });
+
   const inspectTarget: NonNullable<ProviderServiceMethod<"inspectTarget">> = Effect.fn(
     "ProviderService.inspectTarget",
   )(function* (input) {
@@ -1191,6 +1207,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     listSessions,
     getCapabilities,
     getInstanceInfo,
+    getCodexUsage,
     inspectTarget,
     rollbackConversation,
     // Each access creates a fresh PubSub subscription so that multiple

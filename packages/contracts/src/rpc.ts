@@ -60,6 +60,7 @@ import {
   OrchestrationRpcSchemas,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { CodexUsageSnapshot } from "./providerRuntime.ts";
 import {
   RelayClientInstallFailedError,
   RelayClientInstallProgressEventSchema,
@@ -209,6 +210,7 @@ export const WS_METHODS = {
   // Server meta
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
+  serverGetCodexUsage: "server.getCodexUsage",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
   serverUpdateServer: "server.updateServer",
@@ -266,6 +268,15 @@ export const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
   payload: Schema.Struct({}),
   success: ServerConfig,
   error: Schema.Union([KeybindingsConfigError, ServerSettingsError, EnvironmentAuthorizationError]),
+});
+
+export const WsServerGetCodexUsageRpc = Rpc.make(WS_METHODS.serverGetCodexUsage, {
+  payload: Schema.Struct({
+    providerInstanceId: ProviderInstanceId,
+    model: Schema.String,
+  }),
+  success: Schema.NullOr(CodexUsageSnapshot),
+  error: EnvironmentAuthorizationError,
 });
 
 export const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
@@ -722,6 +733,7 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
 export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
+  WsServerGetCodexUsageRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsServerUpdateServerRpc,

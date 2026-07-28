@@ -12,6 +12,7 @@
  * @module ProviderService
  */
 import type {
+  CodexUsageSnapshot,
   ProviderInterruptTurnInput,
   ProviderInstanceId,
   ProviderRespondToRequestInput,
@@ -97,6 +98,11 @@ export interface ProviderServiceShape {
   readonly getInstanceInfo: (
     instanceId: ProviderInstanceId,
   ) => Effect.Effect<ProviderInstanceRoutingInfo, ProviderServiceError>;
+
+  readonly getCodexUsage: (input: {
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly model: string;
+  }) => Effect.Effect<CodexUsageSnapshot | null, ProviderServiceError>;
 
   readonly inspectTarget?: (input: {
     readonly providerInstanceId: ProviderInstanceId;

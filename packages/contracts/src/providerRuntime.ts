@@ -18,6 +18,29 @@ import { ProviderInstanceId, ProviderDriverKind } from "./providerInstance.ts";
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const UnknownRecordSchema = Schema.Record(Schema.String, Schema.Unknown);
 
+export const CodexUsageWindow = Schema.Struct({
+  label: TrimmedNonEmptyStringSchema,
+  usedPercent: Schema.Number,
+  remainingPercent: Schema.Number,
+  resetsAt: Schema.NullOr(IsoDateTime),
+  windowDurationMins: Schema.NullOr(Schema.Number),
+});
+export type CodexUsageWindow = typeof CodexUsageWindow.Type;
+
+export const CodexUsageSnapshotSource = Schema.Literals(["read", "notification", "cache"]);
+export type CodexUsageSnapshotSource = typeof CodexUsageSnapshotSource.Type;
+
+export const CodexUsageSnapshot = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  model: TrimmedNonEmptyStringSchema,
+  limitId: TrimmedNonEmptyStringSchema,
+  checkedAt: IsoDateTime,
+  windows: Schema.Array(CodexUsageWindow),
+  rateLimitReachedType: Schema.NullOr(Schema.String),
+  source: CodexUsageSnapshotSource,
+});
+export type CodexUsageSnapshot = typeof CodexUsageSnapshot.Type;
+
 const RuntimeEventRawSource = Schema.Union([
   Schema.Literal("codex.app-server.notification"),
   Schema.Literal("codex.app-server.request"),

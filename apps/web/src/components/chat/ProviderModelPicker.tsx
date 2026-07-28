@@ -39,6 +39,8 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
   open?: boolean;
   triggerVariant?: VariantProps<typeof buttonVariants>["variant"];
   triggerClassName?: string;
+  hideTriggerTooltip?: boolean;
+  popoverSide?: "top" | "bottom";
   onOpenChange?: (open: boolean) => void;
   getModelDisabledReason?: (instanceId: ProviderInstanceId, model: string) => string | null;
   onInstanceModelChange: (instanceId: ProviderInstanceId, model: string) => void;
@@ -174,12 +176,16 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
               )}
             />
           ) : null}
-          <Tooltip>
-            <TooltipTrigger render={<span className="min-w-0 flex-1 overflow-hidden truncate" />}>
-              {triggerTitle}
-            </TooltipTrigger>
-            <TooltipPopup side="top">{triggerLabel}</TooltipPopup>
-          </Tooltip>
+          {props.hideTriggerTooltip ? (
+            <span className="min-w-0 flex-1 overflow-hidden truncate">{triggerTitle}</span>
+          ) : (
+            <Tooltip>
+              <TooltipTrigger render={<span className="min-w-0 flex-1 overflow-hidden truncate" />}>
+                {triggerTitle}
+              </TooltipTrigger>
+              <TooltipPopup side="top">{triggerLabel}</TooltipPopup>
+            </Tooltip>
+          )}
         </span>
         <span aria-hidden="true" className="flex items-center">
           <ChevronDownIcon aria-hidden="true" className="!ms-0 !-me-1 size-3 shrink-0 opacity-60" />
@@ -187,6 +193,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
       </PopoverTrigger>
       <PopoverPopup
         align="start"
+        side={props.popoverSide}
         className="border-0 bg-transparent p-0 shadow-none before:hidden [-webkit-backdrop-filter:none]! [--viewport-inline-padding:0] [backdrop-filter:none]!"
         viewportClassName="rounded-lg !overflow-hidden p-0"
       >
