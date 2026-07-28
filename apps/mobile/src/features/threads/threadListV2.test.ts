@@ -4,8 +4,10 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   buildThreadListV2Items,
   resolveAllSnoozedMessage,
+  resolveThreadListV2Enabled,
   resolveThreadListV2SettledTimestamp,
   resolveThreadListV2Status,
+  sortThreadsForListV2,
 } from "./threadListV2";
 
 const environmentId = EnvironmentId.make("environment-1");
@@ -42,6 +44,63 @@ function makeThread(
 function rows(layout: ReturnType<typeof buildThreadListV2Items>) {
   return layout.items.flatMap((item) => (item.type === "thread" ? [item] : []));
 }
+
+describe("resolveThreadListV2Enabled", () => {
+  it("defaults on when the device has never chosen", () => {
+    expect(resolveThreadListV2Enabled({ preference: undefined, preferencesLoaded: true })).toBe(
+      true,
+    );
+  });
+
+  it("honors an explicit device opt-out", () => {
+    expect(resolveThreadListV2Enabled({ preference: false, preferencesLoaded: true })).toBe(false);
+    expect(resolveThreadListV2Enabled({ preference: true, preferencesLoaded: true })).toBe(true);
+  });
+
+  it("holds the default while preferences are still loading so the list does not remount", () => {
+    expect(resolveThreadListV2Enabled({ preference: undefined, preferencesLoaded: false })).toBe(
+      true,
+    );
+  });
+});
+
+describe("resolveThreadListV2Status", () => {
+  it("prioritizes approval over a running session", () => {
+    const thread = makeThread({
+      id: ThreadId.make("t"),
+      title: "t",
+      hasPendingApprovals: true,
+      session: {
+        threadId: ThreadId.make("t"),
+        status: "running",
+        providerName: "Codex",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        runtimeMode: "full-access",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: NOW,
+      },
+    });
+    expect(resolveThreadListV2Status(thread)).toBe("approval");
+  });
+
+  it("resolves ready for quiescent threads", () => {
+    expect(resolveThreadListV2Status(makeThread({ id: ThreadId.make("t"), title: "t" }))).toBe(
+      "ready",
+    );
+  });
+});
+
+describe("sortThreadsForListV2", () => {
+  it("orders by creation time, newest first, ignoring activity", () => {
+    const sorted = sortThreadsForListV2([
+      { id: "oldest", createdAt: "2026-06-01T08:00:00.000Z" },
+      { id: "newest", createdAt: "2026-06-01T12:00:00.000Z" },
+      { id: "middle", createdAt: "2026-06-01T10:00:00.000Z" },
+    ]);
+    expect(sorted.map((thread) => thread.id)).toEqual(["newest", "middle", "oldest"]);
+  });
+});
 
 describe("thread list v2 lifecycle model", () => {
   it("applies snooze precedence and orders the shelf by valid wake time", () => {
