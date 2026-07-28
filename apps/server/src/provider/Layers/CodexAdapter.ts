@@ -96,7 +96,7 @@ export interface CodexAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly beforeRuntimeEventEnqueue?: (event: ProviderRuntimeEvent) => Effect.Effect<void>;
-  readonly now?: () => Date;
+  readonly now?: () => DateTime.Utc;
 }
 
 interface CodexAdapterSessionContext {
@@ -202,6 +202,8 @@ function mergeCodexUsageBucket(
   previous: CodexUsageRawPayload["rateLimits"],
   update: NonNullable<CodexUsageRawPayload["rateLimits"]>,
 ): NonNullable<CodexUsageRawPayload["rateLimits"]> {
+  const primary = mergeCodexUsageWindow(previous?.primary, update.primary);
+  const secondary = mergeCodexUsageWindow(previous?.secondary, update.secondary);
   return {
     ...previous,
     ...(update.limitId === undefined ? {} : { limitId: update.limitId }),
@@ -209,8 +211,8 @@ function mergeCodexUsageBucket(
     ...(update.rateLimitReachedType === undefined
       ? {}
       : { rateLimitReachedType: update.rateLimitReachedType }),
-    primary: mergeCodexUsageWindow(previous?.primary, update.primary),
-    secondary: mergeCodexUsageWindow(previous?.secondary, update.secondary),
+    ...(primary === undefined ? {} : { primary }),
+    ...(secondary === undefined ? {} : { secondary }),
   };
 }
 
@@ -1557,15 +1559,16 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                     const limitId = update?.limitId?.trim();
                     if (update && limitId) codexUsageGeneration += 1;
                     if (cachedCodexUsage && update && limitId) {
+                      const rateLimits =
+                        cachedCodexUsage.payload.rateLimits?.limitId === limitId
+                          ? mergeCodexUsageBucket(cachedCodexUsage.payload.rateLimits, update)
+                          : cachedCodexUsage.payload.rateLimits;
                       cachedCodexUsage = {
                         checkedAt: event.createdAt,
                         source: "notification",
                         payload: {
                           ...cachedCodexUsage.payload,
-                          rateLimits:
-                            cachedCodexUsage.payload.rateLimits?.limitId === limitId
-                              ? mergeCodexUsageBucket(cachedCodexUsage.payload.rateLimits, update)
-                              : cachedCodexUsage.payload.rateLimits,
+                          ...(rateLimits === undefined ? {} : { rateLimits }),
                           rateLimitsByLimitId: {
                             ...cachedCodexUsage.payload.rateLimitsByLimitId,
                             [limitId]: {
@@ -1915,6 +1918,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           }).pipe(
             Effect.provideService(Scope.Scope, usageScope),
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
+            Effect.provideService(Crypto.Crypto, crypto),
             Effect.mapError(
               (cause) =>
                 new ProviderAdapterProcessError({
@@ -1984,7 +1988,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             })
           : null;
       }
-      const checkedAt = (options?.now?.() ?? new Date()).toISOString();
+      const checkedAt = DateTime.formatIso(options?.now?.() ?? (yield* DateTime.now));
       codexUsageGeneration += 1;
       cachedCodexUsage = { payload, checkedAt, source: "read" };
       return resolveCodexUsageSnapshot({

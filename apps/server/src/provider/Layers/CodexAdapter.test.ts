@@ -23,6 +23,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, vi } from "@effect/vitest";
 
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -573,7 +574,7 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
 });
 
 const lifecycleRuntimeFactory = makeRuntimeFactory();
-let lifecycleUsageNow = new Date("2026-01-01T00:00:00.000Z");
+let lifecycleUsageNow = DateTime.makeUnsafe("2026-01-01T00:00:00.000Z");
 const lifecycleLayer = it.layer(
   Layer.effect(
     CodexAdapter,
@@ -612,7 +613,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
     () =>
       Effect.gen(function* () {
         const { adapter, runtime } = yield* startLifecycleRuntime();
-        lifecycleUsageNow = new Date("2026-01-02T00:00:00.000Z");
+        lifecycleUsageNow = DateTime.makeUnsafe("2026-01-02T00:00:00.000Z");
         const initial = yield* adapter.readCodexUsage!("gpt-5.3-codex");
         NodeAssert.equal(initial?.windows[0]?.remainingPercent, 60);
         NodeAssert.equal(initial?.checkedAt, "2026-01-02T00:00:00.000Z");
@@ -643,7 +644,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
         NodeAssert.equal(retained?.windows[0]?.resetsAt, "2027-01-15T08:00:00.000Z");
 
         runtime.rateLimitsShouldFail = false;
-        lifecycleUsageNow = new Date("2026-02-04T00:00:00.000Z");
+        lifecycleUsageNow = DateTime.makeUnsafe("2026-02-04T00:00:00.000Z");
         runtime.readAccountRateLimitsImpl.mockResolvedValue({
           rateLimits: { limitId: "codex", primary: { usedPercent: 5 } },
           rateLimitsByLimitId: {
