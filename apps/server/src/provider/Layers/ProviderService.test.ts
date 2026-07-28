@@ -223,7 +223,9 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
         sessions.clear();
       }),
   );
-  const readCodexUsage = vi.fn((_model: string) => Effect.succeed(null));
+  const readCodexUsage = vi.fn<
+    NonNullable<ProviderAdapterShape<ProviderAdapterError>["readCodexUsage"]>
+  >((_model) => Effect.succeed(null));
 
   const adapter: ProviderAdapterShape<ProviderAdapterError> = {
     provider,
