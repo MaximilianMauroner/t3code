@@ -370,13 +370,14 @@ function SnoozePopoverButton(props: {
           <button
             type="button"
             aria-label="Snooze thread"
+            title="Snooze"
             onClick={(event) => event.stopPropagation()}
             onDoubleClick={(event) => event.stopPropagation()}
-            className="inline-flex h-full cursor-pointer items-center gap-0.5 rounded-md bg-transparent px-1.5 text-xs text-muted-foreground hover:text-foreground"
+            className="inline-flex size-6 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground outline-none transition-[color,background-color,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
           />
         }
       >
-        <ClockIcon className="size-3" />
+        <ClockIcon className="size-3.5" />
       </PopoverTrigger>
       <PopoverPopup side="bottom" align="end" className="w-56" viewportClassName="p-1">
         {presets.map((preset) => (
@@ -1209,38 +1210,44 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                   <button
                     type="button"
                     aria-label="Wake thread now"
+                    title="Wake"
                     onClick={handleUnsnoozeClick}
                     className={cn(
-                      "pointer-events-none absolute inset-y-0 right-0 inline-flex cursor-pointer items-center gap-1 rounded-md bg-transparent px-2 text-xs text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:pointer-events-auto focus-visible:opacity-100 group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100",
-                      isWoke && "group-hover/sidebar-row:static",
+                      "pointer-events-none absolute top-1/2 right-0 inline-flex size-6 -translate-y-1/2 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground opacity-0 transition-[color,background-color,opacity,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:pointer-events-auto focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100",
+                      isWoke &&
+                        "group-hover/sidebar-row:static group-hover/sidebar-row:translate-y-0",
                     )}
                   >
-                    <AlarmClockOffIcon className="size-3" />
+                    <AlarmClockOffIcon className="size-3.5" />
                   </button>
                 )
               ) : !props.settlementSupported ? null : variantAction === "unsettle" ? (
                 <button
                   type="button"
                   aria-label="Un-settle thread"
+                  title="Un-settle"
                   onClick={handleUnsettleClick}
                   className={cn(
-                    "pointer-events-none absolute inset-y-0 right-0 -mr-1 inline-flex cursor-pointer items-center gap-1 rounded-md bg-transparent px-1.5 text-xs text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:pointer-events-auto focus-visible:opacity-100 group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100",
-                    isWoke && "group-hover/sidebar-row:static",
+                    "pointer-events-none absolute top-1/2 right-0 inline-flex size-6 -translate-y-1/2 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground opacity-0 transition-[color,background-color,opacity,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:pointer-events-auto focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100",
+                    isWoke &&
+                      "group-hover/sidebar-row:static group-hover/sidebar-row:translate-y-0",
                   )}
                 >
-                  <Undo2Icon className="mb-px size-3.5" />
+                  <Undo2Icon className="size-3.5" />
                 </button>
               ) : (
                 <button
                   type="button"
                   aria-label="Settle thread"
+                  title="Settle"
                   onClick={handleSettleClick}
                   className={cn(
-                    "pointer-events-none absolute inset-y-0 right-0 inline-flex cursor-pointer items-center gap-1 rounded-md bg-transparent px-2 text-xs text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:pointer-events-auto focus-visible:opacity-100 group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100",
-                    isWoke && "group-hover/sidebar-row:static",
+                    "pointer-events-none absolute top-1/2 right-0 inline-flex size-6 -translate-y-1/2 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground opacity-0 transition-[color,background-color,opacity,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:pointer-events-auto focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100",
+                    isWoke &&
+                      "group-hover/sidebar-row:static group-hover/sidebar-row:translate-y-0",
                   )}
                 >
-                  <CheckIcon className="size-3" />
+                  <CheckIcon className="size-3.5" />
                 </button>
               )}
             </span>
@@ -1411,11 +1418,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                       <button
                         type="button"
                         aria-label="Settle thread"
+                        title="Settle"
                         onClick={handleSettleClick}
-                        className="-mr-1 inline-flex cursor-pointer items-center gap-1 rounded-md bg-transparent px-1.5 text-xs text-muted-foreground hover:text-foreground"
+                        className="inline-flex size-6 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground outline-none transition-[color,background-color,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
                       >
                         <CheckIcon className="size-3.5" />
-                        Settle
                       </button>
                     ) : null}
                   </span>
@@ -3351,7 +3358,12 @@ export default function Sidebar() {
                     <span className="min-w-0 flex-1 truncate">
                       {scopedProjectGroup?.displayName ?? "All projects"}
                     </span>
-                    <ChevronDownIcon className="-mr-px size-4 shrink-0" />
+                    <ChevronDownIcon
+                      className={cn(
+                        "-mr-px size-4 shrink-0 transition-transform",
+                        projectScopeMenuOpen && "rotate-180",
+                      )}
+                    />
                   </MenuTrigger>
                   <MenuPopup align="start" className="w-(--anchor-width)">
                     <MenuRadioGroup
