@@ -1339,7 +1339,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                   actions on hover/keyboard focus or while the popover is open. Keeping
                   the hidden state out of flow lets the project label reclaim
                   space without either state overlapping it. */}
-              <span className="group/sidebar-status-slot relative ml-auto flex h-5 min-w-8 shrink-0 items-stretch justify-end text-xs">
+              <span className="group/sidebar-status-slot relative ml-auto flex h-6 min-w-8 shrink-0 items-center justify-end text-xs leading-none">
                 {/* Read-only status labels yield to the hover actions. Woke is
                     itself an action, so it stays pointer-enabled and visible
                     while the other controls appear beside it. */}
@@ -1348,7 +1348,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                     isWokeStatus
                       ? "pointer-events-auto"
                       : "pointer-events-none group-has-[:focus-visible]/sidebar-status-slot:absolute group-has-[:focus-visible]/sidebar-status-slot:right-0 group-has-[:focus-visible]/sidebar-status-slot:opacity-0 group-hover/sidebar-row:absolute group-hover/sidebar-row:right-0 group-hover/sidebar-row:opacity-0",
-                    "self-center justify-self-end tabular-nums text-secondary-label transition-opacity",
+                    "inline-flex items-center justify-end tabular-nums text-secondary-label transition-opacity",
                     snoozeMenuOpen && "pointer-events-none absolute right-0 opacity-0",
                   )}
                 >
@@ -1402,7 +1402,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                       // would keep the controls pinned over the status label
                       // once the pointer moves away (e.g. after a failed
                       // settle) instead of cross-fading back.
-                      "pointer-events-none absolute inset-y-0 right-0 flex items-stretch opacity-0 transition-opacity has-[:focus-visible]:pointer-events-auto has-[:focus-visible]:static has-[:focus-visible]:opacity-100 group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:static group-hover/sidebar-row:opacity-100",
+                      "pointer-events-none absolute inset-y-0 right-0 flex items-center opacity-0 transition-opacity has-[:focus-visible]:pointer-events-auto has-[:focus-visible]:static has-[:focus-visible]:opacity-100 group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:static group-hover/sidebar-row:opacity-100",
                       snoozeMenuOpen && "pointer-events-auto static opacity-100",
                     )}
                   >
