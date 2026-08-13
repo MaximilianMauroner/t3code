@@ -90,7 +90,10 @@ import { usePreparedConnection } from "../state/session";
 import { previewEnvironment } from "../state/preview";
 import { useAtomCommand } from "../state/use-atom-command";
 import { useAtomQueryRunner } from "../state/use-atom-query-runner";
-import { useOpenChangeRequestLink } from "~/lib/openPullRequestLink";
+import {
+  shouldOpenPullRequestExternally,
+  useOpenChangeRequestLink,
+} from "~/lib/openPullRequestLink";
 import { writeTextToClipboard } from "../hooks/useCopyToClipboard";
 import { isPreviewSupportedInRuntime } from "../previewStateStore";
 import {
@@ -1560,6 +1563,26 @@ function ChatMarkdown({
                 onClick?.(event);
                 if (isSameDocumentLink && href) {
                   handleMarkdownFragmentClick(event, href);
+                  return;
+                }
+                if (href && shouldOpenPullRequestExternally(event)) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const api = readLocalApi();
+                  if (!api) return;
+                  void api.shell.openExternal(href).catch((cause) => {
+                    reportMarkdownActionFailure(
+                      { operation: "open-link-externally", target: href },
+                      cause,
+                    );
+                    toastManager.add(
+                      stackedThreadToast({
+                        type: "error",
+                        title: "Unable to open link",
+                        description: cause instanceof Error ? cause.message : "An error occurred.",
+                      }),
+                    );
+                  });
                   return;
                 }
                 // A link to a change request in a workspace project opens beside the
