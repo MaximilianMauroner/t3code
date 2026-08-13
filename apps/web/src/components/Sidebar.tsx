@@ -63,6 +63,7 @@ import {
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type ReactElement,
   type ReactNode,
 } from "react";
 import { useParams, useRouter } from "@tanstack/react-router";
@@ -350,6 +351,15 @@ function SidebarThreadTooltip({
  * Controlled by the row (which also uses the open state to pin its hover
  * actions while the menu is up).
  */
+function LifecycleActionTooltip({ label, children }: { label: string; children: ReactElement }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger delay={500} render={children} />
+      <TooltipPopup side="top">{label}</TooltipPopup>
+    </Tooltip>
+  );
+}
+
 function SnoozePopoverButton(props: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -365,20 +375,21 @@ function SnoozePopoverButton(props: {
   );
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
-      <PopoverTrigger
-        render={
-          <button
-            type="button"
-            aria-label="Snooze thread"
-            title="Snooze"
-            onClick={(event) => event.stopPropagation()}
-            onDoubleClick={(event) => event.stopPropagation()}
-            className="inline-flex size-6 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground outline-none transition-[color,background-color,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-          />
-        }
-      >
-        <ClockIcon className="size-3.5" />
-      </PopoverTrigger>
+      <LifecycleActionTooltip label="Snooze thread">
+        <PopoverTrigger
+          render={
+            <button
+              type="button"
+              aria-label="Snooze thread"
+              onClick={(event) => event.stopPropagation()}
+              onDoubleClick={(event) => event.stopPropagation()}
+              className="inline-flex size-6 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground outline-none transition-[color,background-color,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          }
+        >
+          <ClockIcon className="size-3.5" />
+        </PopoverTrigger>
+      </LifecycleActionTooltip>
       <PopoverPopup side="bottom" align="end" className="w-56" viewportClassName="p-1">
         {presets.map((preset) => (
           <button
@@ -1207,48 +1218,51 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
               </span>
               {variantAction === "unsnooze" ? (
                 !props.snoozeSupported ? null : (
+                  <LifecycleActionTooltip label="Wake thread">
+                    <button
+                      type="button"
+                      aria-label="Wake thread now"
+                      onClick={handleUnsnoozeClick}
+                      className={cn(
+                        "pointer-events-none absolute top-1/2 right-0 inline-flex size-6 -translate-y-1/2 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground opacity-0 transition-[color,background-color,opacity,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:pointer-events-auto focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100",
+                        isWoke &&
+                          "group-hover/sidebar-row:static group-hover/sidebar-row:translate-y-0",
+                      )}
+                    >
+                      <AlarmClockOffIcon className="size-3.5" />
+                    </button>
+                  </LifecycleActionTooltip>
+                )
+              ) : !props.settlementSupported ? null : variantAction === "unsettle" ? (
+                <LifecycleActionTooltip label="Un-settle thread">
                   <button
                     type="button"
-                    aria-label="Wake thread now"
-                    title="Wake"
-                    onClick={handleUnsnoozeClick}
+                    aria-label="Un-settle thread"
+                    onClick={handleUnsettleClick}
                     className={cn(
                       "pointer-events-none absolute top-1/2 right-0 inline-flex size-6 -translate-y-1/2 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground opacity-0 transition-[color,background-color,opacity,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:pointer-events-auto focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100",
                       isWoke &&
                         "group-hover/sidebar-row:static group-hover/sidebar-row:translate-y-0",
                     )}
                   >
-                    <AlarmClockOffIcon className="size-3.5" />
+                    <Undo2Icon className="size-3.5" />
                   </button>
-                )
-              ) : !props.settlementSupported ? null : variantAction === "unsettle" ? (
-                <button
-                  type="button"
-                  aria-label="Un-settle thread"
-                  title="Un-settle"
-                  onClick={handleUnsettleClick}
-                  className={cn(
-                    "pointer-events-none absolute top-1/2 right-0 inline-flex size-6 -translate-y-1/2 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground opacity-0 transition-[color,background-color,opacity,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:pointer-events-auto focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100",
-                    isWoke &&
-                      "group-hover/sidebar-row:static group-hover/sidebar-row:translate-y-0",
-                  )}
-                >
-                  <Undo2Icon className="size-3.5" />
-                </button>
+                </LifecycleActionTooltip>
               ) : (
-                <button
-                  type="button"
-                  aria-label="Settle thread"
-                  title="Settle"
-                  onClick={handleSettleClick}
-                  className={cn(
-                    "pointer-events-none absolute top-1/2 right-0 inline-flex size-6 -translate-y-1/2 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground opacity-0 transition-[color,background-color,opacity,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:pointer-events-auto focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100",
-                    isWoke &&
-                      "group-hover/sidebar-row:static group-hover/sidebar-row:translate-y-0",
-                  )}
-                >
-                  <CheckIcon className="size-3.5" />
-                </button>
+                <LifecycleActionTooltip label="Settle thread">
+                  <button
+                    type="button"
+                    aria-label="Settle thread"
+                    onClick={handleSettleClick}
+                    className={cn(
+                      "pointer-events-none absolute top-1/2 right-0 inline-flex size-6 -translate-y-1/2 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground opacity-0 transition-[color,background-color,opacity,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:pointer-events-auto focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/sidebar-row:pointer-events-auto group-hover/sidebar-row:opacity-100",
+                      isWoke &&
+                        "group-hover/sidebar-row:static group-hover/sidebar-row:translate-y-0",
+                    )}
+                  >
+                    <CheckIcon className="size-3.5" />
+                  </button>
+                </LifecycleActionTooltip>
               )}
             </span>
             {props.jumpLabel ? <JumpHintBadge label={props.jumpLabel} /> : null}
@@ -1415,15 +1429,16 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                       />
                     ) : null}
                     {props.settlementSupported ? (
-                      <button
-                        type="button"
-                        aria-label="Settle thread"
-                        title="Settle"
-                        onClick={handleSettleClick}
-                        className="inline-flex size-6 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground outline-none transition-[color,background-color,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-                      >
-                        <CheckIcon className="size-3.5" />
-                      </button>
+                      <LifecycleActionTooltip label="Settle thread">
+                        <button
+                          type="button"
+                          aria-label="Settle thread"
+                          onClick={handleSettleClick}
+                          className="inline-flex size-6 cursor-pointer items-center justify-center rounded-md bg-transparent p-0 text-muted-foreground outline-none transition-[color,background-color,box-shadow] hover:bg-sidebar-row-hover hover:text-foreground focus-visible:bg-sidebar-row-hover focus-visible:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                        >
+                          <CheckIcon className="size-3.5" />
+                        </button>
+                      </LifecycleActionTooltip>
                     ) : null}
                   </span>
                 ) : null}

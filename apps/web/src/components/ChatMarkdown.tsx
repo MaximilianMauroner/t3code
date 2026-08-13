@@ -1566,10 +1566,13 @@ function ChatMarkdown({
                   return;
                 }
                 if (href && shouldOpenPullRequestExternally(event)) {
+                  const api = readLocalApi();
+                  // Web clients do not have the desktop shell bridge. Leave the
+                  // event untouched there so the browser can honor the modifier
+                  // click with its native new-tab behavior.
+                  if (!api) return;
                   event.preventDefault();
                   event.stopPropagation();
-                  const api = readLocalApi();
-                  if (!api) return;
                   void api.shell.openExternal(href).catch((cause) => {
                     reportMarkdownActionFailure(
                       { operation: "open-link-externally", target: href },
