@@ -1,6 +1,6 @@
 import { useAndroidControlSizing } from "../../components/useAndroidControlSizing";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
-import { computeThreadMoveAvailability } from "./threadOrder";
+import { computeThreadMoveAvailability, type ThreadMoveDestination } from "./threadOrder";
 import type {
   EnvironmentProject,
   EnvironmentThreadShell,
@@ -299,6 +299,11 @@ function ThreadNavigationSidebarPane(
     toggleSnoozedShelf,
     toggleWorkingShelf,
   } = useThreadListV2ShelfPreferences();
+  const moveVisibleThread = useCallback(
+    (thread: EnvironmentThreadShell, direction: ThreadMoveDestination) =>
+      moveThread(thread, direction, { workingShelfEnabled }),
+    [moveThread, workingShelfEnabled],
+  );
   // The queued-start and snooze helpers need a clock while the pane stays open.
   const [nowMinute, setNowMinute] = useState(() => new Date().toISOString().slice(0, 16));
   // Snooze wake times are second-precise; a counter bumped exactly at the
@@ -346,9 +351,10 @@ function ThreadNavigationSidebarPane(
           settlementEnvironmentIds,
           snoozeEnvironmentIds,
           queuedThreadKeys,
+          workingShelfEnabled,
         }),
       });
-    // The Working beta orders the inbox by time, so only pins can move.
+    // The Working section orders the inbox by time, so only pins can move.
     return new Map([
       ...sectionAvailability("pinned"),
       ...(workingShelfEnabled ? [] : sectionAvailability("active")),
@@ -745,7 +751,7 @@ function ThreadNavigationSidebarPane(
               onPinThread={pinThread}
               onUnpinThread={unpinThread}
               onSetThreadAutoSettle={setThreadAutoSettle}
-              onMoveThread={moveThread}
+              onMoveThread={moveVisibleThread}
               onSwipeableClose={handleSwipeableClose}
               onSwipeableWillOpen={handleSwipeableWillOpen}
               simultaneousSwipeGesture={sidebarScrollGesture}
@@ -801,7 +807,7 @@ function ThreadNavigationSidebarPane(
       handleSwipeableClose,
       handleSwipeableWillOpen,
       machineByEnvironmentId,
-      moveThread,
+      moveVisibleThread,
       openPendingTask,
       pinReorderEnvironmentIds,
       pinThread,

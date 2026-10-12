@@ -56,14 +56,24 @@ import {
   shouldCreateNewThreadInCurrentProject,
   shouldNavigateAfterThreadPark,
   THREAD_JUMP_HINT_SHOW_DELAY_MS,
+  visibleSidebarShelfThreads,
   type SidebarListItem,
   type SidebarListMarker,
   type SidebarSection,
   resolveSidebarDropVerb,
 } from "./Sidebar.logic";
+import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
 import { sortSettledThreads } from "@t3tools/client-runtime/state/thread-sort";
-import { EnvironmentId, ProjectId, ProviderInstanceId, RunId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  type OrchestrationV2ThreadShell,
+  ProjectId,
+  ProviderInstanceId,
+  RunId,
+  RuntimeRequestId,
+  ThreadId,
+} from "@t3tools/contracts";
 
 import {
   DEFAULT_INTERACTION_MODE,
@@ -131,19 +141,25 @@ describe("animateSidebarLayoutChanges", () => {
 });
 
 describe("resolveSidebarThreadSection", () => {
-  it("keeps a pinned thread in the pinned shelf", () => {
-    expect(resolveSidebarThreadSection({ snoozed: false, settled: false, pinned: true })).toBe(
-      "pinned",
-    );
+  const resolve = (input: Partial<Parameters<typeof resolveSidebarThreadSection>[0]>) =>
+    resolveSidebarThreadSection({
+      snoozed: false,
+      settled: false,
+      working: false,
+      pinned: false,
+      ...input,
+    });
+
+  it("keeps a pinned thread in the pinned shelf until it works", () => {
+    expect(resolve({ pinned: true })).toBe("pinned");
+    expect(resolve({ pinned: true, working: true })).toBe("working");
+    expect(resolve({ working: true })).toBe("working");
+    expect(resolve({})).toBe("active");
   });
 
-  it("keeps lifecycle shelves authoritative over a stale pin", () => {
-    expect(resolveSidebarThreadSection({ snoozed: true, settled: true, pinned: true })).toBe(
-      "snoozed",
-    );
-    expect(resolveSidebarThreadSection({ snoozed: false, settled: true, pinned: true })).toBe(
-      "settled",
-    );
+  it("keeps lifecycle shelves authoritative over a stale pin and live work", () => {
+    expect(resolve({ snoozed: true, settled: true, working: true, pinned: true })).toBe("snoozed");
+    expect(resolve({ settled: true, working: true, pinned: true })).toBe("settled");
   });
 });
 
@@ -2127,7 +2143,7 @@ describe("unseen completion with background work", () => {
   });
 });
 
-describe("Working shelf (beta)", () => {
+describe("Working shelf", () => {
   const runtime = {
     status: "running" as const,
     activeRunId: null,
@@ -2143,6 +2159,7 @@ describe("Working shelf (beta)", () => {
     hasPendingUserInput: false,
     interactionMode: "default" as const,
     latestRun: makeLatestRun(),
+    pendingBackgroundTasks: [],
     runtime: null,
   };
   // Stopped with background tasks still open: V2's "waiting" sidebar status.
@@ -2164,6 +2181,44 @@ describe("Working shelf (beta)", () => {
         runtime: { ...runtime, status: "failed" as const, lastError: "boom" },
       }),
     ).toBe(false);
+  });
+
+  it("folds away a parent waiting on its subagent unless the parent needs the user", () => {
+    const parent = (overrides: Partial<OrchestrationV2ThreadShell> = {}) =>
+      presentThreadShell(localEnvironmentId, {
+        ...makeThreadFixture().source,
+        latestRunId: RunId.make("run-parent"),
+        status: "completed",
+        latestRunCompletedAt: DateTime.makeUnsafe("2026-06-20T01:00:00.000Z"),
+        pendingBackgroundTasks: [{ taskId: "child", kind: "subagent" }],
+        ...overrides,
+      });
+    const request = (kind: "command" | "user_input") => ({
+      pendingRuntimeRequest: {
+        id: RuntimeRequestId.make(`request-${kind}`),
+        kind,
+        createdAt: DateTime.makeUnsafe("2026-06-20T01:01:00.000Z"),
+      },
+    });
+
+    expect(isSidebarThreadWorking(parent())).toBe(true);
+    expect(isSidebarThreadWorking(parent(request("command")))).toBe(false);
+    expect(isSidebarThreadWorking(parent(request("user_input")))).toBe(false);
+    expect(isSidebarThreadWorking(parent({ status: "failed" }))).toBe(false);
+  });
+
+  describe("visibleSidebarShelfThreads", () => {
+    const shelf = ["open", "other"].map((id) => ({
+      environmentId: localEnvironmentId,
+      id: ThreadId.make(id),
+    }));
+    const openKey = scopedThreadKey(scopeThreadRef(localEnvironmentId, ThreadId.make("open")));
+
+    it("keeps only the open thread on a collapsed shelf", () => {
+      expect(visibleSidebarShelfThreads(shelf, false, openKey)).toEqual([shelf[0]]);
+      expect(visibleSidebarShelfThreads(shelf, false, null)).toEqual([]);
+      expect(visibleSidebarShelfThreads(shelf, true, openKey)).toBe(shelf);
+    });
   });
 
   it("keeps a ready plan in the inbox while background work runs", () => {

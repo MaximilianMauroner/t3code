@@ -414,6 +414,34 @@ describe("getThreadListV2OrderedSection", () => {
       ),
     ).toEqual(["pinned-first", "pinned-later"]);
   });
+
+  it("leaves out pins folded into the Working shelf, so Up and Down skip them", () => {
+    const pin = (id: string, input: Partial<EnvironmentThreadShell> = {}) =>
+      makeThread({ id: ThreadId.make(id), title: id, pinnedAt: NOW, pinOrderKey: id, ...input });
+    const threads = [
+      pin("a"),
+      pin("b", {
+        runtime: {
+          status: "running",
+          activeRunId: null,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerName: "Codex",
+          lastError: null,
+          updatedAt: NOW,
+        },
+      }),
+      pin("c"),
+    ];
+    const ids = (workingShelfEnabled: boolean) =>
+      getThreadListV2OrderedSection({
+        threads,
+        section: "pinned",
+        now: NOW,
+        workingShelfEnabled,
+      }).map((thread) => thread.id);
+    expect(ids(true)).toEqual(["a", "c"]);
+    expect(ids(false)).toEqual(["a", "b", "c"]);
+  });
 });
 
 describe("buildThreadListV2Items", () => {
@@ -1698,6 +1726,99 @@ describe("cross-section thread drops", () => {
   });
 });
 
+describe("buildThreadListV2Items Working section", () => {
+  const runtime = (status: "running" | "idle" | "failed") => ({
+    status,
+    activeRunId: status === "running" ? RunId.make("run-active") : null,
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    providerName: "Codex",
+    lastError: status === "failed" ? "boom" : null,
+    updatedAt: NOW,
+  });
+  const subagentTask = { taskId: "child-task", description: "Child", kind: "subagent" as const };
+  const parent = makeThread({
+    id: ThreadId.make("parent"),
+    title: "Parent",
+    runtime: runtime("idle"),
+    pendingBackgroundTasks: [subagentTask],
+  });
+  const threads = [
+    makeThread({ id: ThreadId.make("ready"), title: "Ready" }),
+    makeThread({ id: ThreadId.make("running"), title: "Running", runtime: runtime("running") }),
+    parent,
+    makeThread({
+      id: ThreadId.make("child"),
+      title: "Child",
+      runtime: runtime("running"),
+      lineage: {
+        parentThreadId: parent.id,
+        rootThreadId: parent.id,
+        relationshipToParent: "subagent",
+      },
+    }),
+    makeThread({
+      id: ThreadId.make("approval"),
+      title: "Approval",
+      runtime: runtime("running"),
+      hasPendingApprovals: true,
+    }),
+    makeThread({
+      id: ThreadId.make("question"),
+      title: "Question",
+      runtime: runtime("running"),
+      hasPendingUserInput: true,
+    }),
+    makeThread({
+      id: ThreadId.make("failed"),
+      title: "Failed",
+      runtime: runtime("failed"),
+      pendingBackgroundTasks: [subagentTask],
+    }),
+  ];
+  const ids = (layout: ReturnType<typeof buildThreadListV2Items>) =>
+    layout.items.map((item) => item.thread.id).toSorted();
+
+  it("lists only threads that are not working, keeping the ones that need the user", () => {
+    const layout = buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+      workingShelfEnabled: true,
+    });
+
+    expect(ids(layout)).toEqual(["approval", "failed", "question", "ready"]);
+    expect(layout.workingCount).toBe(2);
+  });
+
+  it("keeps working threads in the inbox while the section is off", () => {
+    const layout = buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+      workingShelfEnabled: false,
+    });
+
+    expect(ids(layout)).toEqual(["approval", "failed", "parent", "question", "ready", "running"]);
+    expect(layout.workingCount).toBe(0);
+  });
+
+  it("keeps the selected working thread on the collapsed shelf", () => {
+    const layout = buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+      workingShelfEnabled: true,
+      selectedThreadKey: `${environmentId}:parent`,
+    });
+
+    expect(ids(layout)).toEqual(["approval", "failed", "parent", "question", "ready"]);
+    expect(layout.workingCount).toBe(2);
+  });
+});
+
 it("excludes subagents from navigation, search and ordering while retaining user forks", () => {
   const root = makeThread({ id: ThreadId.make("root"), title: "Root" });
   const child = makeThread({
@@ -2294,7 +2415,7 @@ describe("buildThreadListV2ListItems row-state stamps", () => {
   });
 });
 
-describe("Working section beta", () => {
+describe("Working section", () => {
   const running = {
     status: "running" as const,
     activeRunId: null,
@@ -2347,20 +2468,42 @@ describe("Working section beta", () => {
   const ids = (layout: ReturnType<typeof buildThreadListV2Items>) =>
     layout.items.map((item) => item.thread.id);
 
-  it("folds unpinned working threads into a collapsed shelf", () => {
+  it("folds working threads, pinned or not, into a collapsed shelf", () => {
     const layout = build();
-    expect(ids(layout)).toEqual([
-      "pinned-working",
-      "finished-late",
-      "asks-approval",
-      "finished-early",
-    ]);
-    expect(layout.workingCount).toBe(1);
-    expect(layout.workingShelfHeaderIndex).toBe(4);
+    expect(ids(layout)).toEqual(["finished-late", "asks-approval", "finished-early"]);
+    expect(layout.workingCount).toBe(2);
+    expect(layout.workingShelfHeaderIndex).toBe(3);
 
     const off = build({ workingShelfEnabled: false });
     expect(ids(off)).toContain("working");
+    expect(off.items[0]).toMatchObject({ thread: { id: "pinned-working" }, pinned: true });
     expect(off.workingCount).toBe(0);
+  });
+
+  it("returns a working pin to Pinned, pin intact, once it stops working or needs the user", () => {
+    const pinnedAt = "2026-06-01T00:00:00.000Z";
+    const pin = (input: Partial<EnvironmentThreadShell> = {}) =>
+      makeThread({ id: ThreadId.make("pin"), title: "pin", pinnedAt, runtime: running, ...input });
+
+    const busy = build({ threads: [pin()], workingShelfExpanded: true });
+    expect(busy.workingCount).toBe(1);
+    expect(busy.items).toEqual([
+      expect.objectContaining({ pinned: false, thread: expect.objectContaining({ pinnedAt }) }),
+    ]);
+    expect(ids(build({ threads: [pin()], selectedThreadKey: `${environmentId}:pin` }))).toEqual([
+      "pin",
+    ]);
+
+    for (const back of [
+      pin({ runtime: null }),
+      pin({ hasPendingApprovals: true }),
+      pin({ hasPendingUserInput: true }),
+      pin({ runtime: { ...running, status: "failed", lastError: "boom" } }),
+    ]) {
+      const layout = build({ threads: [back] });
+      expect(layout.workingCount).toBe(0);
+      expect(layout.items).toEqual([expect.objectContaining({ pinned: true, thread: back })]);
+    }
   });
 
   it("shows working rows as cards when expanded, or only the selected one when collapsed", () => {
@@ -2376,7 +2519,7 @@ describe("Working section beta", () => {
       inboxReturnAt: (thread) =>
         thread.id === "finished-early" ? Date.parse("2026-06-01T04:00:00.000Z") : undefined,
     });
-    expect(ids(layout).slice(1)).toEqual(["finished-early", "finished-late", "asks-approval"]);
+    expect(ids(layout)).toEqual(["finished-early", "finished-late", "asks-approval"]);
   });
 
   it("places the shelf after queued tasks and before snoozed and settled threads", () => {

@@ -1,7 +1,19 @@
-import { EnvironmentId, ProviderInstanceId, RunId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProviderInstanceId,
+  ProviderThreadId,
+  RunId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { createInboxReturnTracker, sortWorkingThreadsBySend } from "./threadInbox.ts";
+import { presentThreadShell } from "./models.ts";
+import { v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
+import {
+  createInboxReturnTracker,
+  isThreadWorking,
+  sortWorkingThreadsBySend,
+} from "./threadInbox.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
 
@@ -16,6 +28,7 @@ function thread(id: string, working: boolean) {
     hasPendingApprovals: false,
     hasPendingUserInput: false,
     interactionMode: "default" as const,
+    pendingBackgroundTasks: [],
     runtime: working
       ? {
           status: "running" as const,
@@ -29,6 +42,32 @@ function thread(id: string, working: boolean) {
   };
 }
 
+describe("isThreadWorking", () => {
+  // An imported conversation has a provider thread but no run, so it presents
+  // an idle runtime with nothing that will wake it.
+  const runless = {
+    ...v2ThreadShell,
+    latestRunId: null,
+    activeProviderThreadId: ProviderThreadId.make("provider-thread:imported"),
+    status: "idle",
+  } as const;
+
+  it("keeps a runless idle thread in the inbox", () => {
+    const shell = presentThreadShell(environmentId, { ...runless, pendingBackgroundTasks: [] });
+    expect(shell.runtime?.status).toBe("idle");
+    expect(isThreadWorking(shell)).toBe(false);
+  });
+
+  it.each(["subagent", "monitor"] as const)("folds away a thread parked by a %s", (kind) => {
+    const shell = presentThreadShell(environmentId, {
+      ...runless,
+      pendingBackgroundTasks: [{ taskId: `${kind}:1`, kind }],
+    });
+    expect(shell.runtime?.status).toBe("idle");
+    expect(isThreadWorking(shell)).toBe(true);
+  });
+});
+
 describe("createInboxReturnTracker", () => {
   it("stamps a thread when it stops working, but never on the first observation", () => {
     const tracker = createInboxReturnTracker();
@@ -41,7 +80,7 @@ describe("createInboxReturnTracker", () => {
     expect(tracker.returnedAt(thread("b", false))).toBeUndefined();
   });
 
-  it("forgets deleted threads and resets when the beta turns off", () => {
+  it("forgets deleted threads and resets when the section turns off", () => {
     const tracker = createInboxReturnTracker();
     tracker.observe([thread("a", true), thread("b", true)]);
     tracker.observe([thread("a", false), thread("b", false)]);

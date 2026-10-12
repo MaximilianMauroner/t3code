@@ -112,14 +112,17 @@ rename a thread, regenerate its title, or link and unlink a pull request. These 
 appear on web, desktop, and mobile without requiring the originating browser to remain
 open.
 
-### Fold working threads (beta)
+### Fold working threads
 
-Turn on **Settings → General → Working section (beta)** on web and desktop, or **Settings →
-Thread behavior → Working section** on iOS and Android, to move threads that are working or
-monitoring into a collapsed **Working** section below the active list. A thread returns to the top
-of the active list when it finishes, fails, or needs an approval or answer. The Working section
-lists the thread you last sent work to first. Pinned threads stay in the pinned section. Each
-device keeps its own choice.
+Threads that are working or monitoring, pinned threads included, fold into a collapsed
+**Working** section below the active list. A thread comes back when it finishes, fails, or needs
+an approval or answer: to the top of the active list, or to the pinned section if it is pinned.
+Its pin stays. The Working section lists the thread you last sent work to first.
+
+The Working section is on by default. To keep working threads in the active list, turn off
+**Settings → General → Working section** on web and desktop, or **Settings → Thread behavior →
+Working section** on iOS and Android. Each device keeps its own choice, and a choice saved
+earlier stays in effect.
 
 While this is on, the active list is ordered by when each thread last came back to you, so you
 cannot drag or move threads within it. Your saved order returns when you turn it off.

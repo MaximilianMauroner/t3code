@@ -1,8 +1,10 @@
+import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+
 import { threadRuntimeIsActive, type EnvironmentThreadShell } from "./models.ts";
 import { toSortableTimestamp } from "./threadSort.ts";
 
-// Working section beta, shared so web and mobile fold and order the inbox the
-// same way. Off by default; each client owns its own toggle.
+// Working section, shared so web and mobile fold and order the inbox the same
+// way. On by default; each client owns its own toggle.
 
 type WorkingThreadInput = Pick<
   EnvironmentThreadShell,
@@ -11,6 +13,7 @@ type WorkingThreadInput = Pick<
   | "hasPendingUserInput"
   | "interactionMode"
   | "latestRun"
+  | "pendingBackgroundTasks"
   | "runtime"
 >;
 
@@ -19,7 +22,12 @@ type WorkingThreadInput = Pick<
     it. Approvals, questions, plan prompts, and failures stay in the inbox. */
 export function isThreadWorking(thread: WorkingThreadInput): boolean {
   if (thread.hasPendingApprovals || thread.hasPendingUserInput) return false;
-  if (!threadRuntimeIsActive(thread.runtime) && thread.runtime?.status !== "idle") return false;
+  // An idle runtime is working only when background work will wake it; a
+  // thread that never ran, such as an imported one, also presents as idle.
+  const parked =
+    thread.runtime?.status === "idle" &&
+    backgroundWorkHoldsCompletion(thread.pendingBackgroundTasks);
+  if (!threadRuntimeIsActive(thread.runtime) && !parked) return false;
   // A plan prompt outranks lingering background work: the user has to act on it.
   const run = thread.latestRun;
   const runSettled =
@@ -104,7 +112,7 @@ function sortNewestFirst<T extends Pick<EnvironmentThreadShell, "id" | "environm
  * Remembers when this client saw each thread leave the Working section. Keep
  * one at module scope so the inbox order survives routes that unmount the
  * list. Call `observe` with every thread shell on each list rebuild, or with
- * null to reset while the beta is off. The first call only takes a baseline,
+ * null to reset while the section is off. The first call only takes a baseline,
  * so mounting never reshuffles the inbox.
  */
 export function createInboxReturnTracker() {

@@ -7,6 +7,7 @@ import {
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
 import { defaultAnimateLayoutChanges, type AnimateLayoutChanges } from "@dnd-kit/sortable";
+import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
 import type { ContextMenuItem, EnvironmentId, ThreadId } from "@t3tools/contracts";
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "@t3tools/contracts/settings";
@@ -128,20 +129,24 @@ export const animateSidebarLayoutChanges: AnimateLayoutChanges = (args) =>
 // the lifecycle action; Sidebar.drag previews the resulting layout. Pinned
 // and active threads keep the dragged position; settled threads use time
 // order. Snoozed rows can leave the shelf, but dropping into it is not
-// supported because snoozing requires a wake time. The Working shelf (beta)
-// follows live status, so it is neither a drag source nor a destination.
+// supported because snoozing requires a wake time. The Working shelf follows
+// live status, so it is neither a drag source nor a destination.
 
 export type SidebarSection = "pinned" | "active" | "working" | "snoozed" | "settled";
 
 /** Resolve the shelf a visible thread belongs to. Snooze is temporary and
- * wins until its wake boundary; settlement then wins over a stale pin. */
+ * wins until its wake boundary; settlement then wins over a stale pin. A
+ * working thread (with the Working section on) folds away whether or not it
+ * is pinned, and its pin brings it back to Pinned once it stops working. */
 export function resolveSidebarThreadSection(input: {
   readonly snoozed: boolean;
   readonly settled: boolean;
+  readonly working: boolean;
   readonly pinned: boolean;
 }): SidebarSection {
   if (input.snoozed) return "snoozed";
   if (input.settled) return "settled";
+  if (input.working) return "working";
   if (input.pinned) return "pinned";
   return "active";
 }
@@ -317,7 +322,7 @@ export function planSidebarThreadDrop(input: {
   readonly activeOrder: readonly string[];
   readonly activeKeysById: ReadonlyMap<string, string | null | undefined>;
   readonly activeReorderableKeys?: ReadonlySet<string>;
-  /** Working beta: the inbox sorts by time, so drops only change lifecycle. */
+  /** Working section: the inbox sorts by time, so drops only change lifecycle. */
   readonly activeTimeOrdered?: boolean;
 }): SidebarThreadDropPlan {
   const {
@@ -1057,7 +1062,7 @@ export function firstValidTimestampMs(
 }
 
 export { sortActiveThreadsByOrderKey as sortThreadsForSidebar } from "@t3tools/client-runtime/state/thread-sort";
-// The Working section beta folds and orders the inbox the same way on mobile.
+// The Working section folds and orders the inbox the same way on mobile.
 export {
   isThreadWorking as isSidebarThreadWorking,
   sortInboxThreadsByReturn,
@@ -1068,6 +1073,24 @@ export {
 // (state/thread-sort) so web and mobile compute identical pinned orders.
 export { pinOrderKeyBetween } from "@t3tools/client-runtime/state/thread-sort";
 export { sortPinnedThreadsByOrderKey as sortPinnedThreadsForSidebar } from "@t3tools/client-runtime/state/thread-sort";
+
+// Collapsed shelves share one empty list so a route change alone does not
+// give the sidebar list a new identity.
+const NO_SHELF_THREADS: readonly never[] = [];
+
+/** Rows a sidebar shelf renders. A collapsed shelf renders none except the
+    open thread, so the route thread never vanishes behind the shelf (sending
+    a message, for example, folds it into the Working shelf). */
+export function visibleSidebarShelfThreads<
+  T extends { readonly environmentId: EnvironmentId; readonly id: ThreadId },
+>(threads: readonly T[], expanded: boolean, routeThreadKey: string | null): readonly T[] {
+  if (expanded) return threads;
+  if (routeThreadKey === null) return NO_SHELF_THREADS;
+  const routeThread = threads.find(
+    (thread) => scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
+  );
+  return routeThread === undefined ? NO_SHELF_THREADS : [routeThread];
+}
 
 const EMPTY_CONTENT_MATCH_KEYS: ReadonlySet<string> = new Set<string>();
 

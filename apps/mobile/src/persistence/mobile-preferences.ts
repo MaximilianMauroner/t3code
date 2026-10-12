@@ -44,7 +44,10 @@ export interface Preferences {
   readonly projectGroupingMode?: SidebarProjectGroupingMode;
   /** Device-local counterpart of desktop's `planModeEnabled` legacy flag. */
   readonly planModeEnabled?: boolean;
-  /** Device-local counterpart of web's `sidebarWorkingShelfEnabled` beta. */
+  /**
+   * Device-local counterpart of web's `sidebarWorkingShelfEnabled`. Missing
+   * means on; read it through `isWorkingShelfEnabled`.
+   */
   readonly workingShelfEnabled?: boolean;
   /** @deprecated Retained to migrate favorites to the connected environment. */
   readonly modelFavorites?: ReadonlyArray<{
@@ -55,6 +58,11 @@ export interface Preferences {
   readonly threadListSettledShelfExpanded?: boolean;
   readonly threadListSnoozedShelfExpanded?: boolean;
   readonly threadListWorkingShelfExpanded?: boolean;
+}
+
+/** The Working section is on unless this device saved an opt-out. */
+export function isWorkingShelfEnabled(preferences: Preferences): boolean {
+  return preferences.workingShelfEnabled !== false;
 }
 
 export class MobilePreferencesLoadError extends Schema.TaggedError<MobilePreferencesLoadError>()(
