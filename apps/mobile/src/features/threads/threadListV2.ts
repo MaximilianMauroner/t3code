@@ -39,7 +39,7 @@ import {
 
 export { snoozeWakeLabel };
 
-/** Working section beta: when this device saw each thread leave the Working
+/** Working section: when this device saw each thread leave the Working
     shelf. One instance for Home and the iPad sidebar, so both lists order the
     inbox the same way and the order survives screens that unmount. */
 export const threadListInboxReturns = createInboxReturnTracker();
@@ -282,7 +282,7 @@ export interface ThreadListV2Layout {
   readonly items: ThreadListV2Item[];
   /** Settled threads beyond the render limit (behind "Show more"). */
   readonly hiddenSettledCount: number;
-  /** Working threads folded away by the Working section beta. */
+  /** Working threads folded away by the Working section. */
   readonly workingCount: number;
   /** Index in `items` where the Working shelf header belongs. */
   readonly workingShelfHeaderIndex: number | null;
@@ -476,7 +476,7 @@ function resolveThreadListV2ItemTimeLabel(
 }
 
 /**
- * Builds the shared mobile order: active → pending → working shelf (beta) →
+ * Builds the shared mobile order: active → pending → working shelf →
  * snoozed shelf → settled. Pending tasks are waiting rather than asking, and
  * busy or parked work remains reachable without competing with either the
  * inbox or settled history.
@@ -660,14 +660,14 @@ export function buildThreadListV2Items(input: {
   readonly settledLimit?: number;
   /** Second-precise clock used for time-based classification. */
   readonly now: string;
-  /** Working section beta: unpinned working threads fold into the Working
+  /** Working section: unpinned working threads fold into the Working
       shelf, and the inbox orders by when each thread came back to the user
       instead of the saved arrangement. */
   readonly workingShelfEnabled?: boolean;
   /** Expands the Working shelf into rows. Collapsed is the default. */
   readonly workingShelfExpanded?: boolean;
   /** Returns this device observed but the server does not stamp, such as an
-      approval request mid-turn. Only read while the beta is on. */
+      approval request mid-turn. Only read while the section is on. */
   readonly inboxReturnAt?: (thread: EnvironmentThreadShell) => number | undefined;
   /** Expands the snoozed shelf into rows. Collapsed is the default. */
   readonly snoozedShelfExpanded?: boolean;
@@ -756,8 +756,8 @@ export function buildThreadListV2Items(input: {
     }
   }
 
-  // The beta inbox is time-ordered, so the saved arrangement (and any move in
-  // flight) is kept but not applied until the beta is off again.
+  // The Working section's inbox is time-ordered, so the saved arrangement (and
+  // any move in flight) is kept but not applied until the section is off again.
   const orderedActive = workingShelfEnabled
     ? sortInboxThreadsByReturn(active, input.inboxReturnAt)
     : applyPendingThreadOrder(sortThreadsForListV2(active), "active", pending);

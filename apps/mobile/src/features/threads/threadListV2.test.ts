@@ -2387,7 +2387,7 @@ describe("buildThreadListV2ListItems row-state stamps", () => {
   });
 });
 
-describe("Working section beta", () => {
+describe("Working section", () => {
   const running = {
     status: "running" as const,
     activeRunId: null,
