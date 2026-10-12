@@ -1,5 +1,5 @@
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import type { Atom } from "effect/reactivity";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -114,6 +114,47 @@ describe("shared mobile pending move", () => {
     expect(appAtomRegistry.get(pendingThreadOrderAtom)).toBeNull();
     move.complete();
     appAtomRegistry.set(shellsAtom, rows);
+    expect(getPendingThreadOrder()).toBeNull();
+  });
+
+  it("holds a pin move planned without a pin folded into the Working shelf", () => {
+    const pin = (id: string, input: Partial<EnvironmentThreadShell> = {}) =>
+      makeThreadShellFixture({
+        id: ThreadId.make(id),
+        environmentId: EnvironmentId.make("env"),
+        pinnedAt: "2026-06-01T00:00:00.000Z",
+        pinOrderKey: id,
+        ...input,
+      });
+    const working = pin("b", {
+      runtime: {
+        status: "running",
+        activeRunId: null,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        providerName: "Codex",
+        lastError: null,
+        updatedAt: "2026-06-01T00:00:00.000Z",
+      },
+    });
+    const [a, c] = [pin("a"), pin("c")];
+    appAtomRegistry.set(shellsAtom, [a, working, c]);
+    const hold = (workingShelfEnabled: boolean) =>
+      beginPendingThreadOrder(
+        createPendingThreadOrder({
+          section: "pinned",
+          ordered: [a, c],
+          movedId: "env:a",
+          direction: "down",
+          assignments: [{ id: "env:a", orderKey: "d" }],
+          workingShelfEnabled,
+        }),
+      );
+
+    expect(hold(false).isPending()).toBe(false);
+    const move = hold(true);
+    expect(move.isPending()).toBe(true);
+    appAtomRegistry.set(shellsAtom, [{ ...a, pinOrderKey: "d" }, working, c]);
+    move.complete();
     expect(getPendingThreadOrder()).toBeNull();
   });
 });

@@ -59,6 +59,9 @@ export type OrderRow = Pick<
 
 export interface PendingThreadOrder {
   readonly section: "pinned" | "active";
+  /** Planned against a list with the Working section on, which leaves out
+      working threads. Every reconcile must use the same rows. */
+  readonly workingShelfEnabled?: boolean;
   readonly orderedIds: readonly string[];
   readonly before: ReadonlyMap<string, { readonly key: string | null; readonly anchor: string }>;
   readonly assignments: ReadonlyMap<string, string>;
@@ -263,11 +266,13 @@ export function createPendingThreadOrder(input: {
   readonly movedId: string;
   readonly direction: ThreadMoveDestination;
   readonly assignments: readonly { readonly id: string; readonly orderKey: string }[];
+  readonly workingShelfEnabled?: boolean;
 }): PendingThreadOrder {
   const orderedIds = threadOrderAfterMove(input.ordered.map(rowId), input.movedId, input.direction);
   if (orderedIds === null) throw new Error("Cannot begin an invalid thread move");
   return {
     section: input.section,
+    workingShelfEnabled: input.workingShelfEnabled === true,
     orderedIds,
     before: new Map(input.ordered.map((row) => [rowId(row), rowOrder(row, input.section)])),
     assignments: new Map(input.assignments.map(({ id, orderKey }) => [id, orderKey])),

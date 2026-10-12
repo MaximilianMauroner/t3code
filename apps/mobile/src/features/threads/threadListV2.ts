@@ -695,6 +695,7 @@ export function buildThreadListV2Items(input: {
             ...input,
             section: input.pendingOrder.section,
             pendingOrder: null,
+            workingShelfEnabled: input.pendingOrder.workingShelfEnabled,
           }),
         );
   const query = input.searchQuery.trim().toLocaleLowerCase();

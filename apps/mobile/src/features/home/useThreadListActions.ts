@@ -689,6 +689,7 @@ export function useThreadListActions(): {
               movedId: scopedThreadKey(thread.environmentId, thread.id),
               direction,
               assignments,
+              workingShelfEnabled: options?.workingShelfEnabled,
             }),
           );
       let succeeded = false;
