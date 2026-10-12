@@ -131,6 +131,21 @@ describe("ClientSettings rich text composer", () => {
   });
 });
 
+describe("ClientSettings working section", () => {
+  it("folds working threads out of the inbox when no preference is saved", () => {
+    expect(decodeClientSettings({}).sidebarWorkingShelfEnabled).toBe(true);
+    expect(decodeClientSettings({ sendShortcut: "mod-enter" }).sidebarWorkingShelfEnabled).toBe(
+      true,
+    );
+  });
+
+  it("preserves an explicit opt-out through patches and persistence", () => {
+    const preference = { sidebarWorkingShelfEnabled: false };
+    expect(decodeClientSettingsPatch(preference)).toEqual(preference);
+    expect(encodeClientSettings(decodeClientSettings(preference))).toMatchObject(preference);
+  });
+});
+
 describe("ServerSettings default permissions", () => {
   it("keeps full access for settings saved before a default was configured", () => {
     expect(decodeServerSettings({}).defaultRuntimeMode).toBe("full-access");

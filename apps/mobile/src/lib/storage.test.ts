@@ -100,6 +100,7 @@ import {
   saveConnection,
   savePreferencesPatch,
 } from "../persistence/imperative";
+import { isWorkingShelfEnabled } from "../persistence/mobile-preferences";
 import { toStableSavedRemoteConnection } from "./connection";
 
 const managedConnection = {
@@ -259,6 +260,16 @@ describe("mobile connection storage", () => {
       threadListWorkingShelfExpanded: true,
       workingShelfEnabled: true,
     });
+  });
+
+  it("turns the Working section on unless this device saved an opt-out", async () => {
+    mocks.setPreferencesJson(JSON.stringify({ baseFontSize: 17 }), 10);
+    expect(isWorkingShelfEnabled(await loadPreferences())).toBe(true);
+
+    await savePreferencesPatch({ workingShelfEnabled: false });
+    const saved = await loadPreferences();
+    expect(saved.workingShelfEnabled).toBe(false);
+    expect(isWorkingShelfEnabled(saved)).toBe(false);
   });
 
   it("drops legacy and invalid thread list shelf expansion preferences", async () => {

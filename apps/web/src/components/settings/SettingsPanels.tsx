@@ -2375,7 +2375,7 @@ export function GeneralSettingsPanel() {
 
         <SettingsRow
           {...searchableSetting("working-shelf")}
-          description="Fold working and monitoring threads into a Working section. They return to the top of the inbox when they need you."
+          description="Working and monitoring threads fold out of the inbox into a Working section. They come back to the top of the inbox when they need you."
           resetAction={
             settings.sidebarWorkingShelfEnabled !==
             DEFAULT_UNIFIED_SETTINGS.sidebarWorkingShelfEnabled ? (
@@ -2395,7 +2395,7 @@ export function GeneralSettingsPanel() {
               onCheckedChange={(checked) =>
                 updateSettings({ sidebarWorkingShelfEnabled: Boolean(checked) })
               }
-              aria-label="Working section (beta)"
+              aria-label="Working section"
             />
           }
         />

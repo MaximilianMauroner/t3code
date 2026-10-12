@@ -11,6 +11,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
 import { supportsSharedSettingsSync } from "@t3tools/client-runtime/state/shared-settings";
 import { AppText as Text } from "../../components/AppText";
+import { isWorkingShelfEnabled } from "../../persistence/mobile-preferences";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -47,7 +48,7 @@ export function SettingsThreadsRouteScreen() {
           contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 18) + 18 }}
         >
           <AutoSettleSettingsRows />
-          <BetaSettingsSection />
+          <InboxSettingsSection />
           <LegacySettingsSection />
         </ScrollView>
       </SettingsScreen>
@@ -261,18 +262,18 @@ function AutoSettleSettingsRows() {
 }
 
 /**
- * Device-local beta toggles, the counterpart of web's Working section (beta)
- * in Settings → General.
+ * Device-local inbox toggles, the counterpart of web's Working section in
+ * Settings → General.
  */
-function BetaSettingsSection() {
+function InboxSettingsSection() {
   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
   const preferences = useAtomValue(mobilePreferencesAtom);
   const workingShelfEnabled =
-    AsyncResult.isSuccess(preferences) && preferences.value.workingShelfEnabled === true;
+    AsyncResult.isSuccess(preferences) && isWorkingShelfEnabled(preferences.value);
 
   return (
     <View className="gap-3">
-      <SettingsSection title="Beta">
+      <SettingsSection title="Inbox">
         <SettingsSwitchRow
           icon="bolt.circle"
           label="Working section"
@@ -281,9 +282,9 @@ function BetaSettingsSection() {
         />
       </SettingsSection>
       <Text className="px-2 text-sm text-foreground-muted">
-        Fold working and monitoring threads into a Working section. They return to the top of the
-        list when they need you. While this is on, active threads are ordered by time and cannot be
-        moved.
+        Working and monitoring threads fold out of the list into a Working section. They come back
+        to the top of the list when they need you. While this is on, active threads are ordered by
+        time and cannot be moved.
       </Text>
     </View>
   );

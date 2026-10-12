@@ -2,6 +2,7 @@ import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
 import { useCallback, useRef } from "react";
 
+import { isWorkingShelfEnabled } from "../../persistence/mobile-preferences";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 
 /**
@@ -17,8 +18,8 @@ export function useThreadListV2ShelfPreferences() {
     loaded && preferencesResult.value.threadListSnoozedShelfExpanded === true;
   const settledShelfExpanded =
     loaded && preferencesResult.value.threadListSettledShelfExpanded === true;
-  // Working section beta: off until the preference loads and is enabled.
-  const workingShelfEnabled = loaded && preferencesResult.value.workingShelfEnabled === true;
+  // Working section: on by default once preferences load, unless turned off.
+  const workingShelfEnabled = loaded && isWorkingShelfEnabled(preferencesResult.value);
   const workingShelfExpanded =
     loaded && preferencesResult.value.threadListWorkingShelfExpanded === true;
   const snoozedShelfExpandedRef = useRef(snoozedShelfExpanded);

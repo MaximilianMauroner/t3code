@@ -56,11 +56,13 @@ import {
   shouldCreateNewThreadInCurrentProject,
   shouldNavigateAfterThreadPark,
   THREAD_JUMP_HINT_SHOW_DELAY_MS,
+  visibleSidebarShelfThreads,
   type SidebarListItem,
   type SidebarListMarker,
   type SidebarSection,
   resolveSidebarDropVerb,
 } from "./Sidebar.logic";
+import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
 import { sortSettledThreads } from "@t3tools/client-runtime/state/thread-sort";
 import { EnvironmentId, ProjectId, ProviderInstanceId, RunId, ThreadId } from "@t3tools/contracts";
@@ -2127,7 +2129,7 @@ describe("unseen completion with background work", () => {
   });
 });
 
-describe("Working shelf (beta)", () => {
+describe("Working shelf", () => {
   const runtime = {
     status: "running" as const,
     activeRunId: null,
@@ -2164,6 +2166,38 @@ describe("Working shelf (beta)", () => {
         runtime: { ...runtime, status: "failed" as const, lastError: "boom" },
       }),
     ).toBe(false);
+  });
+
+  it("folds away a parent waiting on its subagent unless the parent needs the user", () => {
+    const parent = {
+      ...waiting,
+      pendingBackgroundTasks: [
+        { taskId: "child", description: "Child", kind: "subagent" as const },
+      ],
+    };
+    expect(isSidebarThreadWorking(parent)).toBe(true);
+    expect(isSidebarThreadWorking({ ...parent, hasPendingApprovals: true })).toBe(false);
+    expect(isSidebarThreadWorking({ ...parent, hasPendingUserInput: true })).toBe(false);
+    expect(
+      isSidebarThreadWorking({
+        ...parent,
+        runtime: { ...runtime, status: "failed" as const, lastError: "boom" },
+      }),
+    ).toBe(false);
+  });
+
+  describe("visibleSidebarShelfThreads", () => {
+    const shelf = ["open", "other"].map((id) => ({
+      environmentId: localEnvironmentId,
+      id: ThreadId.make(id),
+    }));
+    const openKey = scopedThreadKey(scopeThreadRef(localEnvironmentId, ThreadId.make("open")));
+
+    it("keeps only the open thread on a collapsed shelf", () => {
+      expect(visibleSidebarShelfThreads(shelf, false, openKey)).toEqual([shelf[0]]);
+      expect(visibleSidebarShelfThreads(shelf, false, null)).toEqual([]);
+      expect(visibleSidebarShelfThreads(shelf, true, openKey)).toBe(shelf);
+    });
   });
 
   it("keeps a ready plan in the inbox while background work runs", () => {

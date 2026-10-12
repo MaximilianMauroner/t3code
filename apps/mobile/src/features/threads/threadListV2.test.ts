@@ -1698,6 +1698,99 @@ describe("cross-section thread drops", () => {
   });
 });
 
+describe("buildThreadListV2Items Working section", () => {
+  const runtime = (status: "running" | "idle" | "failed") => ({
+    status,
+    activeRunId: status === "running" ? RunId.make("run-active") : null,
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    providerName: "Codex",
+    lastError: status === "failed" ? "boom" : null,
+    updatedAt: NOW,
+  });
+  const subagentTask = { taskId: "child-task", description: "Child", kind: "subagent" as const };
+  const parent = makeThread({
+    id: ThreadId.make("parent"),
+    title: "Parent",
+    runtime: runtime("idle"),
+    pendingBackgroundTasks: [subagentTask],
+  });
+  const threads = [
+    makeThread({ id: ThreadId.make("ready"), title: "Ready" }),
+    makeThread({ id: ThreadId.make("running"), title: "Running", runtime: runtime("running") }),
+    parent,
+    makeThread({
+      id: ThreadId.make("child"),
+      title: "Child",
+      runtime: runtime("running"),
+      lineage: {
+        parentThreadId: parent.id,
+        rootThreadId: parent.id,
+        relationshipToParent: "subagent",
+      },
+    }),
+    makeThread({
+      id: ThreadId.make("approval"),
+      title: "Approval",
+      runtime: runtime("running"),
+      hasPendingApprovals: true,
+    }),
+    makeThread({
+      id: ThreadId.make("question"),
+      title: "Question",
+      runtime: runtime("running"),
+      hasPendingUserInput: true,
+    }),
+    makeThread({
+      id: ThreadId.make("failed"),
+      title: "Failed",
+      runtime: runtime("failed"),
+      pendingBackgroundTasks: [subagentTask],
+    }),
+  ];
+  const ids = (layout: ReturnType<typeof buildThreadListV2Items>) =>
+    layout.items.map((item) => item.thread.id).toSorted();
+
+  it("lists only threads that are not working, keeping the ones that need the user", () => {
+    const layout = buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+      workingShelfEnabled: true,
+    });
+
+    expect(ids(layout)).toEqual(["approval", "failed", "question", "ready"]);
+    expect(layout.workingCount).toBe(2);
+  });
+
+  it("keeps working threads in the inbox while the section is off", () => {
+    const layout = buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+      workingShelfEnabled: false,
+    });
+
+    expect(ids(layout)).toEqual(["approval", "failed", "parent", "question", "ready", "running"]);
+    expect(layout.workingCount).toBe(0);
+  });
+
+  it("keeps the selected working thread on the collapsed shelf", () => {
+    const layout = buildThreadListV2Items({
+      threads,
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+      workingShelfEnabled: true,
+      selectedThreadKey: `${environmentId}:parent`,
+    });
+
+    expect(ids(layout)).toEqual(["approval", "failed", "parent", "question", "ready"]);
+    expect(layout.workingCount).toBe(2);
+  });
+});
+
 it("excludes subagents from navigation, search and ordering while retaining user forks", () => {
   const root = makeThread({ id: ThreadId.make("root"), title: "Root" });
   const child = makeThread({

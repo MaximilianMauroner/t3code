@@ -220,6 +220,7 @@ import {
   sortSidebarV2ProjectGroups,
   sortThreadsForSidebar,
   sortWorkingThreadsBySend,
+  visibleSidebarShelfThreads,
   useThreadJumpHintVisibility,
   useRetainedValue,
   useSidebarRowSubscriptionLease,
@@ -292,10 +293,6 @@ import {
 // Settled-tail paging: recent history is the common lookup; the deep tail
 // stays behind an explicit Show more.
 const EMPTY_PROVIDER_ENTRIES: ReadonlyMap<string, ProviderInstanceEntry> = new Map();
-// Collapsed shelves share one empty list so a route change alone does not
-// give the sidebar list a new identity.
-const EMPTY_THREADS: readonly EnvironmentThreadShell[] = [];
-
 const SETTLED_TAIL_INITIAL_COUNT = 10;
 const SETTLED_TAIL_PAGE_COUNT = 25;
 // Fresh keys deliberately reset both shelves to collapsed for existing users.
@@ -2822,8 +2819,8 @@ export default function Sidebar() {
     const pinned: EnvironmentThreadShell[] = [];
     const active: EnvironmentThreadShell[] = [];
     const working: EnvironmentThreadShell[] = [];
-    // Working beta: only inbox threads fold away. Pins stay where the user
-    // put them, and snoozed or settled threads keep their shelves.
+    // Working section: only inbox threads fold away. Pins stay where the
+    // user put them, and snoozed or settled threads keep their shelves.
     const inbox = (thread: EnvironmentThreadShell) =>
       workingShelfEnabled && isSidebarThreadWorking(thread) ? working : active;
     const snoozed: EnvironmentThreadShell[] = [];
@@ -3033,15 +3030,10 @@ export default function Sidebar() {
     () => setSettledShelfExpanded((value) => !value),
     [setSettledShelfExpanded],
   );
-  const renderedSettledThreads = useMemo(() => {
-    if (settledShelfExpanded) return visibleSettledThreads;
-    if (routeThreadKey === null) return EMPTY_THREADS;
-    const routeThread = visibleSettledThreads.find(
-      (thread) =>
-        scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
-    );
-    return routeThread === undefined ? EMPTY_THREADS : [routeThread];
-  }, [routeThreadKey, settledShelfExpanded, visibleSettledThreads]);
+  const renderedSettledThreads = useMemo(
+    () => visibleSidebarShelfThreads(visibleSettledThreads, settledShelfExpanded, routeThreadKey),
+    [routeThreadKey, settledShelfExpanded, visibleSettledThreads],
+  );
 
   // The snoozed shelf is collapsed by default: out of the way, never gone.
   // Collapsed threads don't render (and so don't participate in jump
@@ -3055,23 +3047,18 @@ export default function Sidebar() {
     () => setSnoozedShelfExpanded((value) => !value),
     [setSnoozedShelfExpanded],
   );
-  const visibleSnoozedThreads = useMemo(() => {
-    if (snoozedShelfExpanded) return snoozedThreads;
-    // The open thread must never vanish behind the collapsed shelf: a
-    // snoozed thread reached by route (deep link, open before snoozing
-    // elsewhere) keeps its row — with highlight and wake affordance — same
-    // exception the settled tail's "Show more" makes.
-    if (routeThreadKey === null) return EMPTY_THREADS;
-    const routeThread = snoozedThreads.find(
-      (thread) =>
-        scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
-    );
-    return routeThread === undefined ? EMPTY_THREADS : [routeThread];
-  }, [routeThreadKey, snoozedShelfExpanded, snoozedThreads]);
+  // The open thread must never vanish behind the collapsed shelf: a snoozed
+  // thread reached by route (deep link, open before snoozing elsewhere) keeps
+  // its row — with highlight and wake affordance — same exception the settled
+  // tail's "Show more" makes.
+  const visibleSnoozedThreads = useMemo(
+    () => visibleSidebarShelfThreads(snoozedThreads, snoozedShelfExpanded, routeThreadKey),
+    [routeThreadKey, snoozedShelfExpanded, snoozedThreads],
+  );
 
-  // The Working shelf (beta) collapses the same way, with the same route
-  // exception: sending a message folds the open thread into the shelf, and
-  // its row must stay visible there.
+  // The Working shelf collapses the same way, with the same route exception:
+  // sending a message folds the open thread into the shelf, and its row must
+  // stay visible there.
   const [workingShelfExpanded, setWorkingShelfExpanded] = useLocalStorage(
     WORKING_SHELF_EXPANDED_KEY,
     false,
@@ -3081,15 +3068,10 @@ export default function Sidebar() {
     () => setWorkingShelfExpanded((value) => !value),
     [setWorkingShelfExpanded],
   );
-  const visibleWorkingThreads = useMemo(() => {
-    if (workingShelfExpanded) return workingThreads;
-    if (routeThreadKey === null) return EMPTY_THREADS;
-    const routeThread = workingThreads.find(
-      (thread) =>
-        scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
-    );
-    return routeThread === undefined ? EMPTY_THREADS : [routeThread];
-  }, [routeThreadKey, workingShelfExpanded, workingThreads]);
+  const visibleWorkingThreads = useMemo(
+    () => visibleSidebarShelfThreads(workingThreads, workingShelfExpanded, routeThreadKey),
+    [routeThreadKey, workingShelfExpanded, workingThreads],
+  );
 
   const orderedThreads = useMemo(
     () => [
