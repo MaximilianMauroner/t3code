@@ -258,9 +258,13 @@ export function useThreadListActions(): {
     thread: EnvironmentThreadShell,
     enabled: boolean,
   ) => Promise<boolean>;
+  /** A thread list passes its Working section setting so Up/Down plans
+      against the rows it shows. The arrangement sheet shows the saved order,
+      working threads included, so it leaves the option out. */
   readonly moveThread: (
     thread: EnvironmentThreadShell,
     direction: ThreadMoveDestination,
+    options?: { readonly workingShelfEnabled?: boolean },
   ) => Promise<boolean>;
   readonly renameThread: (thread: EnvironmentThreadShell) => void;
   readonly regenerateThreadTitle: (thread: EnvironmentThreadShell) => Promise<boolean>;
@@ -586,7 +590,11 @@ export function useThreadListActions(): {
     reportFailure: false,
   });
   const moveThread = useCallback(
-    async (thread: EnvironmentThreadShell, direction: ThreadMoveDestination) => {
+    async (
+      thread: EnvironmentThreadShell,
+      direction: ThreadMoveDestination,
+      options?: { readonly workingShelfEnabled?: boolean },
+    ) => {
       if (!checkThreadOperationPermission(thread, "Could not move thread")) return false;
       if (getPendingThreadOrder() !== null || appAtomRegistry.get(threadDropBusyAtom)) return false;
       const shells = appAtomRegistry.get(environmentThreadShells.threadShellsAtom);
@@ -629,6 +637,7 @@ export function useThreadListActions(): {
         section,
         now: new Date().toISOString(),
         queuedThreadKeys: appAtomRegistry.get(queuedThreadKeysAtom),
+        workingShelfEnabled: options?.workingShelfEnabled,
         settlementEnvironmentIds: new Set(
           [...configs].flatMap(([id, config]) =>
             config.environment.capabilities.threadSettlement === true ? [id] : [],

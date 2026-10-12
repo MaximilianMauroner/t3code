@@ -282,9 +282,9 @@ function InboxSettingsSection() {
         />
       </SettingsSection>
       <Text className="px-2 text-sm text-foreground-muted">
-        Working and monitoring threads fold out of the list into a Working section. They come back
-        to the top of the list when they need you. While this is on, active threads are ordered by
-        time and cannot be moved.
+        Working and monitoring threads, pinned ones too, fold out of the list into a Working
+        section. They come back when they need you: to Pinned if pinned, otherwise to the top of the
+        list. While this is on, active threads are ordered by time and cannot be moved.
       </Text>
     </View>
   );

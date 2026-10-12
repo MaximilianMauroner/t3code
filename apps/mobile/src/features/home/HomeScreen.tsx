@@ -120,6 +120,7 @@ interface HomeScreenProps {
   readonly onMoveThread: (
     thread: EnvironmentThreadShell,
     direction: ThreadMoveDestination,
+    options?: { readonly workingShelfEnabled?: boolean },
   ) => Promise<boolean>;
   readonly onRenameThread: (thread: EnvironmentThreadShell) => void;
   readonly onRegenerateThreadTitle: (thread: EnvironmentThreadShell) => Promise<boolean>;
@@ -449,12 +450,6 @@ export function HomeScreen(props: HomeScreenProps) {
     },
     [props.onPinThread],
   );
-  const handleMoveThread = useCallback(
-    (thread: EnvironmentThreadShell, direction: ThreadMoveDestination) => {
-      void props.onMoveThread(thread, direction);
-    },
-    [props.onMoveThread],
-  );
   const handleUnpinThread = useCallback(
     (thread: EnvironmentThreadShell) => {
       void props.onUnpinThread(thread);
@@ -504,6 +499,12 @@ export function HomeScreen(props: HomeScreenProps) {
     toggleSnoozedShelf,
     toggleWorkingShelf,
   } = useThreadListV2ShelfPreferences();
+  const handleMoveThread = useCallback(
+    (thread: EnvironmentThreadShell, direction: ThreadMoveDestination) => {
+      void props.onMoveThread(thread, direction, { workingShelfEnabled });
+    },
+    [props.onMoveThread, workingShelfEnabled],
+  );
   // The queued-start and snooze helpers need a clock while the list stays open.
   const [nowMinute, setNowMinute] = useState(() => new Date().toISOString().slice(0, 16));
   // Snooze wake times are second-precise; a counter bumped exactly at the
@@ -553,6 +554,7 @@ export function HomeScreen(props: HomeScreenProps) {
           settlementEnvironmentIds,
           snoozeEnvironmentIds,
           queuedThreadKeys,
+          workingShelfEnabled,
         }),
       });
     // The Working section orders the inbox by time, so only pins can move.

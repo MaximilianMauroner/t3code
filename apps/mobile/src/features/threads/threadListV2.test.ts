@@ -414,6 +414,34 @@ describe("getThreadListV2OrderedSection", () => {
       ),
     ).toEqual(["pinned-first", "pinned-later"]);
   });
+
+  it("leaves out pins folded into the Working shelf, so Up and Down skip them", () => {
+    const pin = (id: string, input: Partial<EnvironmentThreadShell> = {}) =>
+      makeThread({ id: ThreadId.make(id), title: id, pinnedAt: NOW, pinOrderKey: id, ...input });
+    const threads = [
+      pin("a"),
+      pin("b", {
+        runtime: {
+          status: "running",
+          activeRunId: null,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerName: "Codex",
+          lastError: null,
+          updatedAt: NOW,
+        },
+      }),
+      pin("c"),
+    ];
+    const ids = (workingShelfEnabled: boolean) =>
+      getThreadListV2OrderedSection({
+        threads,
+        section: "pinned",
+        now: NOW,
+        workingShelfEnabled,
+      }).map((thread) => thread.id);
+    expect(ids(true)).toEqual(["a", "c"]);
+    expect(ids(false)).toEqual(["a", "b", "c"]);
+  });
 });
 
 describe("buildThreadListV2Items", () => {

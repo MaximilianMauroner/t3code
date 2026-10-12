@@ -2375,7 +2375,7 @@ export function GeneralSettingsPanel() {
 
         <SettingsRow
           {...searchableSetting("working-shelf")}
-          description="Working and monitoring threads fold out of the inbox into a Working section. They come back to the top of the inbox when they need you."
+          description="Working and monitoring threads, pinned ones too, fold out of the inbox into a Working section. They come back when they need you: to Pinned if pinned, otherwise to the top of the inbox."
           resetAction={
             settings.sidebarWorkingShelfEnabled !==
             DEFAULT_UNIFIED_SETTINGS.sidebarWorkingShelfEnabled ? (

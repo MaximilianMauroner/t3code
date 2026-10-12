@@ -236,6 +236,9 @@ export function getThreadListV2OrderedSection(input: {
   readonly settlementEnvironmentIds?: ReadonlySet<EnvironmentId>;
   readonly snoozeEnvironmentIds?: ReadonlySet<EnvironmentId>;
   readonly queuedThreadKeys?: ReadonlySet<string>;
+  /** Leaves out threads folded into the Working shelf, pinned or not. Like
+      snoozed pins, their order keys stay reserved through the planner. */
+  readonly workingShelfEnabled?: boolean;
 }): EnvironmentThreadShell[] {
   // An empty set is treated as absent so `?.` skips building the key.
   const queuedThreadKeys = input.queuedThreadKeys?.size ? input.queuedThreadKeys : undefined;
@@ -255,6 +258,7 @@ export function getThreadListV2OrderedSection(input: {
     ) {
       return false;
     }
+    if (input.workingShelfEnabled === true && isThreadWorking(thread)) return false;
     return (thread.pinnedAt != null) === (input.section === "pinned");
   });
   const ordered =
