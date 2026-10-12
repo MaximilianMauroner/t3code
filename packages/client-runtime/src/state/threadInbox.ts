@@ -1,3 +1,5 @@
+import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+
 import { threadRuntimeIsActive, type EnvironmentThreadShell } from "./models.ts";
 import { toSortableTimestamp } from "./threadSort.ts";
 
@@ -11,6 +13,7 @@ type WorkingThreadInput = Pick<
   | "hasPendingUserInput"
   | "interactionMode"
   | "latestRun"
+  | "pendingBackgroundTasks"
   | "runtime"
 >;
 
@@ -19,7 +22,12 @@ type WorkingThreadInput = Pick<
     it. Approvals, questions, plan prompts, and failures stay in the inbox. */
 export function isThreadWorking(thread: WorkingThreadInput): boolean {
   if (thread.hasPendingApprovals || thread.hasPendingUserInput) return false;
-  if (!threadRuntimeIsActive(thread.runtime) && thread.runtime?.status !== "idle") return false;
+  // An idle runtime is working only when background work will wake it; a
+  // thread that never ran, such as an imported one, also presents as idle.
+  const parked =
+    thread.runtime?.status === "idle" &&
+    backgroundWorkHoldsCompletion(thread.pendingBackgroundTasks);
+  if (!threadRuntimeIsActive(thread.runtime) && !parked) return false;
   // A plan prompt outranks lingering background work: the user has to act on it.
   const run = thread.latestRun;
   const runSettled =

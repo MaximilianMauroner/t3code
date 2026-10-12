@@ -65,7 +65,15 @@ import {
 import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
 import { sortSettledThreads } from "@t3tools/client-runtime/state/thread-sort";
-import { EnvironmentId, ProjectId, ProviderInstanceId, RunId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  type OrchestrationV2ThreadShell,
+  ProjectId,
+  ProviderInstanceId,
+  RunId,
+  RuntimeRequestId,
+  ThreadId,
+} from "@t3tools/contracts";
 
 import {
   DEFAULT_INTERACTION_MODE,
@@ -2145,6 +2153,7 @@ describe("Working shelf", () => {
     hasPendingUserInput: false,
     interactionMode: "default" as const,
     latestRun: makeLatestRun(),
+    pendingBackgroundTasks: [],
     runtime: null,
   };
   // Stopped with background tasks still open: V2's "waiting" sidebar status.
@@ -2169,21 +2178,27 @@ describe("Working shelf", () => {
   });
 
   it("folds away a parent waiting on its subagent unless the parent needs the user", () => {
-    const parent = {
-      ...waiting,
-      pendingBackgroundTasks: [
-        { taskId: "child", description: "Child", kind: "subagent" as const },
-      ],
-    };
-    expect(isSidebarThreadWorking(parent)).toBe(true);
-    expect(isSidebarThreadWorking({ ...parent, hasPendingApprovals: true })).toBe(false);
-    expect(isSidebarThreadWorking({ ...parent, hasPendingUserInput: true })).toBe(false);
-    expect(
-      isSidebarThreadWorking({
-        ...parent,
-        runtime: { ...runtime, status: "failed" as const, lastError: "boom" },
-      }),
-    ).toBe(false);
+    const parent = (overrides: Partial<OrchestrationV2ThreadShell> = {}) =>
+      presentThreadShell(localEnvironmentId, {
+        ...makeThreadFixture().source,
+        latestRunId: RunId.make("run-parent"),
+        status: "completed",
+        latestRunCompletedAt: DateTime.makeUnsafe("2026-06-20T01:00:00.000Z"),
+        pendingBackgroundTasks: [{ taskId: "child", kind: "subagent" }],
+        ...overrides,
+      });
+    const request = (kind: "command" | "user_input") => ({
+      pendingRuntimeRequest: {
+        id: RuntimeRequestId.make(`request-${kind}`),
+        kind,
+        createdAt: DateTime.makeUnsafe("2026-06-20T01:01:00.000Z"),
+      },
+    });
+
+    expect(isSidebarThreadWorking(parent())).toBe(true);
+    expect(isSidebarThreadWorking(parent(request("command")))).toBe(false);
+    expect(isSidebarThreadWorking(parent(request("user_input")))).toBe(false);
+    expect(isSidebarThreadWorking(parent({ status: "failed" }))).toBe(false);
   });
 
   describe("visibleSidebarShelfThreads", () => {
