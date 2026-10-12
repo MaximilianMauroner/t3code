@@ -141,19 +141,25 @@ describe("animateSidebarLayoutChanges", () => {
 });
 
 describe("resolveSidebarThreadSection", () => {
-  it("keeps a pinned thread in the pinned shelf", () => {
-    expect(resolveSidebarThreadSection({ snoozed: false, settled: false, pinned: true })).toBe(
-      "pinned",
-    );
+  const resolve = (input: Partial<Parameters<typeof resolveSidebarThreadSection>[0]>) =>
+    resolveSidebarThreadSection({
+      snoozed: false,
+      settled: false,
+      working: false,
+      pinned: false,
+      ...input,
+    });
+
+  it("keeps a pinned thread in the pinned shelf until it works", () => {
+    expect(resolve({ pinned: true })).toBe("pinned");
+    expect(resolve({ pinned: true, working: true })).toBe("working");
+    expect(resolve({ working: true })).toBe("working");
+    expect(resolve({})).toBe("active");
   });
 
-  it("keeps lifecycle shelves authoritative over a stale pin", () => {
-    expect(resolveSidebarThreadSection({ snoozed: true, settled: true, pinned: true })).toBe(
-      "snoozed",
-    );
-    expect(resolveSidebarThreadSection({ snoozed: false, settled: true, pinned: true })).toBe(
-      "settled",
-    );
+  it("keeps lifecycle shelves authoritative over a stale pin and live work", () => {
+    expect(resolve({ snoozed: true, settled: true, working: true, pinned: true })).toBe("snoozed");
+    expect(resolve({ settled: true, working: true, pinned: true })).toBe("settled");
   });
 });
 

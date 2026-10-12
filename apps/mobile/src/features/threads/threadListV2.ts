@@ -660,7 +660,7 @@ export function buildThreadListV2Items(input: {
   readonly settledLimit?: number;
   /** Second-precise clock used for time-based classification. */
   readonly now: string;
-  /** Working section: unpinned working threads fold into the Working
+  /** Working section: working threads, pinned or not, fold into the Working
       shelf, and the inbox orders by when each thread came back to the user
       instead of the saved arrangement. */
   readonly workingShelfEnabled?: boolean;
@@ -747,10 +747,11 @@ export function buildThreadListV2Items(input: {
       queuedThreadKeys?.has(`${thread.environmentId}:${thread.id}`) === true;
     if (supportsSettlement && thread.settledOverride === "settled" && !hasQueuedMessages) {
       settled.push(thread);
+    } else if (workingShelfEnabled && isThreadWorking(thread)) {
+      // Pinned or not; the pin brings it back to Pinned once it stops working.
+      working.push(thread);
     } else if (thread.pinnedAt != null) {
       pinned.push(thread);
-    } else if (workingShelfEnabled && isThreadWorking(thread)) {
-      working.push(thread);
     } else {
       active.push(thread);
     }

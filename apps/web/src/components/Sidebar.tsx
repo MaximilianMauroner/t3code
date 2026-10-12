@@ -2819,12 +2819,13 @@ export default function Sidebar() {
     const pinned: EnvironmentThreadShell[] = [];
     const active: EnvironmentThreadShell[] = [];
     const working: EnvironmentThreadShell[] = [];
-    // Working section: only inbox threads fold away. Pins stay where the
-    // user put them, and snoozed or settled threads keep their shelves.
-    const inbox = (thread: EnvironmentThreadShell) =>
-      workingShelfEnabled && isSidebarThreadWorking(thread) ? working : active;
     const snoozed: EnvironmentThreadShell[] = [];
     const settled: EnvironmentThreadShell[] = [];
+    const shelves = { pinned, active, working, snoozed, settled };
+    // Working section: working threads fold away, pinned or not, and keep
+    // their pin; snoozed or settled threads keep their shelves.
+    const isWorking = (thread: EnvironmentThreadShell) =>
+      workingShelfEnabled && isSidebarThreadWorking(thread);
     const draggable = new Set<string>();
     const activeReorderable = new Set<string>();
     for (const thread of visible) {
@@ -2849,12 +2850,13 @@ export default function Sidebar() {
           optimisticDrop.occurredAt,
           optimisticDrop.assignedKeys.get(threadKey),
         );
-        (optimisticDrop.section === "pinned"
-          ? pinned
-          : optimisticDrop.section === "settled"
-            ? settled
-            : inbox(projected)
-        ).push(
+        const section = resolveSidebarThreadSection({
+          snoozed: false,
+          settled: optimisticDrop.section === "settled",
+          working: isWorking(projected),
+          pinned: optimisticDrop.section === "pinned",
+        });
+        shelves[section].push(
           optimisticDrop.clearsSnooze
             ? projected
             : { ...projected, snoozedAt: thread.snoozedAt, snoozedUntil: thread.snoozedUntil },
@@ -2863,16 +2865,10 @@ export default function Sidebar() {
         const section = resolveSidebarThreadSection({
           snoozed: supportsSnooze && effectiveSnoozed(thread, { now: preciseNow }),
           settled: supportsSettlement && thread.settledOverride === "settled",
+          working: isWorking(thread),
           pinned: thread.pinnedAt != null,
         });
-        (section === "snoozed"
-          ? snoozed
-          : section === "settled"
-            ? settled
-            : section === "pinned"
-              ? pinned
-              : inbox(thread)
-        ).push(thread);
+        shelves[section].push(thread);
       }
     }
     // One shared rule on every platform (see sortPinnedThreadsByOrderKey):

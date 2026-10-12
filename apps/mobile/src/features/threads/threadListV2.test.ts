@@ -2440,20 +2440,42 @@ describe("Working section", () => {
   const ids = (layout: ReturnType<typeof buildThreadListV2Items>) =>
     layout.items.map((item) => item.thread.id);
 
-  it("folds unpinned working threads into a collapsed shelf", () => {
+  it("folds working threads, pinned or not, into a collapsed shelf", () => {
     const layout = build();
-    expect(ids(layout)).toEqual([
-      "pinned-working",
-      "finished-late",
-      "asks-approval",
-      "finished-early",
-    ]);
-    expect(layout.workingCount).toBe(1);
-    expect(layout.workingShelfHeaderIndex).toBe(4);
+    expect(ids(layout)).toEqual(["finished-late", "asks-approval", "finished-early"]);
+    expect(layout.workingCount).toBe(2);
+    expect(layout.workingShelfHeaderIndex).toBe(3);
 
     const off = build({ workingShelfEnabled: false });
     expect(ids(off)).toContain("working");
+    expect(off.items[0]).toMatchObject({ thread: { id: "pinned-working" }, pinned: true });
     expect(off.workingCount).toBe(0);
+  });
+
+  it("returns a working pin to Pinned, pin intact, once it stops working or needs the user", () => {
+    const pinnedAt = "2026-06-01T00:00:00.000Z";
+    const pin = (input: Partial<EnvironmentThreadShell> = {}) =>
+      makeThread({ id: ThreadId.make("pin"), title: "pin", pinnedAt, runtime: running, ...input });
+
+    const busy = build({ threads: [pin()], workingShelfExpanded: true });
+    expect(busy.workingCount).toBe(1);
+    expect(busy.items).toEqual([
+      expect.objectContaining({ pinned: false, thread: expect.objectContaining({ pinnedAt }) }),
+    ]);
+    expect(ids(build({ threads: [pin()], selectedThreadKey: `${environmentId}:pin` }))).toEqual([
+      "pin",
+    ]);
+
+    for (const back of [
+      pin({ runtime: null }),
+      pin({ hasPendingApprovals: true }),
+      pin({ hasPendingUserInput: true }),
+      pin({ runtime: { ...running, status: "failed", lastError: "boom" } }),
+    ]) {
+      const layout = build({ threads: [back] });
+      expect(layout.workingCount).toBe(0);
+      expect(layout.items).toEqual([expect.objectContaining({ pinned: true, thread: back })]);
+    }
   });
 
   it("shows working rows as cards when expanded, or only the selected one when collapsed", () => {
@@ -2469,7 +2491,7 @@ describe("Working section", () => {
       inboxReturnAt: (thread) =>
         thread.id === "finished-early" ? Date.parse("2026-06-01T04:00:00.000Z") : undefined,
     });
-    expect(ids(layout).slice(1)).toEqual(["finished-early", "finished-late", "asks-approval"]);
+    expect(ids(layout)).toEqual(["finished-early", "finished-late", "asks-approval"]);
   });
 
   it("places the shelf after queued tasks and before snoozed and settled threads", () => {

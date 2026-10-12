@@ -135,14 +135,18 @@ export const animateSidebarLayoutChanges: AnimateLayoutChanges = (args) =>
 export type SidebarSection = "pinned" | "active" | "working" | "snoozed" | "settled";
 
 /** Resolve the shelf a visible thread belongs to. Snooze is temporary and
- * wins until its wake boundary; settlement then wins over a stale pin. */
+ * wins until its wake boundary; settlement then wins over a stale pin. A
+ * working thread (with the Working section on) folds away whether or not it
+ * is pinned, and its pin brings it back to Pinned once it stops working. */
 export function resolveSidebarThreadSection(input: {
   readonly snoozed: boolean;
   readonly settled: boolean;
+  readonly working: boolean;
   readonly pinned: boolean;
 }): SidebarSection {
   if (input.snoozed) return "snoozed";
   if (input.settled) return "settled";
+  if (input.working) return "working";
   if (input.pinned) return "pinned";
   return "active";
 }
