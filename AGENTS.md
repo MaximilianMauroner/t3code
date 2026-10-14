@@ -76,7 +76,7 @@ The most common defect in this repo is a change that works on the path you teste
 
 ## Dev servers
 
-- `vp i` installs. Worktrees get this from the t3.json setup script; if module resolution looks broken, it probably did not run.
+- `vp i` installs dependencies. On fresh clones, copy `t3.example.json` to the ignored `t3.json`, then import its **Setup Worktree** action in T3 Code before creating worktrees. The action runs `vp i` and links the project root `.env` and `infra/relay/.env` into the worktree. Existing imported actions remain available. If module resolution looks broken, check that the setup action ran.
 - `vp run dev` starts server and web. In a worktree, state defaults to that worktree's gitignored `.t3`, which deliberately outranks an ambient `T3CODE_HOME` so you cannot land on shared state by accident. An explicit `--home-dir` still wins.
 - Ports derive from the worktree path and are stable across restarts, but read the real ones from the `[dev-runner]` line since occupied ports shift.
 - `--share` publishes over the tailnet. Do not open the URL when you use this, just send it to the user with the pairing code included in url
