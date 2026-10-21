@@ -101,7 +101,8 @@ function setup(initial: Listing = AsyncResult.initial(true)) {
 }
 
 const button = (name: string) => page.getByRole("button", { name, exact: true });
-const checkbox = (name: string) => page.getByRole("checkbox", { name, exact: true });
+const checkbox = (name: string) =>
+  page.getByRole("checkbox", { name: new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")) });
 
 describe("ignored-file picker query state", () => {
   it("waits for defaults before search edits and preserves an intentional clear", async () => {
