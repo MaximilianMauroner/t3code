@@ -468,17 +468,18 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceEntries", (it) => {
           Array.from({ length: 205 }, (_, i) => i),
           (i) => writeTextFile(cwd, `data/generated-${String(i).padStart(3, "0")}.log`, "x"),
         );
-        yield* writeTextFile(cwd, "data/z-target.log", "found");
+        yield* writeTextFile(cwd, "data/z-Target.log", "found");
         yield* writeTextFile(cwd, "node_modules/z-target.log", "excluded");
 
         const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
         expect(
           yield* workspaceEntries.listIgnoredFiles({ cwd, query: "  DaTa/Z-TaRgEt.LoG  " }),
         ).toEqual({
-          files: [{ path: "data/z-target.log", byteLength: 5 }],
+          files: [{ path: "data/z-Target.log", byteLength: 5 }],
           truncated: false,
         });
         const unfiltered = yield* workspaceEntries.listIgnoredFiles({ cwd });
+        expect(unfiltered.files.map((file) => file.path)).not.toContain("data/z-Target.log");
         expect(yield* workspaceEntries.listIgnoredFiles({ cwd, query: "" })).toEqual(unfiltered);
         expect(yield* workspaceEntries.listIgnoredFiles({ cwd, query: "   " })).toEqual(unfiltered);
         expect(yield* workspaceEntries.listIgnoredFiles({ cwd, query: "node_modules" })).toEqual({
