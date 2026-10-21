@@ -121,10 +121,8 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
         })
       : null,
   );
-  const ignoredFiles =
-    canSearchFiles && normalizedQuery && debouncedQuery
-      ? filteredIgnoredFiles
-      : defaultIgnoredFiles;
+  const searchActive = canSearchFiles && normalizedQuery.length > 0 && debouncedQuery.length > 0;
+  const ignoredFiles = searchActive ? filteredIgnoredFiles : defaultIgnoredFiles;
   const loadingDefaults = defaultIgnoredFiles.data === null && defaultIgnoredFiles.error === null;
   const loadingFiles = ignoredFiles.data === null && ignoredFiles.error === null;
   const files = ignoredFiles.error ? [] : (ignoredFiles.data?.files ?? []);
@@ -384,7 +382,7 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                   <p className="text-destructive-foreground text-xs">{ignoredFiles.error}</p>
                 ) : files.length === 0 ? (
                   <p className="text-muted-foreground text-xs">
-                    {debouncedQuery
+                    {searchActive
                       ? "No ignored files match your search."
                       : "No ignored files to copy."}
                   </p>
@@ -392,20 +390,20 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                 <IgnoredFileTree
                   files={loadingFiles || ignoredFiles.error ? [] : files}
                   defaultFiles={defaultIgnoredFiles.data?.files ?? null}
-                  searching={canSearchFiles && normalizedQuery.length > 0}
+                  searching={searchActive}
                   selected={selectedFiles}
                   atSelectionLimit={atSelectionLimit}
                   onCheckedChange={(file, checked) =>
                     setSelected(updateIgnoredFileSelection(selectedFiles, [file], checked))
                   }
                 />
-                {!normalizedQuery && defaultIgnoredFiles.data?.truncated ? (
+                {!searchActive && defaultIgnoredFiles.data?.truncated ? (
                   <p className="text-muted-foreground text-xs">
                     Only the first {PROJECT_IGNORED_FILES_LIMIT} ignored files are listed.
                     {canSearchFiles ? " Search to find more files." : ""}
                   </p>
                 ) : null}
-                {normalizedQuery &&
+                {searchActive &&
                 !loadingFiles &&
                 !ignoredFiles.error &&
                 ignoredFiles.data?.truncated ? (
