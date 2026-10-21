@@ -310,6 +310,57 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceEntries", (it) => {
       }),
     );
 
+    it.effect("searches all ignored paths before limiting results", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir({ git: true });
+        yield* writeTextFile(cwd, ".gitignore", "*.log\nnode_modules/\n");
+        yield* writeTextFile(cwd, "data/keep.txt", "tracked");
+        yield* git(cwd, ["add", "data/keep.txt"]);
+        yield* Effect.forEach(
+          Array.from({ length: 205 }, (_, i) => i),
+          (i) => writeTextFile(cwd, `data/generated-${String(i).padStart(3, "0")}.log`, "x"),
+        );
+        yield* writeTextFile(cwd, "data/z-target.log", "found");
+        yield* writeTextFile(cwd, "node_modules/z-target.log", "excluded");
+
+        const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+        expect(yield* workspaceEntries.listIgnoredFiles({ cwd, query: "z-target" })).toEqual({
+          files: [{ path: "data/z-target.log", byteLength: 5 }],
+          truncated: false,
+        });
+        expect(yield* workspaceEntries.listIgnoredFiles({ cwd, query: "node_modules" })).toEqual({
+          files: [],
+          truncated: false,
+        });
+      }),
+    );
+
+    it.effect(
+      "matches full paths without case sensitivity and treats empty queries as unfiltered",
+      () =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTempDir({ git: true });
+          yield* writeTextFile(cwd, ".gitignore", ".env*\n*.log\n");
+          yield* writeTextFile(cwd, "services/API/index.ts", "tracked");
+          yield* git(cwd, ["add", "services/API/index.ts"]);
+          yield* writeTextFile(cwd, "services/API/.env.local", "A=1");
+          yield* writeTextFile(cwd, "debug.log", "log");
+
+          const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+          const unfiltered = yield* workspaceEntries.listIgnoredFiles({ cwd });
+          expect(yield* workspaceEntries.listIgnoredFiles({ cwd, query: "" })).toEqual(unfiltered);
+          expect(yield* workspaceEntries.listIgnoredFiles({ cwd, query: "   " })).toEqual(
+            unfiltered,
+          );
+          expect(
+            yield* workspaceEntries.listIgnoredFiles({ cwd, query: "  SERVICES/api/.ENV  " }),
+          ).toEqual({
+            files: [{ path: "services/API/.env.local", byteLength: 3 }],
+            truncated: false,
+          });
+        }),
+    );
+
     it.effect("lists ignored files with sizes and skips wholly ignored folders", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTempDir({ git: true });

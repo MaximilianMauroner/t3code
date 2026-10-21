@@ -6,6 +6,8 @@ import {
   getCloneDirectoryName,
 } from "@t3tools/client-runtime/operations/projects";
 import {
+  PROJECT_IGNORED_FILES_LIMIT,
+  isDefaultCopiedFile,
   type EnvironmentId,
   type ProjectIgnoredFile,
   type ScopedProjectRef,
@@ -25,13 +27,14 @@ import {
   addProjectToMachine,
   cloneUrlForProtocol,
   cloneUrlProtocol,
-  isDefaultCopiedFile,
+  updateIgnoredFileSelection,
 } from "../lib/addProjectToMachine";
 import { formatBytes } from "../lib/formatBytes";
 import { newProjectId } from "../lib/utils";
 import { useProject } from "../state/entities";
 import { useEnvironments } from "../state/environments";
 import { projectEnvironment } from "../state/projects";
+import { useDebouncedValue } from "../state/queries";
 import { useEnvironmentQuery } from "../state/query";
 import { EnvironmentMachineIcon } from "./EnvironmentMachineIcon";
 import { Button } from "./ui/button";
@@ -98,7 +101,11 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
   const destinationPath = pathOverride ?? defaultPath;
 
   const canListFiles = source?.serverConfig?.environment.capabilities.ignoredFileListing === true;
-  const ignoredFiles = useEnvironmentQuery(
+  const canSearchFiles = source?.serverConfig?.environment.capabilities.ignoredFileSearch === true;
+  const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim();
+  const debouncedQuery = useDebouncedValue(normalizedQuery, 200);
+  const defaultIgnoredFiles = useEnvironmentQuery(
     project && canListFiles
       ? projectEnvironment.listIgnoredFiles({
           environmentId: project.environmentId,
@@ -106,33 +113,39 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
         })
       : null,
   );
-  const files = ignoredFiles.data?.files ?? [];
-  const [selected, setSelected] = useState<ReadonlySet<string> | null>(null);
-  const selectedFiles = selected ?? defaultSelection(files);
+  const filteredIgnoredFiles = useEnvironmentQuery(
+    project && canSearchFiles && debouncedQuery
+      ? projectEnvironment.listIgnoredFiles({
+          environmentId: project.environmentId,
+          input: { cwd: project.workspaceRoot, query: debouncedQuery },
+        })
+      : null,
+  );
+  const ignoredFiles =
+    canSearchFiles && normalizedQuery && debouncedQuery
+      ? filteredIgnoredFiles
+      : defaultIgnoredFiles;
+  const loadingDefaults = defaultIgnoredFiles.data === null && defaultIgnoredFiles.error === null;
+  const loadingFiles = ignoredFiles.data === null && ignoredFiles.error === null;
+  const files = ignoredFiles.error ? [] : (ignoredFiles.data?.files ?? []);
+  const [selected, setSelected] = useState<ReadonlyMap<string, ProjectIgnoredFile> | null>(null);
+  const selectedFiles = selected ?? defaultSelection(defaultIgnoredFiles.data?.files ?? []);
   const copyable = files.filter((file) => file.byteLength <= COPYABLE_FILE_MAX_BYTES);
-  const selectedBytes = files
-    .filter((file) => selectedFiles.has(file.path))
-    .reduce((total, file) => total + file.byteLength, 0);
+  const selectedBytes = Array.from(selectedFiles.values()).reduce(
+    (total, file) => total + file.byteLength,
+    0,
+  );
+  const atSelectionLimit = selectedFiles.size >= PROJECT_IGNORED_FILES_LIMIT;
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // The project or every target can vanish while the dialog is open. Submitting
   // before the file list loads would silently skip the default .env copies.
-  const unavailable =
-    project === null ||
-    target === null ||
-    (canListFiles && ignoredFiles.data === null && ignoredFiles.error === null);
+  const unavailable = project === null || target === null || (canListFiles && loadingDefaults);
   useEffect(() => {
     if (project === null) close();
   }, [project]);
-
-  const toggleFile = (path: string, checked: boolean) => {
-    const next = new Set(selectedFiles);
-    if (checked) next.add(path);
-    else next.delete(path);
-    setSelected(next);
-  };
 
   // Lands the user on the new machine right away; its composer shows the clone
   // and holds sends until it finishes. A draft open on the source project moves
@@ -179,7 +192,7 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
         title: project.title,
         remoteUrl,
         destinationPath: destinationPath.trim(),
-        files: files.filter((file) => selectedFiles.has(file.path)).map((file) => file.path),
+        files: Array.from(selectedFiles.keys()),
       });
       close();
       openClonedProject(scopeProjectRef(target.environmentId, projectId));
@@ -310,36 +323,68 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
               <div className="flex flex-col gap-1.5">
                 <div className="flex items-center gap-2">
                   <Label className="flex-1">Copy ignored files</Label>
-                  {copyable.length > 0 ? (
-                    <>
-                      <span className="text-muted-foreground text-xs">
-                        {selectedFiles.size} of {files.length}
-                        {selectedBytes > 0 ? ` · ${formatBytes(selectedBytes)}` : ""}
-                      </span>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="xs"
-                        onClick={() =>
-                          setSelected(
-                            selectedFiles.size === copyable.length
-                              ? new Set()
-                              : new Set(copyable.map((file) => file.path)),
-                          )
-                        }
-                      >
-                        {selectedFiles.size === copyable.length ? "None" : "All"}
-                      </Button>
-                    </>
-                  ) : null}
+                  <span className="text-muted-foreground text-xs">
+                    {selectedFiles.size} selected
+                    {selectedBytes > 0 ? ` · ${formatBytes(selectedBytes)}` : ""}
+                  </span>
                 </div>
-                {ignoredFiles.error ? (
+                {canSearchFiles ? (
+                  <>
+                    <Label htmlFor={`${id}-search`}>Search ignored files</Label>
+                    <Input
+                      id={`${id}-search`}
+                      value={query}
+                      onChange={(event) => setQuery(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") event.preventDefault();
+                      }}
+                      maxLength={256}
+                      spellCheck={false}
+                      autoComplete="off"
+                    />
+                  </>
+                ) : (
+                  <p className="text-muted-foreground text-xs">
+                    Update T3 Code on {source?.label ?? "the source machine"} to search ignored
+                    files.
+                  </p>
+                )}
+                <div className="flex items-center gap-2">
+                  <span className="flex-1 text-muted-foreground text-xs">{files.length} shown</span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    disabled={
+                      atSelectionLimit || !copyable.some((file) => !selectedFiles.has(file.path))
+                    }
+                    onClick={() =>
+                      setSelected(updateIgnoredFileSelection(selectedFiles, copyable, true))
+                    }
+                  >
+                    Select shown
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    disabled={!files.some((file) => selectedFiles.has(file.path))}
+                    onClick={() =>
+                      setSelected(updateIgnoredFileSelection(selectedFiles, files, false))
+                    }
+                  >
+                    Clear shown
+                  </Button>
+                </div>
+                {loadingFiles ? (
+                  <p className="text-muted-foreground text-xs">Finding ignored files…</p>
+                ) : ignoredFiles.error ? (
                   <p className="text-destructive-foreground text-xs">{ignoredFiles.error}</p>
                 ) : files.length === 0 ? (
                   <p className="text-muted-foreground text-xs">
-                    {ignoredFiles.isSuccess
-                      ? "No ignored files to copy."
-                      : "Finding ignored files…"}
+                    {debouncedQuery
+                      ? "No ignored files match your search."
+                      : "No ignored files to copy."}
                   </p>
                 ) : (
                   <div className="max-h-52 overflow-y-auto rounded-md border">
@@ -348,14 +393,25 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                         key={file.path}
                         file={file}
                         checked={selectedFiles.has(file.path)}
-                        onCheckedChange={(checked) => toggleFile(file.path, checked)}
+                        atSelectionLimit={atSelectionLimit}
+                        onCheckedChange={(checked) =>
+                          setSelected(updateIgnoredFileSelection(selectedFiles, [file], checked))
+                        }
                       />
                     ))}
                   </div>
                 )}
-                {ignoredFiles.data?.truncated ? (
+                {!loadingFiles && !ignoredFiles.error && ignoredFiles.data?.truncated ? (
                   <p className="text-muted-foreground text-xs">
-                    Showing the first {files.length} files.
+                    {canSearchFiles
+                      ? "More files match. Refine your search."
+                      : `Showing the first ${files.length} files.`}
+                  </p>
+                ) : null}
+                {atSelectionLimit ? (
+                  <p role="status" className="text-muted-foreground text-xs">
+                    You can copy up to {PROJECT_IGNORED_FILES_LIMIT} files. Clear a selection to
+                    choose another file.
                   </p>
                 ) : null}
                 <p className="text-muted-foreground text-xs">
@@ -394,29 +450,35 @@ function projectSubdirectory(repositoryRoot: string | undefined, workspaceRoot: 
     : "";
 }
 
-function defaultSelection(files: readonly ProjectIgnoredFile[]): ReadonlySet<string> {
-  return new Set(
-    files
-      .filter(
-        (file) => file.byteLength <= COPYABLE_FILE_MAX_BYTES && isDefaultCopiedFile(file.path),
-      )
-      .map((file) => file.path),
+function defaultSelection(
+  files: readonly ProjectIgnoredFile[],
+): ReadonlyMap<string, ProjectIgnoredFile> {
+  return updateIgnoredFileSelection(
+    new Map(),
+    files.filter((file) => isDefaultCopiedFile(file.path)),
+    true,
   );
 }
 
 function IgnoredFileRow({
   file,
   checked,
+  atSelectionLimit,
   onCheckedChange,
 }: {
   file: ProjectIgnoredFile;
   checked: boolean;
+  atSelectionLimit: boolean;
   onCheckedChange: (checked: boolean) => void;
 }) {
   const tooLarge = file.byteLength > COPYABLE_FILE_MAX_BYTES;
   return (
     <label className="flex cursor-pointer items-center gap-2 px-2.5 py-1.5 text-sm not-last:border-b has-disabled:cursor-not-allowed has-disabled:opacity-64">
-      <Checkbox checked={checked} disabled={tooLarge} onCheckedChange={onCheckedChange} />
+      <Checkbox
+        checked={checked}
+        disabled={tooLarge || (!checked && atSelectionLimit)}
+        onCheckedChange={onCheckedChange}
+      />
       <span className="min-w-0 flex-1 truncate font-mono text-xs">{file.path}</span>
       <span className="shrink-0 text-muted-foreground text-xs tabular-nums">
         {tooLarge ? "Over 1 MB" : formatBytes(file.byteLength)}

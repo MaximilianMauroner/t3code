@@ -4,11 +4,13 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { scopedProjectKey } from "@t3tools/client-runtime/environment";
-import type {
-  EnvironmentId,
-  ProjectCloneSnapshot,
-  ProjectId,
-  ScopedProjectRef,
+import {
+  PROJECT_IGNORED_FILES_LIMIT,
+  type EnvironmentId,
+  type ProjectCloneSnapshot,
+  type ProjectId,
+  type ProjectIgnoredFile,
+  type ScopedProjectRef,
 } from "@t3tools/contracts";
 import { create } from "zustand";
 
@@ -21,6 +23,24 @@ export type CloneProtocol = "ssh" | "https";
 
 /** Matches the server's read cap: a larger file would arrive truncated. */
 export const COPYABLE_FILE_MAX_BYTES = 1024 * 1024;
+
+export function updateIgnoredFileSelection(
+  selected: ReadonlyMap<string, ProjectIgnoredFile>,
+  files: readonly ProjectIgnoredFile[],
+  checked: boolean,
+): ReadonlyMap<string, ProjectIgnoredFile> {
+  const next = new Map(selected);
+  for (const file of files) {
+    if (!checked) next.delete(file.path);
+    else if (
+      file.byteLength <= COPYABLE_FILE_MAX_BYTES &&
+      (next.has(file.path) || next.size < PROJECT_IGNORED_FILES_LIMIT)
+    ) {
+      next.set(file.path, file);
+    }
+  }
+  return next;
+}
 
 const SCP_LIKE_URL = /^(?:[^@/\s]+@)?([^:/\s]+):(?!\/)(.+)$/;
 const SSH_URL = /^ssh:\/\/(?:[^@/\s]+@)?([^:/\s]+)(:\d+)?\/(.+)$/;
@@ -56,14 +76,6 @@ export function cloneUrlForProtocol(url: string, protocol: CloneProtocol): strin
   return protocol === "ssh"
     ? `git@${parsed.host}:${parsed.path}`
     : `https://${parsed.host}/${parsed.path}`;
-}
-
-const DEFAULT_COPIED_FILE_NAME = /^(?:\.env(?:\..+)?|\.envrc|\.dev\.vars)$/;
-
-/** Env files are the ignored files people almost always want on a new machine. */
-export function isDefaultCopiedFile(path: string): boolean {
-  const name = path.split("/").at(-1) ?? path;
-  return DEFAULT_COPIED_FILE_NAME.test(name);
 }
 
 export interface AddProjectToMachineInput {

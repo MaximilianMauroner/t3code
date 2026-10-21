@@ -8,18 +8,20 @@ import * as Path from "effect/Path";
 import * as RcMap from "effect/RcMap";
 import * as Schema from "effect/Schema";
 
-import type {
-  FilesystemBrowseInput,
-  FilesystemBrowseResult,
-  ProjectEntry,
-  ProjectListEntriesInput,
-  ProjectListEntriesResult,
-  ProjectListIgnoredFilesInput,
-  ProjectListIgnoredFilesResult,
-  ProjectSearchContentsInput,
-  ProjectSearchContentsResult,
-  ProjectSearchEntriesInput,
-  ProjectSearchEntriesResult,
+import {
+  PROJECT_IGNORED_FILES_LIMIT,
+  isDefaultCopiedFile,
+  type FilesystemBrowseInput,
+  type FilesystemBrowseResult,
+  type ProjectEntry,
+  type ProjectListEntriesInput,
+  type ProjectListEntriesResult,
+  type ProjectListIgnoredFilesInput,
+  type ProjectListIgnoredFilesResult,
+  type ProjectSearchContentsInput,
+  type ProjectSearchContentsResult,
+  type ProjectSearchEntriesInput,
+  type ProjectSearchEntriesResult,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { isExplicitRelativePath, isWindowsAbsolutePath } from "@t3tools/shared/path";
@@ -110,9 +112,6 @@ export class WorkspaceEntries extends Context.Service<
     readonly refresh: (cwd: string) => Effect.Effect<void>;
   }
 >()("t3/workspace/WorkspaceEntries") {}
-
-/** Ignored files offered for copying; more than this is a build folder, not config. */
-const IGNORED_FILES_LIMIT = 200;
 
 /** Paths sent to one `git check-ignore` call when labelling a folder's children. */
 const IGNORE_CHECK_CHUNK_SIZE = 1000;
@@ -424,13 +423,20 @@ export const make = Effect.gen(function* () {
       })
       .pipe(Effect.orElseSucceed(() => undefined));
     if (!result || result.exitCode !== 0) return { files: [], truncated: false };
+    const query = input.query?.trim().toLowerCase() ?? "";
     const paths = result.stdout
       .split("\0")
-      .filter((entry) => entry.length > 0 && !entry.endsWith("/"))
+      .filter(
+        (entry) => entry.length > 0 && !entry.endsWith("/") && entry.toLowerCase().includes(query),
+      )
       .toSorted();
+    const prioritizedPaths = [
+      ...paths.filter(isDefaultCopiedFile),
+      ...paths.filter((entry) => !isDefaultCopiedFile(entry)),
+    ];
     const files = yield* Effect.promise(() =>
       Promise.all(
-        paths.slice(0, IGNORED_FILES_LIMIT).map(async (relativePath) => {
+        prioritizedPaths.slice(0, PROJECT_IGNORED_FILES_LIMIT).map(async (relativePath) => {
           // lstat: a symlink usually points outside the workspace, where reads refuse to go.
           const stat = await NodeFSP.lstat(path.join(normalizedCwd, relativePath)).catch(
             () => null,
@@ -441,7 +447,7 @@ export const make = Effect.gen(function* () {
     );
     return {
       files: files.filter((file) => file !== null),
-      truncated: paths.length > IGNORED_FILES_LIMIT,
+      truncated: paths.length > PROJECT_IGNORED_FILES_LIMIT,
     };
   });
 
