@@ -52,7 +52,7 @@ const source = {
   serverConfig: {
     environment: {
       platform: { machine: "server" },
-      capabilities: { ignoredFileListing: true, ignoredFileSearch: true, ignoredFilePaging: true },
+      capabilities: { ignoredFileListing: true, ignoredFileBrowsing: true },
     },
   },
 };
@@ -90,7 +90,6 @@ function setup(initial: Listing = AsyncResult.initial(true)) {
   return {
     defaults,
     registry,
-    addProject: mocks.addProject,
     dialog: () => (
       <RegistryContext.Provider value={registry}>
         <AddProjectToMachineDialogHost />
@@ -143,7 +142,7 @@ describe("ignored-file picker query state", () => {
     await userEvent.fill(search, "");
     await expect.element(checkbox(".env")).not.toBeChecked();
     await userEvent.click(button("Clone to Target"));
-    expect(state.addProject).toHaveBeenCalledExactlyOnceWith(
+    expect(mocks.addProject).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ files: [] }),
     );
   });
@@ -179,7 +178,7 @@ describe("ignored-file picker query state", () => {
     await expect.element(button("Next")).toBeEnabled();
     await expect.element(checkbox("file-0.txt")).toBeChecked();
     await userEvent.click(button("Clone to Target"));
-    expect(state.addProject).toHaveBeenCalledExactlyOnceWith(
+    expect(mocks.addProject).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ files: ["file-0.txt"] }),
     );
   });

@@ -101,8 +101,8 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
   const destinationPath = pathOverride ?? defaultPath;
 
   const canListFiles = source?.serverConfig?.environment.capabilities.ignoredFileListing === true;
-  const canSearchFiles = source?.serverConfig?.environment.capabilities.ignoredFileSearch === true;
-  const canPageFiles = source?.serverConfig?.environment.capabilities.ignoredFilePaging === true;
+  const canBrowseFiles =
+    source?.serverConfig?.environment.capabilities.ignoredFileBrowsing === true;
   const [query, setQuery] = useState("");
   const [pages, setPages] = useState<{ query: string; cursors: readonly string[] }>({
     query: "",
@@ -118,11 +118,11 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
         })
       : null,
   );
-  const listQuery = canSearchFiles && normalizedQuery ? debouncedQuery : "";
+  const listQuery = canBrowseFiles && normalizedQuery ? debouncedQuery : "";
   if (pages.query !== listQuery) {
     setPages({ query: listQuery, cursors: [] });
   }
-  const cursors = canPageFiles && pages.query === listQuery ? pages.cursors : [];
+  const cursors = canBrowseFiles && pages.query === listQuery ? pages.cursors : [];
   const after = cursors.at(-1);
   const ignoredFiles = useEnvironmentQuery(
     project && canListFiles
@@ -137,12 +137,12 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
       : null,
   );
   const searchActive = listQuery.length > 0;
-  const debouncing = canSearchFiles && normalizedQuery !== debouncedQuery;
+  const debouncing = canBrowseFiles && normalizedQuery !== debouncedQuery;
   const loadingDefaults = defaultIgnoredFiles.data === null && defaultIgnoredFiles.error === null;
   const loadingFiles = ignoredFiles.data === null && ignoredFiles.error === null;
   const listingError =
     ignoredFiles.error ??
-    (canPageFiles && ignoredFiles.data?.truncated && !ignoredFiles.data.nextCursor
+    (canBrowseFiles && ignoredFiles.data?.truncated && !ignoredFiles.data.nextCursor
       ? "The source machine did not return the next page. Retry or return to the first page."
       : null);
   const files = loadingFiles || listingError ? [] : (ignoredFiles.data?.files ?? []);
@@ -348,7 +348,7 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                     {selectedBytes > 0 ? ` · ${formatBytes(selectedBytes)}` : ""}
                   </span>
                 </div>
-                {canSearchFiles ? (
+                {canBrowseFiles ? (
                   <>
                     <Label htmlFor={`${id}-search`}>Search ignored files</Label>
                     <Input
@@ -366,8 +366,8 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                   </>
                 ) : (
                   <p className="text-muted-foreground text-xs">
-                    Update T3 Code on {source?.label ?? "the source machine"} to search ignored
-                    files.
+                    Update T3 Code on {source?.label ?? "the source machine"} to search and browse
+                    more ignored files.
                   </p>
                 )}
                 <div className="flex items-center gap-2">
@@ -435,7 +435,7 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                     setSelected(updateIgnoredFileSelection(selectedFiles, [file], checked))
                   }
                 />
-                {canPageFiles ? (
+                {canBrowseFiles ? (
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="flex-1 text-muted-foreground text-xs" aria-live="polite">
                       Page {cursors.length + 1}
@@ -472,20 +472,11 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                       Next
                     </Button>
                   </div>
-                ) : (
-                  <>
-                    {ignoredFiles.data?.truncated ? (
-                      <p className="text-muted-foreground text-xs">
-                        Only the first {PROJECT_IGNORED_FILES_LIMIT}{" "}
-                        {searchActive ? "matches" : "ignored files"} are listed.
-                      </p>
-                    ) : null}
-                    <p className="text-muted-foreground text-xs">
-                      Update T3 Code on {source?.label ?? "the source machine"} to browse more
-                      ignored files.
-                    </p>
-                  </>
-                )}
+                ) : ignoredFiles.data?.truncated ? (
+                  <p className="text-muted-foreground text-xs">
+                    Only the first {PROJECT_IGNORED_FILES_LIMIT} ignored files are listed.
+                  </p>
+                ) : null}
                 {ignoredFiles.data?.outputTruncated ? (
                   <p role="status" className="text-muted-foreground text-xs">
                     Git output reached the listing limit. Some ignored files are not shown and

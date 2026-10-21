@@ -114,8 +114,7 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
         );
         expect(descriptor.capabilities).toMatchObject({
           ignoredFileListing: true,
-          ignoredFileSearch: true,
-          ignoredFilePaging: true,
+          ignoredFileBrowsing: true,
           settledWorktreeCleanup: true,
           storageCleanupRun: true,
           projectWorktreeCleanup: true,
