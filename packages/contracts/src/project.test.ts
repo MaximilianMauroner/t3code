@@ -20,6 +20,10 @@ import {
   ProjectWriteFileError,
 } from "./project.ts";
 
+const decodeIgnoredFilesResult = Schema.decodeUnknownSync(ProjectListIgnoredFilesResult);
+const encodeIgnoredFilesResult = Schema.encodeSync(ProjectListIgnoredFilesResult);
+const decodeIgnoredFilesInput = Schema.decodeUnknownSync(ProjectListIgnoredFilesInput);
+const encodeIgnoredFilesInput = Schema.encodeSync(ProjectListIgnoredFilesInput);
 const decodeProjectCreatePayload = Schema.decodeUnknownSync(ProjectCreatePayload);
 const decodeProjectUpdatePayload = Schema.decodeUnknownSync(ProjectUpdatePayload);
 const decodeProjectMutation = Schema.decodeUnknownSync(ProjectMutation);
@@ -184,15 +188,15 @@ describe("ignored-file paging", () => {
   it.each([" notes.txt", "notes.txt ", " "])(
     "preserves the exact path %j through RPC schemas",
     (path) => {
-      const result = Schema.decodeUnknownSync(ProjectListIgnoredFilesResult)(
-        Schema.encodeSync(ProjectListIgnoredFilesResult)({
+      const result = decodeIgnoredFilesResult(
+        encodeIgnoredFilesResult({
           files: [{ path, byteLength: 1 }],
           truncated: true,
           nextCursor: path,
         }),
       );
-      const input = Schema.decodeUnknownSync(ProjectListIgnoredFilesInput)(
-        Schema.encodeSync(ProjectListIgnoredFilesInput)({
+      const input = decodeIgnoredFilesInput(
+        encodeIgnoredFilesInput({
           cwd: "/workspace",
           after: result.nextCursor,
         }),
