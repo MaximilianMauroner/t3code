@@ -6,6 +6,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { OrchestrationProjectShell } from "./orchestrationProject.ts";
 
 import {
+  isDefaultCopiedFile,
   ProjectListIgnoredFilesInput,
   ProjectListIgnoredFilesResult,
   ProjectFaviconPath,
@@ -205,4 +206,15 @@ describe("ignored-file paging", () => {
       expect(input.after).toBe(path);
     },
   );
+});
+
+describe("isDefaultCopiedFile", () => {
+  it("matches environment config by file name at any depth", () => {
+    for (const path of [".env", "services/api/.env.local", ".envrc", "apps/web/.dev.vars"]) {
+      expect(isDefaultCopiedFile(path)).toBe(true);
+    }
+    for (const path of ["env", "debug.log", ".env/secret.txt", ".envrc.local", ".dev.vars.local"]) {
+      expect(isDefaultCopiedFile(path)).toBe(false);
+    }
+  });
 });

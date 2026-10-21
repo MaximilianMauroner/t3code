@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { PROJECT_IGNORED_FILES_LIMIT, isDefaultCopiedFile } from "@t3tools/contracts";
+import { PROJECT_IGNORED_FILES_LIMIT } from "@t3tools/contracts";
 
 import {
   COPYABLE_FILE_MAX_BYTES,
@@ -77,16 +77,5 @@ describe("ignored file selection", () => {
     expect(
       Array.from(updateIgnoredFileSelection(new Map(), [atCap, tooLarge], true).values()),
     ).toEqual([atCap]);
-  });
-});
-
-describe("isDefaultCopiedFile", () => {
-  it("matches environment config by file name at any depth", () => {
-    for (const path of [".env", "services/api/.env.local", ".envrc", "apps/web/.dev.vars"]) {
-      expect(isDefaultCopiedFile(path)).toBe(true);
-    }
-    for (const path of ["env", "debug.log", ".env/secret.txt", ".envrc.local", ".dev.vars.local"]) {
-      expect(isDefaultCopiedFile(path)).toBe(false);
-    }
   });
 });
