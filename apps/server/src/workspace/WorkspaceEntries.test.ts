@@ -289,6 +289,27 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceEntries", (it) => {
   });
 
   describe("listIgnoredFiles", () => {
+    it.effect("keeps environment files visible beyond 200 ignored files", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir({ git: true });
+        yield* writeTextFile(cwd, ".gitignore", "*.log\n.env*\n");
+        yield* writeTextFile(cwd, "data/keep.txt", "tracked");
+        yield* writeTextFile(cwd, "services/api/index.ts", "tracked");
+        yield* git(cwd, ["add", "data/keep.txt", "services/api/index.ts"]);
+        yield* Effect.forEach(
+          Array.from({ length: 205 }, (_, i) => i),
+          (i) => writeTextFile(cwd, `data/generated-${String(i).padStart(3, "0")}.log`, "x"),
+        );
+        yield* writeTextFile(cwd, "services/api/.env.local", "A=1");
+
+        const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+        const result = yield* workspaceEntries.listIgnoredFiles({ cwd });
+        expect(result.files).toContainEqual({ path: "services/api/.env.local", byteLength: 3 });
+        expect(result.files).toHaveLength(200);
+        expect(result.truncated).toBe(true);
+      }),
+    );
+
     it.effect("lists ignored files with sizes and skips wholly ignored folders", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTempDir({ git: true });
