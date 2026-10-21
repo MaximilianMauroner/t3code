@@ -306,17 +306,19 @@ export const ProjectListEntriesResult = Schema.Struct({
 });
 export type ProjectListEntriesResult = typeof ProjectListEntriesResult.Type;
 
+const ProjectIgnoredFilePath = Schema.String.check(Schema.isNonEmpty(), Schema.isMaxLength(4096));
+
 // Untracked files git ignores. Wholly ignored folders such as `node_modules`
 // are left out, so the list stays small enough to pick from.
 export const ProjectListIgnoredFilesInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   query: Schema.optional(TrimmedString.check(Schema.isMaxLength(256))),
-  after: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(4096))),
+  after: Schema.optional(ProjectIgnoredFilePath),
 });
 export type ProjectListIgnoredFilesInput = typeof ProjectListIgnoredFilesInput.Type;
 
 export const ProjectIgnoredFile = Schema.Struct({
-  path: TrimmedNonEmptyString,
+  path: ProjectIgnoredFilePath,
   byteLength: NonNegativeInt,
 });
 export type ProjectIgnoredFile = typeof ProjectIgnoredFile.Type;
@@ -331,7 +333,7 @@ export function isDefaultCopiedFile(path: string): boolean {
 export const ProjectListIgnoredFilesResult = Schema.Struct({
   files: Schema.Array(ProjectIgnoredFile),
   truncated: Schema.Boolean,
-  nextCursor: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(4096))),
+  nextCursor: Schema.optional(ProjectIgnoredFilePath),
   outputTruncated: Schema.optional(Schema.Boolean),
 });
 export type ProjectListIgnoredFilesResult = typeof ProjectListIgnoredFilesResult.Type;

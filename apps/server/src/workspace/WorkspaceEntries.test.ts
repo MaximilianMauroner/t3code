@@ -346,7 +346,6 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceEntries", (it) => {
           expect(page.outputTruncated).not.toBe(true);
           if (pageCount === 0) {
             expect(page.files[0]).toEqual({ path: ".env", byteLength: 3 });
-            // A keyset cursor remains valid when its file is removed between requests.
             expect(page.nextCursor).toBe(".agents/run-0198.log");
             yield* fileSystem.remove(`${cwd}/.agents/run-0198.log`);
           }

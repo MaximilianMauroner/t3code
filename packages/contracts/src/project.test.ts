@@ -6,6 +6,8 @@ import { describe, expect, it } from "vite-plus/test";
 import { OrchestrationProjectShell } from "./orchestrationProject.ts";
 
 import {
+  ProjectListIgnoredFilesInput,
+  ProjectListIgnoredFilesResult,
   ProjectFaviconPath,
   ReceivedProjectIcon,
   StoredProjectIcon,
@@ -177,3 +179,26 @@ effectIt.effect("an icon kind from a newer server shows the default icon", () =>
     assert.strictEqual(broken._tag, "Failure");
   }),
 );
+
+describe("ignored-file paging", () => {
+  it.each([" notes.txt", "notes.txt ", " "])(
+    "preserves the exact path %j through RPC schemas",
+    (path) => {
+      const result = Schema.decodeUnknownSync(ProjectListIgnoredFilesResult)(
+        Schema.encodeSync(ProjectListIgnoredFilesResult)({
+          files: [{ path, byteLength: 1 }],
+          truncated: true,
+          nextCursor: path,
+        }),
+      );
+      const input = Schema.decodeUnknownSync(ProjectListIgnoredFilesInput)(
+        Schema.encodeSync(ProjectListIgnoredFilesInput)({
+          cwd: "/workspace",
+          after: result.nextCursor,
+        }),
+      );
+      expect(result.files[0]?.path).toBe(path);
+      expect(input.after).toBe(path);
+    },
+  );
+});
