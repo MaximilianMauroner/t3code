@@ -139,15 +139,14 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
   const searchActive = listQuery.length > 0;
   const debouncing = canSearchFiles && normalizedQuery !== debouncedQuery;
   const loadingDefaults = defaultIgnoredFiles.data === null && defaultIgnoredFiles.error === null;
-  const loadingFiles =
-    ignoredFiles.isPending || (ignoredFiles.data === null && ignoredFiles.error === null);
+  const loadingFiles = ignoredFiles.data === null && ignoredFiles.error === null;
   const listingError =
     ignoredFiles.error ??
     (canPageFiles && ignoredFiles.data?.truncated && !ignoredFiles.data.nextCursor
       ? "The source machine did not return the next page. Retry or return to the first page."
       : null);
   const files = loadingFiles || listingError ? [] : (ignoredFiles.data?.files ?? []);
-  const pagingDisabled = loadingFiles || debouncing;
+  const pagingDisabled = loadingFiles || ignoredFiles.isPending || debouncing;
   const nextCursor = ignoredFiles.data?.nextCursor;
   const [selected, setSelected] = useState<ReadonlyMap<string, ProjectIgnoredFile> | null>(null);
   const selectedFiles = selected ?? defaultSelection(defaultIgnoredFiles.data?.files ?? []);
@@ -354,6 +353,7 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                     <Label htmlFor={`${id}-search`}>Search ignored files</Label>
                     <Input
                       id={`${id}-search`}
+                      disabled={loadingDefaults}
                       value={query}
                       onChange={(event) => setQuery(event.target.value)}
                       onKeyDown={(event) => {
