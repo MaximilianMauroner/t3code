@@ -19,7 +19,6 @@ export type IgnoredFileTreeNode =
     };
 
 type Directory = {
-  name: string;
   path: string;
   children: Map<string, Directory | ProjectIgnoredFile>;
 };
@@ -27,7 +26,7 @@ type Directory = {
 export function buildIgnoredFileTree(
   files: readonly ProjectIgnoredFile[],
 ): readonly IgnoredFileTreeNode[] {
-  const root: Directory = { name: "", path: "", children: new Map() };
+  const root: Directory = { path: "", children: new Map() };
   for (const file of files) {
     const parts = file.path.split("/");
     const name = parts.pop()!;
@@ -36,7 +35,6 @@ export function buildIgnoredFileTree(
       let child = directory.children.get(part);
       if (!child) {
         child = {
-          name: part,
           path: directory.path ? `${directory.path}/${part}` : part,
           children: new Map(),
         };

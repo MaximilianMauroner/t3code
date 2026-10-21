@@ -1,6 +1,6 @@
 import type { ProjectIgnoredFile } from "@t3tools/contracts";
 import { ChevronDownIcon, ChevronRightIcon, FolderIcon } from "lucide-react";
-import { useState, type Dispatch, type SetStateAction } from "react";
+import { useState } from "react";
 
 import { COPYABLE_FILE_MAX_BYTES } from "../lib/addProjectToMachine";
 import { formatBytes } from "../lib/formatBytes";
@@ -44,81 +44,51 @@ export function IgnoredFileTree({
     />
   );
 
+  function renderNodes(nodes: readonly IgnoredFileTreeNode[]): React.ReactNode {
+    return nodes.map((node) => {
+      if (node.kind === "file") return <li key={node.path}>{fileRow(node.file, node.name)}</li>;
+      const open = expanded?.has(node.path) ?? false;
+      const selectedCount = countSelectedIgnoredDescendants(node.path, selected.keys());
+      const ChevronIcon = open ? ChevronDownIcon : ChevronRightIcon;
+      return (
+        <li key={node.path}>
+          <button
+            type="button"
+            aria-expanded={open}
+            aria-label={`${node.path}, ${node.listedCount} listed${selectedCount ? `, ${selectedCount} selected` : ""}`}
+            className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2"
+            onClick={() =>
+              setExpanded((current) => {
+                const next = new Set(current);
+                if (open) next.delete(node.path);
+                else next.add(node.path);
+                return next;
+              })
+            }
+          >
+            <ChevronIcon className="size-3.5 shrink-0" aria-hidden />
+            <FolderIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+            <span className="min-w-0 flex-1 truncate font-mono">{node.name}</span>
+            <span className="shrink-0 text-muted-foreground tabular-nums">
+              {node.listedCount} listed{selectedCount ? ` · ${selectedCount} selected` : ""}
+            </span>
+          </button>
+          {open ? <ul className="ml-4 border-l">{renderNodes(node.children)}</ul> : null}
+        </li>
+      );
+    });
+  }
+
   if (files.length === 0) return null;
   return (
     <div className="max-h-52 overflow-y-auto rounded-md border">
       <ul>
-        {searching ? (
-          files.map((file) => <li key={file.path}>{fileRow(file, file.path)}</li>)
-        ) : (
-          <IgnoredFileTreeNodes
-            nodes={tree}
-            expanded={expanded}
-            setExpanded={setExpanded}
-            selected={selected}
-            fileRow={fileRow}
-          />
-        )}
+        {searching
+          ? files.map((file) => <li key={file.path}>{fileRow(file, file.path)}</li>)
+          : renderNodes(tree)}
       </ul>
     </div>
   );
-}
-
-function IgnoredFileTreeNodes({
-  nodes,
-  expanded,
-  setExpanded,
-  selected,
-  fileRow,
-}: {
-  nodes: readonly IgnoredFileTreeNode[];
-  expanded: ReadonlySet<string> | null;
-  setExpanded: Dispatch<SetStateAction<ReadonlySet<string> | null>>;
-  selected: ReadonlyMap<string, ProjectIgnoredFile>;
-  fileRow: (file: ProjectIgnoredFile, name: string) => React.ReactNode;
-}) {
-  return nodes.map((node) => {
-    if (node.kind === "file") return <li key={node.path}>{fileRow(node.file, node.name)}</li>;
-    const open = expanded?.has(node.path) ?? false;
-    const selectedCount = countSelectedIgnoredDescendants(node.path, selected.keys());
-    const ChevronIcon = open ? ChevronDownIcon : ChevronRightIcon;
-    return (
-      <li key={node.path}>
-        <button
-          type="button"
-          aria-expanded={open}
-          aria-label={`${node.path}, ${node.listedCount} listed${selectedCount ? `, ${selectedCount} selected` : ""}`}
-          className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring focus-visible:-outline-offset-2"
-          onClick={() =>
-            setExpanded((current) => {
-              const next = new Set(current);
-              if (open) next.delete(node.path);
-              else next.add(node.path);
-              return next;
-            })
-          }
-        >
-          <ChevronIcon className="size-3.5 shrink-0" aria-hidden />
-          <FolderIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-          <span className="min-w-0 flex-1 truncate font-mono">{node.name}</span>
-          <span className="shrink-0 text-muted-foreground tabular-nums">
-            {node.listedCount} listed{selectedCount ? ` · ${selectedCount} selected` : ""}
-          </span>
-        </button>
-        {open ? (
-          <ul className="ml-4 border-l">
-            <IgnoredFileTreeNodes
-              nodes={node.children}
-              expanded={expanded}
-              setExpanded={setExpanded}
-              selected={selected}
-              fileRow={fileRow}
-            />
-          </ul>
-        ) : null}
-      </li>
-    );
-  });
 }
 
 function IgnoredFileRow({
