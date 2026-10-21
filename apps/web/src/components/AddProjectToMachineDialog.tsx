@@ -37,8 +37,8 @@ import { projectEnvironment } from "../state/projects";
 import { useDebouncedValue } from "../state/queries";
 import { useEnvironmentQuery } from "../state/query";
 import { EnvironmentMachineIcon } from "./EnvironmentMachineIcon";
+import { IgnoredFileTree } from "./IgnoredFileTree";
 import { Button } from "./ui/button";
-import { Checkbox } from "./ui/checkbox";
 import {
   Dialog,
   DialogDescription,
@@ -350,7 +350,9 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                   </p>
                 )}
                 <div className="flex items-center gap-2">
-                  <span className="flex-1 text-muted-foreground text-xs">{files.length} shown</span>
+                  <span className="flex-1 text-muted-foreground text-xs">
+                    {files.length} listed
+                  </span>
                   <Button
                     type="button"
                     variant="ghost"
@@ -362,7 +364,7 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                       setSelected(updateIgnoredFileSelection(selectedFiles, copyable, true))
                     }
                   >
-                    Select shown
+                    Select listed
                   </Button>
                   <Button
                     type="button"
@@ -373,7 +375,7 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                       setSelected(updateIgnoredFileSelection(selectedFiles, files, false))
                     }
                   >
-                    Clear shown
+                    Clear listed
                   </Button>
                 </div>
                 {loadingFiles ? (
@@ -386,26 +388,30 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                       ? "No ignored files match your search."
                       : "No ignored files to copy."}
                   </p>
-                ) : (
-                  <div className="max-h-52 overflow-y-auto rounded-md border">
-                    {files.map((file) => (
-                      <IgnoredFileRow
-                        key={file.path}
-                        file={file}
-                        checked={selectedFiles.has(file.path)}
-                        atSelectionLimit={atSelectionLimit}
-                        onCheckedChange={(checked) =>
-                          setSelected(updateIgnoredFileSelection(selectedFiles, [file], checked))
-                        }
-                      />
-                    ))}
-                  </div>
-                )}
-                {!loadingFiles && !ignoredFiles.error && ignoredFiles.data?.truncated ? (
+                ) : null}
+                <IgnoredFileTree
+                  files={loadingFiles || ignoredFiles.error ? [] : files}
+                  defaultFiles={defaultIgnoredFiles.data?.files ?? null}
+                  searching={canSearchFiles && normalizedQuery.length > 0}
+                  selected={selectedFiles}
+                  atSelectionLimit={atSelectionLimit}
+                  onCheckedChange={(file, checked) =>
+                    setSelected(updateIgnoredFileSelection(selectedFiles, [file], checked))
+                  }
+                />
+                {!normalizedQuery && defaultIgnoredFiles.data?.truncated ? (
                   <p className="text-muted-foreground text-xs">
-                    {canSearchFiles
-                      ? "More files match. Refine your search."
-                      : `Showing the first ${files.length} files.`}
+                    Only the first {PROJECT_IGNORED_FILES_LIMIT} ignored files are listed.
+                    {canSearchFiles ? " Search to find more files." : ""}
+                  </p>
+                ) : null}
+                {normalizedQuery &&
+                !loadingFiles &&
+                !ignoredFiles.error &&
+                ignoredFiles.data?.truncated ? (
+                  <p className="text-muted-foreground text-xs">
+                    Only the first {PROJECT_IGNORED_FILES_LIMIT} matches are listed. Refine your
+                    search to find more.
                   </p>
                 ) : null}
                 {atSelectionLimit ? (
@@ -457,32 +463,5 @@ function defaultSelection(
     new Map(),
     files.filter((file) => isDefaultCopiedFile(file.path)),
     true,
-  );
-}
-
-function IgnoredFileRow({
-  file,
-  checked,
-  atSelectionLimit,
-  onCheckedChange,
-}: {
-  file: ProjectIgnoredFile;
-  checked: boolean;
-  atSelectionLimit: boolean;
-  onCheckedChange: (checked: boolean) => void;
-}) {
-  const tooLarge = file.byteLength > COPYABLE_FILE_MAX_BYTES;
-  return (
-    <label className="flex cursor-pointer items-center gap-2 px-2.5 py-1.5 text-sm not-last:border-b has-disabled:cursor-not-allowed has-disabled:opacity-64">
-      <Checkbox
-        checked={checked}
-        disabled={tooLarge || (!checked && atSelectionLimit)}
-        onCheckedChange={onCheckedChange}
-      />
-      <span className="min-w-0 flex-1 truncate font-mono text-xs">{file.path}</span>
-      <span className="shrink-0 text-muted-foreground text-xs tabular-nums">
-        {tooLarge ? "Over 1 MB" : formatBytes(file.byteLength)}
-      </span>
-    </label>
   );
 }
