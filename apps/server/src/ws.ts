@@ -456,6 +456,8 @@ function projectEntriesFailureContext(error: WorkspaceEntries.WorkspaceEntriesEr
         failure: "workspace_root_not_directory",
         normalizedCwd: error.normalizedWorkspaceRoot,
       };
+    case "WorkspaceEntriesListIgnoredFilesError":
+      return { failure: "ignored_files_list_failed", normalizedCwd: error.cwd };
     case "WorkspaceEntriesReadDirectoryError":
       return {
         failure: "directory_list_failed",

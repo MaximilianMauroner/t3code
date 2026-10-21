@@ -311,6 +311,7 @@ export type ProjectListEntriesResult = typeof ProjectListEntriesResult.Type;
 export const ProjectListIgnoredFilesInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   query: Schema.optional(TrimmedString.check(Schema.isMaxLength(256))),
+  after: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(4096))),
 });
 export type ProjectListIgnoredFilesInput = typeof ProjectListIgnoredFilesInput.Type;
 
@@ -330,6 +331,8 @@ export function isDefaultCopiedFile(path: string): boolean {
 export const ProjectListIgnoredFilesResult = Schema.Struct({
   files: Schema.Array(ProjectIgnoredFile),
   truncated: Schema.Boolean,
+  nextCursor: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(4096))),
+  outputTruncated: Schema.optional(Schema.Boolean),
 });
 export type ProjectListIgnoredFilesResult = typeof ProjectListIgnoredFilesResult.Type;
 
@@ -342,6 +345,7 @@ export const ProjectEntriesFailure = Schema.Literals([
   "search_index_scan_timed_out",
   "search_index_search_failed",
   "directory_list_failed",
+  "ignored_files_list_failed",
 ]);
 export type ProjectEntriesFailure = typeof ProjectEntriesFailure.Type;
 

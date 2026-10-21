@@ -102,7 +102,12 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
 
   const canListFiles = source?.serverConfig?.environment.capabilities.ignoredFileListing === true;
   const canSearchFiles = source?.serverConfig?.environment.capabilities.ignoredFileSearch === true;
+  const canPageFiles = source?.serverConfig?.environment.capabilities.ignoredFilePaging === true;
   const [query, setQuery] = useState("");
+  const [pages, setPages] = useState<{ query: string; cursors: readonly string[] }>({
+    query: "",
+    cursors: [],
+  });
   const normalizedQuery = query.trim();
   const debouncedQuery = useDebouncedValue(normalizedQuery, 200);
   const defaultIgnoredFiles = useEnvironmentQuery(
@@ -113,19 +118,37 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
         })
       : null,
   );
-  const filteredIgnoredFiles = useEnvironmentQuery(
-    project && canSearchFiles && debouncedQuery
+  const listQuery = canSearchFiles && normalizedQuery ? debouncedQuery : "";
+  if (pages.query !== listQuery) {
+    setPages({ query: listQuery, cursors: [] });
+  }
+  const cursors = canPageFiles && pages.query === listQuery ? pages.cursors : [];
+  const after = cursors.at(-1);
+  const ignoredFiles = useEnvironmentQuery(
+    project && canListFiles
       ? projectEnvironment.listIgnoredFiles({
           environmentId: project.environmentId,
-          input: { cwd: project.workspaceRoot, query: debouncedQuery },
+          input: {
+            cwd: project.workspaceRoot,
+            ...(listQuery ? { query: listQuery } : {}),
+            ...(after ? { after } : {}),
+          },
         })
       : null,
   );
-  const searchActive = canSearchFiles && normalizedQuery.length > 0 && debouncedQuery.length > 0;
-  const ignoredFiles = searchActive ? filteredIgnoredFiles : defaultIgnoredFiles;
+  const searchActive = listQuery.length > 0;
+  const debouncing = canSearchFiles && normalizedQuery !== debouncedQuery;
   const loadingDefaults = defaultIgnoredFiles.data === null && defaultIgnoredFiles.error === null;
-  const loadingFiles = ignoredFiles.data === null && ignoredFiles.error === null;
-  const files = ignoredFiles.error ? [] : (ignoredFiles.data?.files ?? []);
+  const loadingFiles =
+    ignoredFiles.isPending || (ignoredFiles.data === null && ignoredFiles.error === null);
+  const listingError =
+    ignoredFiles.error ??
+    (canPageFiles && ignoredFiles.data?.truncated && !ignoredFiles.data.nextCursor
+      ? "The source machine did not return the next page. Retry or return to the first page."
+      : null);
+  const files = loadingFiles || listingError ? [] : (ignoredFiles.data?.files ?? []);
+  const pagingDisabled = loadingFiles || debouncing;
+  const nextCursor = ignoredFiles.data?.nextCursor;
   const [selected, setSelected] = useState<ReadonlyMap<string, ProjectIgnoredFile> | null>(null);
   const selectedFiles = selected ?? defaultSelection(defaultIgnoredFiles.data?.files ?? []);
   const copyable = files.filter((file) => file.byteLength <= COPYABLE_FILE_MAX_BYTES);
@@ -349,7 +372,7 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                 )}
                 <div className="flex items-center gap-2">
                   <span className="flex-1 text-muted-foreground text-xs">
-                    {files.length} listed
+                    {files.length} listed on this page
                   </span>
                   <Button
                     type="button"
@@ -378,17 +401,32 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                 </div>
                 {loadingFiles ? (
                   <p className="text-muted-foreground text-xs">Finding ignored files…</p>
-                ) : ignoredFiles.error ? (
-                  <p className="text-destructive-foreground text-xs">{ignoredFiles.error}</p>
+                ) : listingError ? (
+                  <div className="flex items-center gap-2">
+                    <p role="alert" className="flex-1 text-destructive-foreground text-xs">
+                      {listingError}
+                    </p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="xs"
+                      disabled={pagingDisabled}
+                      onClick={ignoredFiles.refresh}
+                    >
+                      Retry
+                    </Button>
+                  </div>
                 ) : files.length === 0 ? (
                   <p className="text-muted-foreground text-xs">
-                    {searchActive
-                      ? "No ignored files match your search."
-                      : "No ignored files to copy."}
+                    {cursors.length > 0 || nextCursor
+                      ? "No copyable files on this page."
+                      : searchActive
+                        ? "No ignored files match your search."
+                        : "No ignored files to copy."}
                   </p>
                 ) : null}
                 <IgnoredFileTree
-                  files={loadingFiles || ignoredFiles.error ? [] : files}
+                  files={files}
                   defaultFiles={defaultIgnoredFiles.data?.files ?? null}
                   searching={searchActive}
                   selected={selectedFiles}
@@ -397,19 +435,61 @@ function AddProjectToMachineDialog({ request }: { request: AddProjectToMachineRe
                     setSelected(updateIgnoredFileSelection(selectedFiles, [file], checked))
                   }
                 />
-                {!searchActive && defaultIgnoredFiles.data?.truncated ? (
-                  <p className="text-muted-foreground text-xs">
-                    Only the first {PROJECT_IGNORED_FILES_LIMIT} ignored files are listed.
-                    {canSearchFiles ? " Search to find more files." : ""}
-                  </p>
-                ) : null}
-                {searchActive &&
-                !loadingFiles &&
-                !ignoredFiles.error &&
-                ignoredFiles.data?.truncated ? (
-                  <p className="text-muted-foreground text-xs">
-                    Only the first {PROJECT_IGNORED_FILES_LIMIT} matches are listed. Refine your
-                    search to find more.
+                {canPageFiles ? (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="flex-1 text-muted-foreground text-xs" aria-live="polite">
+                      Page {cursors.length + 1}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      disabled={pagingDisabled || cursors.length === 0}
+                      onClick={() => setPages({ query: listQuery, cursors: [] })}
+                    >
+                      First page
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="xs"
+                      disabled={pagingDisabled || cursors.length === 0}
+                      onClick={() => setPages({ query: listQuery, cursors: cursors.slice(0, -1) })}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="xs"
+                      disabled={pagingDisabled || listingError !== null || !nextCursor}
+                      onClick={() => {
+                        if (nextCursor) {
+                          setPages({ query: listQuery, cursors: [...cursors, nextCursor] });
+                        }
+                      }}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                ) : (
+                  <>
+                    {ignoredFiles.data?.truncated ? (
+                      <p className="text-muted-foreground text-xs">
+                        Only the first {PROJECT_IGNORED_FILES_LIMIT}{" "}
+                        {searchActive ? "matches" : "ignored files"} are listed.
+                      </p>
+                    ) : null}
+                    <p className="text-muted-foreground text-xs">
+                      Update T3 Code on {source?.label ?? "the source machine"} to browse more
+                      ignored files.
+                    </p>
+                  </>
+                )}
+                {ignoredFiles.data?.outputTruncated ? (
+                  <p role="status" className="text-muted-foreground text-xs">
+                    Git output reached the listing limit. Some ignored files are not shown and
+                    cannot be reached by paging or search.
                   </p>
                 ) : null}
                 {atSelectionLimit ? (

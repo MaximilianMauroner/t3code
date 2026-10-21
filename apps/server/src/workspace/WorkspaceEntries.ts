@@ -72,6 +72,18 @@ export class WorkspaceEntriesReadDirectoryError extends Schema.TaggedError<Works
   }
 }
 
+export class WorkspaceEntriesListIgnoredFilesError extends Schema.TaggedError<WorkspaceEntriesListIgnoredFilesError>()(
+  "WorkspaceEntriesListIgnoredFilesError",
+  {
+    cwd: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return "Failed to list ignored files.";
+  }
+}
+
 export const WorkspaceEntriesBrowseError = Schema.Union([
   WorkspaceEntriesWindowsPathUnsupportedError,
   WorkspaceEntriesCurrentProjectRequiredError,
@@ -80,6 +92,7 @@ export const WorkspaceEntriesBrowseError = Schema.Union([
 export type WorkspaceEntriesBrowseError = typeof WorkspaceEntriesBrowseError.Type;
 
 export const WorkspaceEntriesError = Schema.Union([
+  WorkspaceEntriesListIgnoredFilesError,
   WorkspaceEntriesReadDirectoryError,
   WorkspacePaths.WorkspaceRootNotExistsError,
   WorkspacePaths.WorkspaceRootCreateFailedError,
@@ -417,26 +430,39 @@ export const make = Effect.gen(function* () {
           "-z",
         ],
         cwd: normalizedCwd,
-        allowNonZeroExit: true,
         timeoutMs: 10_000,
         maxOutputBytes: 4 * 1024 * 1024,
       })
-      .pipe(Effect.orElseSucceed(() => undefined));
-    if (!result || result.exitCode !== 0) return { files: [], truncated: false };
+      .pipe(
+        Effect.mapError(
+          (cause) => new WorkspaceEntriesListIgnoredFilesError({ cwd: normalizedCwd, cause }),
+        ),
+      );
+    const stdout = result.stdoutTruncated
+      ? result.stdout.slice(0, result.stdout.lastIndexOf("\0") + 1)
+      : result.stdout;
     const query = input.query?.trim().toLowerCase() ?? "";
-    const paths = result.stdout
+    const paths = stdout
       .split("\0")
       .filter(
         (entry) => entry.length > 0 && !entry.endsWith("/") && entry.toLowerCase().includes(query),
       )
       .toSorted();
+    const after = input.after;
+    const afterIsDefault = after !== undefined && isDefaultCopiedFile(after);
     const prioritizedPaths = [
       ...paths.filter(isDefaultCopiedFile),
       ...paths.filter((entry) => !isDefaultCopiedFile(entry)),
-    ];
+    ].filter((entry) => {
+      if (after === undefined) return true;
+      const isDefault = isDefaultCopiedFile(entry);
+      return isDefault === afterIsDefault ? entry > after : afterIsDefault;
+    });
+    const candidates = prioritizedPaths.slice(0, PROJECT_IGNORED_FILES_LIMIT);
+    const truncated = prioritizedPaths.length > PROJECT_IGNORED_FILES_LIMIT;
     const files = yield* Effect.promise(() =>
       Promise.all(
-        prioritizedPaths.slice(0, PROJECT_IGNORED_FILES_LIMIT).map(async (relativePath) => {
+        candidates.map(async (relativePath) => {
           // lstat: a symlink usually points outside the workspace, where reads refuse to go.
           const stat = await NodeFSP.lstat(path.join(normalizedCwd, relativePath)).catch(
             () => null,
@@ -447,7 +473,9 @@ export const make = Effect.gen(function* () {
     );
     return {
       files: files.filter((file) => file !== null),
-      truncated: paths.length > PROJECT_IGNORED_FILES_LIMIT,
+      truncated,
+      ...(truncated ? { nextCursor: candidates.at(-1) } : {}),
+      ...(result.stdoutTruncated ? { outputTruncated: true } : {}),
     };
   });
 

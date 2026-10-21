@@ -6,13 +6,20 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import { ChildProcessSpawner } from "effect/process";
 import { vi } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import {
+  type ProjectListIgnoredFilesResult,
+  VcsProcessSpawnError,
+  VcsProcessTimeoutError,
+} from "@t3tools/contracts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspaceEntries from "./WorkspaceEntries.ts";
 import * as WorkspacePaths from "./WorkspacePaths.ts";
+import * as WorkspaceSearchIndex from "./WorkspaceSearchIndex.ts";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -307,6 +314,186 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceEntries", (it) => {
         expect(result.files).toContainEqual({ path: "services/api/.env.local", byteLength: 3 });
         expect(result.files).toHaveLength(200);
         expect(result.truncated).toBe(true);
+      }),
+    );
+
+    it.effect("browses every captured ignored path in bounded pages without duplicates", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir({ git: true });
+        const fileSystem = yield* FileSystem.FileSystem;
+        yield* writeTextFile(cwd, ".gitignore", "*.log\n.env\nnode_modules/\n");
+        yield* writeTextFile(cwd, ".agents/keep.txt", "tracked");
+        yield* git(cwd, ["add", ".agents/keep.txt"]);
+        const logs = Array.from(
+          { length: 605 },
+          (_, i) => `.agents/run-${String(i).padStart(4, "0")}.log`,
+        );
+        yield* Effect.forEach(logs, (name) => writeTextFile(cwd, name, "x"));
+        yield* writeTextFile(cwd, ".env", "A=1");
+        yield* writeTextFile(cwd, "node_modules/excluded.log", "excluded");
+
+        const entries = yield* WorkspaceEntries.WorkspaceEntries;
+        const seen: string[] = [];
+        let after: string | undefined;
+        let pageCount = 0;
+        do {
+          const page: ProjectListIgnoredFilesResult = yield* entries.listIgnoredFiles({
+            cwd,
+            ...(after ? { after } : {}),
+          });
+          expect(page.files.length).toBeLessThanOrEqual(200);
+          expect(page.truncated).toBe(page.nextCursor !== undefined);
+          expect(page.outputTruncated).not.toBe(true);
+          if (pageCount === 0) {
+            expect(page.files[0]).toEqual({ path: ".env", byteLength: 3 });
+            // A keyset cursor remains valid when its file is removed between requests.
+            expect(page.nextCursor).toBe(".agents/run-0198.log");
+            yield* fileSystem.remove(`${cwd}/.agents/run-0198.log`);
+          }
+          seen.push(...page.files.map((file) => file.path));
+          after = page.nextCursor;
+          pageCount++;
+          expect(pageCount).toBeLessThanOrEqual(4);
+        } while (after !== undefined);
+        expect(pageCount).toBe(4);
+        expect(new Set(seen).size).toBe(seen.length);
+        expect(seen.toSorted()).toEqual([".env", ...logs].toSorted());
+
+        const matches: string[] = [];
+        after = undefined;
+        let filteredPages = 0;
+        do {
+          const page: ProjectListIgnoredFilesResult = yield* entries.listIgnoredFiles({
+            cwd,
+            query: "  .AGENTS/RUN-0  ",
+            ...(after ? { after } : {}),
+          });
+          expect(page.files.length).toBeLessThanOrEqual(200);
+          matches.push(...page.files.map((file) => file.path));
+          after = page.nextCursor;
+          filteredPages++;
+          expect(filteredPages).toBeLessThanOrEqual(4);
+        } while (after !== undefined);
+        expect(filteredPages).toBe(4);
+        expect(new Set(matches).size).toBe(matches.length);
+        expect(matches).toEqual(logs.filter((name) => name !== ".agents/run-0198.log"));
+      }),
+    );
+
+    it.effect("advances past an empty candidate page and a removed or symlink cursor", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir();
+        const fileSystem = yield* FileSystem.FileSystem;
+        const missing = Array.from({ length: 199 }, (_, i) => `a-${String(i).padStart(3, "0")}`);
+        yield* writeTextFile(cwd, "z-file", "last");
+        yield* fileSystem.symlink(`${cwd}/z-file`, `${cwd}/a-link`);
+        const entries = yield* WorkspaceEntries.make.pipe(
+          Effect.provideService(
+            VcsProcess.VcsProcess,
+            VcsProcess.VcsProcess.of({
+              run: () =>
+                Effect.succeed({
+                  exitCode: ChildProcessSpawner.ExitCode(0),
+                  stdout: [...missing, "a-link", "z-file"].join("\0") + "\0",
+                  stderr: "",
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                }),
+            }),
+          ),
+          Effect.provide(WorkspaceSearchIndex.WorkspaceSearchIndexMap.layer),
+        );
+        const first = yield* entries.listIgnoredFiles({ cwd });
+        expect(first).toEqual({ files: [], truncated: true, nextCursor: "a-link" });
+        yield* fileSystem.remove(`${cwd}/a-link`);
+        expect(yield* entries.listIgnoredFiles({ cwd, after: first.nextCursor })).toEqual({
+          files: [{ path: "z-file", byteLength: 4 }],
+          truncated: false,
+        });
+      }),
+    );
+
+    it.effect("drops only the incomplete trailing record when Git output is truncated", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir();
+        yield* writeTextFile(cwd, ".env", "A=1");
+        yield* writeTextFile(cwd, "partial", "must not be listed");
+        for (const stdout of [".env\0partial", ".env\0"]) {
+          const entries = yield* WorkspaceEntries.make.pipe(
+            Effect.provideService(
+              VcsProcess.VcsProcess,
+              VcsProcess.VcsProcess.of({
+                run: () =>
+                  Effect.succeed({
+                    exitCode: ChildProcessSpawner.ExitCode(0),
+                    stdout,
+                    stderr: "",
+                    stdoutTruncated: true,
+                    stderrTruncated: false,
+                  }),
+              }),
+            ),
+            Effect.provide(WorkspaceSearchIndex.WorkspaceSearchIndexMap.layer),
+          );
+          expect(yield* entries.listIgnoredFiles({ cwd })).toEqual({
+            files: [{ path: ".env", byteLength: 3 }],
+            truncated: false,
+            outputTruncated: true,
+          });
+        }
+      }),
+    );
+
+    it.effect("keeps a successful Git exit when stdout capture reaches its limit", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir({ git: true });
+        yield* writeTextFile(cwd, ".gitignore", "*.log\n");
+        yield* writeTextFile(cwd, "some-long-file-name.log", "x");
+        const vcs = yield* VcsProcess.VcsProcess;
+        const result = yield* vcs.run({
+          operation: "WorkspaceEntries.test.truncatedGitOutput",
+          command: "git",
+          args: ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+          cwd,
+          maxOutputBytes: 8,
+        });
+        expect(result.exitCode).toBe(0);
+        expect(result.stdoutTruncated).toBe(true);
+      }),
+    );
+
+    it.effect("preserves Git timeout and spawn failures as typed listing errors", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir();
+        const context = { cwd, command: "git", operation: "WorkspaceEntries.listIgnoredFiles" };
+        for (const cause of [
+          new VcsProcessSpawnError({ ...context, cause: new Error("git unavailable") }),
+          new VcsProcessTimeoutError({ ...context, timeoutMs: 10_000 }),
+        ]) {
+          const entries = yield* WorkspaceEntries.make.pipe(
+            Effect.provideService(
+              VcsProcess.VcsProcess,
+              VcsProcess.VcsProcess.of({
+                run: () => Effect.fail(cause),
+              }),
+            ),
+            Effect.provide(WorkspaceSearchIndex.WorkspaceSearchIndexMap.layer),
+          );
+          const error = yield* entries.listIgnoredFiles({ cwd }).pipe(Effect.flip);
+          expect(error).toMatchObject({ _tag: "WorkspaceEntriesListIgnoredFilesError", cause });
+        }
+      }),
+    );
+
+    it.effect("returns a typed failure when Git exits unsuccessfully", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir();
+        const entries = yield* WorkspaceEntries.WorkspaceEntries;
+        const error = yield* entries.listIgnoredFiles({ cwd }).pipe(Effect.flip);
+        expect(error._tag).toBe("WorkspaceEntriesListIgnoredFilesError");
+        if (error._tag === "WorkspaceEntriesListIgnoredFilesError") {
+          expect(error.cause).toMatchObject({ _tag: "VcsProcessExitError" });
+        }
       }),
     );
 
