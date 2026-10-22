@@ -19,6 +19,9 @@ import {
 
 const now = DateTime.makeUnsafe("2026-04-20T00:00:00.000Z");
 
+const decodeRestartCancelledBackgroundWork = Schema.decodeUnknownSync(
+  OrchestrationV2RestartCancelledBackgroundWork,
+);
 const decodeOrchestrationV2TurnItemJson = Schema.decodeUnknownSync(OrchestrationV2TurnItemJson);
 const encodeOrchestrationV2TurnItemJson = Schema.encodeSync(OrchestrationV2TurnItemJson);
 const decodeOrchestrationV2Subagent = Schema.decodeUnknownSync(OrchestrationV2Subagent);
@@ -64,9 +67,7 @@ describe("orchestration V2 contracts", () => {
       const codec = Schema.toCodecJson(OrchestrationV2RestartCancelledBackgroundWork);
       expect(
         Schema.decodeUnknownSync(codec)(
-          Schema.encodeSync(codec)(
-            Schema.decodeUnknownSync(OrchestrationV2RestartCancelledBackgroundWork)(cancelled),
-          ),
+          Schema.encodeSync(codec)(decodeRestartCancelledBackgroundWork(cancelled)),
         ),
       ).toEqual(cancelled);
     }

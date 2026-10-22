@@ -645,6 +645,7 @@ it.effect.each([
             : [],
       } as unknown as OrchestrationV2ThreadProjection;
       for (const trigger of ["startup", "shutdown"] as const) {
+        let currentProjection = projection;
         const commits: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0][] = [];
         const writes: Parameters<EventSink.EventSinkV2["Service"]["writeWithEffects"]>[0][] = [];
         const recovery = yield* ProviderRuntimeRecovery.make.pipe(
@@ -653,7 +654,7 @@ it.effect.each([
               ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
               Layer.mock(ProjectionStore.ProjectionStoreV2)({
                 getRecoveryThreadIds: () => Effect.succeed([threadId]),
-                getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+                getRuntimeRecoveryProjection: () => Effect.succeed(currentProjection),
               }),
               Layer.mock(EventSink.EventSinkV2)({
                 writeWithEffects: (input) =>
@@ -664,6 +665,10 @@ it.effect.each([
                 commitCommand: (input) =>
                   Effect.sync(() => {
                     commits.push(input);
+                    currentProjection = input.events.reduce(
+                      ProjectionStore.applyToProjection,
+                      currentProjection,
+                    );
                     return { committed: true, cancelledEffectCount: 0 } as never;
                   }),
               }),
@@ -674,6 +679,8 @@ it.effect.each([
               Layer.mock(EffectOutbox.EffectOutboxV2)({
                 listByCommandId: () => Effect.succeed([]),
                 reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+                cancelUnsettled: () => Effect.succeed([]),
+                signalCancellations: () => Effect.void,
               }),
             ),
           ),
@@ -697,18 +704,11 @@ it.effect.each([
         assert.deepEqual(note?.payload.restartCancelledBackgroundWork, [background.work]);
         if (status === "completed")
           assert.isFalse(events.some((event) => event.type === "run.updated"));
-        const recovered = {
-          ...projection,
-          runs: [
-            {
-              ...projection.runs[0]!,
-              restartCancelledBackgroundWork: note!.payload.restartCancelledBackgroundWork,
-            },
-          ],
-          turnItems: events.flatMap((event) =>
-            event.type === "turn-item.updated" ? [event.payload] : [],
-          ),
-        };
+        const recovered = currentProjection;
+        assert.isUndefined(restartContinuationRun(recovered, now));
+        yield* recovery.reconcile("startup");
+        assert.lengthOf(commits, 1);
+        assert.lengthOf(writes, trigger === "shutdown" && wakes ? 1 : 0);
         const dispatches = yield* continuationDispatches(recovered);
         assert.lengthOf(dispatches, wakes ? 1 : 0);
         if (wakes) {
@@ -1211,7 +1211,7 @@ it.effect("keeps restart gates for completion-owned commands after normal turn e
       { ...projection.thread, archivedAt: now },
       { ...projection.thread, deletedAt: now },
       { ...projection.thread, settledOverride: "settled" as const },
-      { ...projection.thread, snoozedUntil: DateTime.add(now, { years: 100 }) },
+      { ...projection.thread, snoozedUntil: DateTime.add(now, { days: 1 }) },
       { ...projection.thread, providerInstanceId: ProviderInstanceId.make("other") },
     ]) {
       const blocked = { ...projection, thread };
