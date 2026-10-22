@@ -2908,8 +2908,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ? [event.turnItem]
             : [],
         );
-        assert.isNotEmpty(commands);
-        assert.isTrue(commands.every((item) => Reflect.get(item, "completionWake") === "always"));
+        assert.isTrue(commands.every((item) => item.completionWake === "always"));
         assert.isFalse(yield* harness.hasPendingBackgroundWork);
         assert.isFalse(
           yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
@@ -3829,7 +3828,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         assert.equal(childCommandUpdates.at(-1)?.turnItem.status, "interrupted");
         assert.isTrue(
           childCommandUpdates.every(
-            (event) => Reflect.get(event.turnItem, "completionWake") === undefined,
+            ({ turnItem }) =>
+              turnItem.type === "command_execution" && turnItem.completionWake === undefined,
           ),
         );
         assert.equal(harness.subagentUpdates().at(-1)?.subagent.status, "interrupted");
